@@ -228,12 +228,24 @@ this proxy can go -- the server at the far end of the tunnel -- so only the
 port means anything. Upstream routes by hostname because it can hold several
 servers at once; with one, doing so would be a fiction.
 
-### 3.4 `ssh` and `cp` clients · ~150 lines · low risk
+### 3.4 `ssh` and `cp` clients ✅ · 350 lines
 
-**Cheaper than it looks.** Upstream shells out to the *system* ssh and scp,
-with tailcat acting as a `ProxyCommand` that pipes stdio to port 22 — which
-is what our pipe mode already does. This is mostly argument construction and
-process spawning.
+As predicted, the system ssh and scp do the protocol and we are the
+`ProxyCommand`. What the estimate missed is that "argument construction" is
+the security-sensitive half: the command line goes to a *shell*, and includes
+a path this program did not choose.
+
+`src/shquote.c` has its own tests for that -- close-escape-reopen for embedded
+single quotes, doubled percent signs for OpenSSH's own token expansion, and a
+refusal rather than a mangling for the cmd.exe characters that cannot survive
+both cmd.exe and the argv parser behind it.
+
+`tc_ssh_dest_host` gives ssh a short stable hash instead of the address,
+because ssh expands the destination into `ControlPath` and an AF_UNIX path
+cannot hold a full tailcat address.
+
+`make live-ssh` runs the real ssh and scp against upstream's own SSH server
+through our tunnel.
 
 ### 3.5 `recv` (file drop box) · ~300 lines · low risk
 
@@ -246,12 +258,9 @@ since it writes attacker-named files. Path traversal is the obvious hazard.
 Persistent keys on disk (with sane permissions), printing a public key, and
 opening a browser. Mostly plumbing.
 
-**Phase 3: 3.1, 3.2 and 3.3 done (1,100 lines). Remaining: ~650 lines** for
-3.4, 3.5 and 3.6. The three commands that move bytes are finished; what is
-left is process spawning, a file drop box and key management.
-
-`client_up` now does the dial-a-server bring-up once for pipe, forward and
-socks, so 3.4's `ssh` and `cp` inherit it.
+**Phase 3: 3.1 through 3.4 done (1,450 lines). Remaining: ~500 lines** for
+3.5 and 3.6 -- a file drop box and key management, neither of which touches
+the data path.
 
 ---
 
@@ -358,7 +367,7 @@ These are already in the README's TODO list and do not depend on any feature.
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
 | 2 — robust | ~1,390 ✅ | done |
-| 3 — commands | ~650 left (1,100 done) | low |
+| 3 — commands | ~500 left (1,450 done) | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
 | 5 — SSH + SFTP | ~5,500 | high |

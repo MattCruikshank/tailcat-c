@@ -118,7 +118,10 @@ largest thing we add is the 181 KB CA bundle.
 | Multiple concurrent clients | ✅ (8) | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
 | `socks` (SOCKS5 proxy) | ✅ (one server) | ✅ (many) |
-| `ssh` / `cp` / `ls` (SSH, SFTP, remote listing) | ❌ | ✅ |
+| `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
+| `ssh` / `cp` (via the system ssh and scp) | ✅ | ✅ |
+| `ls` (SFTP remote listing) | ❌ | ✅ |
+| SSH *server* (`serve ssh`) | ❌ | ✅ |
 | `recv` (file drop box) | ❌ | ✅ |
 | `browse`, `genkey`, `printpub`, `readme` | ❌ | ✅ |
 | **Platforms** | | |
@@ -205,6 +208,7 @@ $ echo hello | tailcat-c <tc-address>      # pipe to a server
 $ tailcat-c serve 22,80,8000-8999          # proxy local ports
 $ tailcat-c forward <tc-addr> 18080:80     # reach its port 80 on ours
 $ tailcat-c socks <tc-addr> 1080           # or via a SOCKS5 proxy
+$ tailcat-c ssh <tc-addr> uptime           # via the system ssh
 $ tailcat-c ping <tc-address>              # time the round trip
 $ tailcat-c resolve <tc-address>           # embed the relay, for offline use
 $ tailcat-c parse <tc-address>             # describe an address
@@ -525,7 +529,14 @@ Current, and deliberate unless noted.
   and interop with the Go binary in both directions — but a session carries a
   single stream of bytes. The port-based commands all wait on the
   demultiplexer (PLAN.md 2.1).
-- **No SSH, SFTP or WASM build.**
+- **No SSH or SFTP *server*, and no WASM build.** `ssh` and `cp` work as
+  clients, because they exec the system ssh and scp with us as a
+  `ProxyCommand`; serving SSH would mean implementing it.
+- **`ssh` turns off host key checking**, because the destination it gives ssh
+  is a hash of the address rather than a host anyone holds a key for, and the
+  address already authenticates the server: reaching it required the
+  pre-shared key and the server's public key. A `known_hosts` entry keyed on a
+  synthetic name would add a prompt and no security.
 - **`socks` reaches one server**, the one in its address, and ignores the
   destination host in each CONNECT request -- only the port is used. Upstream
   routes by hostname across several servers at once. Ours would be inventing
@@ -754,9 +765,14 @@ Roughly in the order they should be picked up.
       is the mirror of `live-serve-ports`: between them, both ends of the
       proxy have now been driven by something that is not ours.
 
-Beyond here, see [PLAN.md](PLAN.md). What is left in Phase 3 is process
-spawning (`ssh`, `cp`), a file drop box (`recv`) and key management
-(`genkey`) -- none of which move bytes, so none of them touch the data path.
+- [x] **Phase 3.4 — `ssh` and `cp`.** The system ssh and scp, with tailcat-c
+      as their `ProxyCommand`. `make live-ssh` is the longest chain anything
+      here has been tested through, and only the middle of it is ours:
+      `ssh -> tailcat-c -> DERP -> WireGuard -> the Go tailcat's sshd`.
+
+Beyond here, see [PLAN.md](PLAN.md). What is left in Phase 3 is a file drop
+box (`recv`) and key management (`genkey`), neither of which touches the data
+path. `recv` is the one to write carefully: it writes attacker-named files.
 
 ## Licence
 
