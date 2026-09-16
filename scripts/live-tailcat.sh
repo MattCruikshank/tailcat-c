@@ -26,7 +26,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "starting a real tailcat server..."
-"$UPSTREAM" > "$OUT" 2>&1 &
+# Feed it a line on stdin: pipe mode sends stdin to whatever connects, so this
+# is what the C side should read back out of the tunnel.
+printf 'reply from the go server
+' | "$UPSTREAM" > "$OUT" 2>&1 &
 SRV_PID=$!
 
 # Wait for it to pick a relay and print its address.
@@ -54,10 +57,22 @@ echo "resolved to a self-contained address (${#RESOLVED} chars)"
 echo
 
 if "$LIVETC" "$RESOLVED"; then
-	echo
-	echo "ok   live-tailcat             a real tailcat server accepted our meow"
-	echo "                              and completed a WireGuard handshake"
-	exit 0
+	# Pipe mode writes whatever it receives to its own stdout, so the line the
+	# C side sent through the tunnel should now be in the server's output.
+	sleep 1
+	if grep -q "hello from tailcat-c" "$OUT"; then
+		echo
+		echo "the go server printed what we sent through the tunnel:"
+		grep "hello from tailcat-c" "$OUT" | sed "s/^/    /"
+		echo
+		echo "ok   live-tailcat             a real tailcat server accepted our"
+		echo "                              meow, completed a WireGuard handshake,"
+		echo "                              and received our TCP stream"
+		exit 0
+	fi
+	echo "live-tailcat: the server did not print our payload. Output was:" >&2
+	cat "$OUT" >&2
+	exit 1
 fi
 
 echo >&2

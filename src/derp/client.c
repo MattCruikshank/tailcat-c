@@ -249,7 +249,7 @@ int tc_derp_connect(tc_derp_client *c, const tc_derp_dial_opts *opts,
 
 	tc_stream tcp;
 	memset(&tcp, 0, sizeof tcp);
-	int rc = tc_tcp_connect(&tcp, dial, port, opts->timeout_ms);
+	int rc = tc_net_tcp_connect(&tcp, dial, port, opts->timeout_ms);
 	if (rc != TC_OK) {
 		FAILF("could not connect to %s port %u", dial, (unsigned)port);
 		return rc;

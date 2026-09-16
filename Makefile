@@ -152,6 +152,7 @@ LIB_SRCS := \
 	src/tailcat/meow.c \
 	src/derp/frame.c \
 	src/derp/client.c \
+	src/net/tcp.c \
 	src/net/tls.c \
 	src/net/ca_bundle.c
 

@@ -6,14 +6,15 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: in progress.** tailcat-c establishes an encrypted WireGuard tunnel
-with a **real tailcat server**, through a production DERP relay: it parses the
-server's address, connects to the relay over TLS, introduces itself with the
-meow exchange, and completes the Noise IKpsk2 handshake. `make live-tailcat`
-does exactly that against the upstream Go binary.
+**Status: in progress.** tailcat-c carries a **TCP stream to a real tailcat
+server** over a WireGuard tunnel through a production DERP relay. It parses
+the server's address, reaches the relay over TLS, introduces itself with the
+meow exchange, completes the Noise IKpsk2 handshake, and then opens a TCP
+connection inside the tunnel using its own userspace stack. `make
+live-tailcat` does all of that against the upstream Go binary and checks that
+the server prints what we sent.
 
-What is missing is what goes *inside* the tunnel: a userspace TCP stack (M6)
-and the netcat-style CLI (M7). See [Roadmap](#roadmap).
+What remains is the netcat-style CLI (M7). See [Roadmap](#roadmap).
 
 ## Why this is a big job
 
@@ -332,6 +333,21 @@ Current, and deliberate unless noted.
 - **No index table.** Handshake indices are random 32-bit values with no
   check for collision, which is fine for one peer and would not be for many.
 
+### TCP
+
+- **No SACK, timestamps or window scaling.** Throughput over a long fat pipe
+  will be poor; over a relay with a 64KB window it is adequate.
+- **No fast recovery**, only fast retransmit: after three duplicate ACKs the
+  window is halved and one segment resent, then slow start resumes.
+- **The MSS is fixed at 1140** and derived from tailcat's 1232-byte maximum
+  UDP payload. There is no path MTU discovery, and nothing fragments, so a
+  smaller path would black-hole rather than degrade.
+- **One connection per object.** There is no demultiplexer, so a second
+  simultaneous stream needs a second `tc_tcp_conn` and a dispatcher above it.
+- **`tc_tcp_force_next_iss` exists for tests only.** A predictable initial
+  sequence number makes blind stream injection practical; it is there so the
+  sequence-number wrap can be tested without moving four gigabytes.
+
 ### Implementation
 
 - **Writes have no timeout.** Reads are bounded by
@@ -380,6 +396,9 @@ Roughly in the order they should be picked up.
       running until the counter limit.
 - [ ] **Initiation replay protection**: remember the last TAI64N timestamp
       per peer and reject anything not strictly newer.
+- [ ] **TCP passive open is implemented but unused**: nothing in tailcat-c
+      listens yet, so only the client path has live coverage.
+- [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
 - [ ] **Write timeouts** on the DERP stream. Reads are now bounded by
       `tc_derp_set_read_timeout`; writes still are not.
 - [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
@@ -420,8 +439,13 @@ Roughly in the order they should be picked up.
       end to end by `make live-tailcat`: a real tailcat server accepts our
       meow, adds us as a peer, and completes a WireGuard handshake through
       the relay.
-- [ ] **M6 — Minimal TCP.** A two-peer userspace TCP: state machine, RTO,
-      fast retransmit, window management. Replaces gvisor's netstack.
+- [x] **M6 — Minimal TCP.** A two-peer userspace TCP over IPv6: the state
+      machine, cumulative ACKs with a bounded reassembly queue, RTO with
+      Jacobson/Karels and Karn's algorithm, fast retransmit, slow start and
+      congestion avoidance, window updates and half close. Roughly 900 lines
+      in place of gvisor's netstack. Tested against a simulated link with
+      loss, duplication and reordering, and end to end against a real
+      tailcat server.
 - [ ] **M7 — CLI.** The netcat-style stdin/stdout pipe mode.
 
 ## Licence

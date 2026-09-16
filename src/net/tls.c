@@ -178,7 +178,7 @@ static int connect_with_timeout(int fd, const struct sockaddr *addr,
 	return rc;
 }
 
-int tc_tcp_connect(tc_stream *out, const char *host, uint16_t port,
+int tc_net_tcp_connect(tc_stream *out, const char *host, uint16_t port,
                    int timeout_ms)
 {
 	if (out == NULL || host == NULL)

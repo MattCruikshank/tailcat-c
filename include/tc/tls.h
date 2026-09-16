@@ -51,12 +51,17 @@ int tc_stream_read_full(tc_stream *s, uint8_t *buf, size_t len);
 
 /* ---- TCP ------------------------------------------------------------- */
 
-/* tc_tcp_connect opens a TCP connection to host:port.
+/* tc_net_tcp_connect opens a TCP connection to host:port using the host
+ * operating system's network stack.
+ *
+ * Named tc_net_* to keep it apart from tc_tcp_* in tcp.h, which is the
+ * userspace TCP that runs *inside* the tunnel. The two are unrelated: this
+ * one carries the tunnel, that one carries what the tunnel is for.
  *
  * host may be a name or a literal IPv4 or IPv6 address; both address families
  * are tried in the order the resolver returns them. timeout_ms bounds the
  * whole attempt including resolution, and 0 means the system default. */
-int tc_tcp_connect(tc_stream *out, const char *host, uint16_t port,
+int tc_net_tcp_connect(tc_stream *out, const char *host, uint16_t port,
                    int timeout_ms);
 
 /* ---- TLS ------------------------------------------------------------- */
