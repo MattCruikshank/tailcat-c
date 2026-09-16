@@ -6,9 +6,9 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: in progress.** The address layer is complete and verified
-wire-compatible against the real Go implementation. The network layers are
-not written yet. See [Roadmap](#roadmap).
+**Status: in progress.** The address layer and the cryptography are done
+and verified against the real Go implementations. The network layers are not
+written yet. See [Roadmap](#roadmap).
 
 ## Why this is a big job
 
@@ -52,11 +52,15 @@ unzip -o cosmocc.zip
 Then:
 
 ```sh
+git clone --recurse-submodules https://github.com/MattCruikshank/tailcat-c
 make            # build
 make test       # unit tests; also asserts every binary is a fat APE
-make fuzz       # fuzz the address parser under ASan + UBSan (host gcc)
+make fuzz       # fuzz/property tests under ASan + UBSan (host gcc)
 make interop    # cross-check against the real Go tailcat library
 ```
+
+Mbed TLS is a pinned submodule, so `--recurse-submodules` matters; an
+existing clone needs `git submodule update --init`.
 
 `make CC=gcc test` builds with the host compiler instead, which is useful
 under sanitizers.
@@ -93,6 +97,20 @@ The address layer is checked three ways:
 3. **Fuzzing.** `make fuzz` mutates a seed corpus under ASan and UBSan,
    asserting no crashes and that any address that parses survives an
    encode/parse round trip unchanged.
+
+The crypto layer is checked the same way. `tools/genvectors` derives
+`tests/crypto_vectors.h` from `golang.org/x/crypto/{blake2s,chacha20poly1305,
+curve25519}` and wireguard-go's own exported `KDF1`/`KDF2`/`KDF3` — the exact
+implementations tailcat interoperates with — rather than transcribing hex by
+hand, which is where crypto test suites quietly go wrong. Two vectors
+(`rfc7693-abc` and `rfc7748-1`) are the published RFC values, so the
+generator is anchored to something outside Go as well.
+
+`tests/fuzz_crypto.c` property-tests the parts that guard the tunnel: random
+ciphertext never authenticates, a single flipped bit anywhere in ciphertext,
+tag, associated data or counter always fails, BLAKE2s fed in arbitrary chunk
+sizes equals the one-shot digest, and X25519 is commutative and refuses
+small-order points.
 
 ## Design notes
 
@@ -135,11 +153,11 @@ tailcat emits. Both deviations are documented at the declaration.
 
 - [x] **M1 — Addresses.** base64url, strict CBOR, the `Addr` codec, golden
       vectors, differential testing against Go, fuzzing.
-- [ ] **M2 — Crypto.** Vendor mbedTLS for X25519, ChaCha20-Poly1305, HKDF,
-      the CSPRNG and TLS; add BLAKE2s, which WireGuard needs and mbedTLS
-      lacks. Verified against RFC 7539/7693/8439 vectors. Using a maintained
-      library rather than hand-rolling is a deliberate call for a
-      security-critical rewrite.
+- [x] **M2 — Crypto.** X25519, ChaCha20-Poly1305 and the CSPRNG from a pinned
+      Mbed TLS 3.6.7; BLAKE2s, HMAC-BLAKE2s and WireGuard's KDF1/2/3
+      implemented here, because Mbed TLS has no BLAKE2s and Noise needs it.
+      Vectors are generated from the same Go libraries WireGuard uses, with
+      RFC 7693 and RFC 7748 values as external anchors.
 - [ ] **M3 — DERP client.** HTTP upgrade, the frame protocol, the key
       exchange, send/recv paths.
 - [ ] **M4 — WireGuard.** Noise IK handshake with the pre-shared key mixed
