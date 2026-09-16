@@ -32,6 +32,18 @@
 
 /* ---- shared helpers -------------------------------------------------- */
 
+int tc_stream_fd(tc_stream *s)
+{
+	if (s == NULL || s->get_fd == NULL)
+		return -1;
+	return s->get_fd(s);
+}
+
+bool tc_stream_has_pending(tc_stream *s)
+{
+	return s != NULL && s->has_pending != NULL && s->has_pending(s);
+}
+
 int tc_stream_set_read_timeout(tc_stream *s, int ms)
 {
 	if (s == NULL)
@@ -43,15 +55,38 @@ int tc_stream_set_read_timeout(tc_stream *s, int ms)
 
 int tc_stream_read_full(tc_stream *s, uint8_t *buf, size_t len)
 {
+	/* A timeout partway through is NOT passed to the caller. The bytes
+	 * already read have been consumed from the stream, so returning now
+	 * would lose them and desynchronise whatever framing sits above -- the
+	 * next read would start mid-frame. Since a timeout means "nothing more
+	 * has arrived yet" rather than "this is broken", keep waiting for the
+	 * rest of the item; a timeout is only reportable before any of it has
+	 * been consumed.
+	 *
+	 * A peer that sends half an item and then stalls forever would otherwise
+	 * block us forever, so that is bounded and reported as truncation, which
+	 * is fatal to the connection -- correct, because the framing really is
+	 * lost at that point. */
+	enum { MAX_PARTIAL_STALLS = 100 };
 	size_t got = 0;
+	unsigned stalls = 0;
+
 	while (got < len) {
 		size_t n = 0;
 		int rc = s->read_some(s, buf + got, len - got, &n);
+		if (rc == TC_ERR_TIMEOUT) {
+			if (got == 0)
+				return TC_ERR_TIMEOUT;
+			if (++stalls > MAX_PARTIAL_STALLS)
+				return TC_ERR_TRUNC;
+			continue;
+		}
 		if (rc != TC_OK)
 			return rc;
 		if (n == 0)
 			return TC_ERR_TRUNC;
 		got += n;
+		stalls = 0;
 	}
 	return TC_OK;
 }
@@ -127,6 +162,12 @@ static int tcp_set_read_timeout(tc_stream *s, int ms)
 	               sizeof tv) != 0)
 		return TC_ERR_INVAL;
 	return TC_OK;
+}
+
+static int tcp_fd(tc_stream *s)
+{
+	tcp_ctx *c = (tcp_ctx *)s->ctx;
+	return c == NULL ? -1 : c->fd;
 }
 
 static void tcp_close(tc_stream *s)
@@ -228,6 +269,8 @@ int tc_net_tcp_connect(tc_stream *out, const char *host, uint16_t port,
 	out->read_some = tcp_read_some;
 	out->write_all = tcp_write_all;
 	out->set_read_timeout = tcp_set_read_timeout;
+	out->get_fd = tcp_fd;
+	out->has_pending = NULL;
 	out->close = tcp_close;
 	out->ctx = c;
 	return TC_OK;
@@ -331,6 +374,25 @@ static int tls_set_read_timeout(tc_stream *s, int ms)
 {
 	tls_ctx *t = (tls_ctx *)s->ctx;
 	return tc_stream_set_read_timeout(&t->tcp, ms);
+}
+
+static int tls_fd(tc_stream *s)
+{
+	tls_ctx *t = (tls_ctx *)s->ctx;
+	return (t == NULL || t->tcp.get_fd == NULL) ? -1 : t->tcp.get_fd(&t->tcp);
+}
+
+/* tls_has_pending reports whether a whole record is already buffered inside
+ * the TLS layer. poll() on the socket cannot see that, so without this an
+ * event loop can block on a socket that has nothing left while a complete
+ * message sits decrypted and waiting. */
+static bool tls_has_pending(tc_stream *s)
+{
+	tls_ctx *t = (tls_ctx *)s->ctx;
+	if (t == NULL)
+		return false;
+	return mbedtls_ssl_get_bytes_avail(&t->ssl) > 0 ||
+	       mbedtls_ssl_check_pending(&t->ssl) != 0;
 }
 
 static void tls_close(tc_stream *s)
@@ -449,6 +511,8 @@ int tc_tls_client(tc_stream *out, tc_stream *tcp, const tc_tls_config *cfg)
 	out->read_some = tls_read_some;
 	out->write_all = tls_write_all;
 	out->set_read_timeout = tls_set_read_timeout;
+	out->get_fd = tls_fd;
+	out->has_pending = tls_has_pending;
 	out->close = tls_close;
 	out->ctx = t;
 

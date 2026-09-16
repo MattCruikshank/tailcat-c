@@ -216,6 +216,12 @@ int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
  * for the acknowledgment. */
 int tc_derp_set_read_timeout(tc_derp_client *c, int ms);
 
+/* tc_derp_fd returns a descriptor an event loop can poll, or -1.
+ * tc_derp_has_pending must be checked first: a whole frame may already be
+ * buffered inside the TLS layer with nothing left on the socket. */
+int tc_derp_fd(tc_derp_client *c);
+bool tc_derp_has_pending(tc_derp_client *c);
+
 /* tc_derp_close tears down the connection. Safe on a zeroed or already
  * closed client. */
 void tc_derp_close(tc_derp_client *c);

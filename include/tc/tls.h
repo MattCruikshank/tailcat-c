@@ -32,6 +32,11 @@ struct tc_stream {
 	 * TC_ERR_TIMEOUT. 0 means wait indefinitely. May be NULL on transports
 	 * that cannot do it. */
 	int (*set_read_timeout)(tc_stream *s, int ms);
+	/* get_fd returns a descriptor usable with poll(), or -1. */
+	int (*get_fd)(tc_stream *s);
+	/* has_pending reports data already buffered above the socket. May be
+	 * NULL on transports that never buffer. */
+	bool (*has_pending)(tc_stream *s);
 	void (*close)(tc_stream *s);
 	void *ctx;
 };
@@ -48,6 +53,17 @@ int tc_stream_set_read_timeout(tc_stream *s, int ms);
 /* tc_stream_read_full reads exactly len bytes, looping over short reads.
  * Returns TC_ERR_TRUNC if the stream ends first. */
 int tc_stream_read_full(tc_stream *s, uint8_t *buf, size_t len);
+
+/* tc_stream_fd returns a descriptor an event loop can poll, or -1. */
+int tc_stream_fd(tc_stream *s);
+
+/* tc_stream_has_pending reports whether bytes are already buffered above the
+ * socket and can be read without waiting.
+ *
+ * An event loop must check this before polling: TLS reads whole records, so
+ * the socket can be empty while decrypted bytes wait inside the TLS layer,
+ * and polling alone would sleep through them. */
+bool tc_stream_has_pending(tc_stream *s);
 
 /* ---- TCP ------------------------------------------------------------- */
 

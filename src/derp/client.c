@@ -374,6 +374,18 @@ int tc_derp_set_read_timeout(tc_derp_client *c, int ms)
 	return tc_stream_set_read_timeout(&c->stream, ms);
 }
 
+int tc_derp_fd(tc_derp_client *c)
+{
+	if (c == NULL || !c->connected)
+		return -1;
+	return tc_stream_fd(&c->stream);
+}
+
+bool tc_derp_has_pending(tc_derp_client *c)
+{
+	return c != NULL && c->connected && tc_stream_has_pending(&c->stream);
+}
+
 void tc_derp_close(tc_derp_client *c)
 {
 	if (c == NULL)

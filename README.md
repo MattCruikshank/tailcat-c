@@ -6,15 +6,25 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: in progress.** tailcat-c carries a **TCP stream to a real tailcat
-server** over a WireGuard tunnel through a production DERP relay. It parses
-the server's address, reaches the relay over TLS, introduces itself with the
-meow exchange, completes the Noise IKpsk2 handshake, and then opens a TCP
-connection inside the tunnel using its own userspace stack. `make
-live-tailcat` does all of that against the upstream Go binary and checks that
-the server prints what we sent.
+**Status: the agreed scope works.** `tailcat-c` pipes stdin to a **real
+tailcat server** and its replies back, over a WireGuard tunnel relayed through
+a production DERP node:
 
-What remains is the netcat-style CLI (M7). See [Roadmap](#roadmap).
+```console
+$ echo 'the quick brown fox' | tailcat-c -v tcpGFwWCDMihnYWAeovm...
+# relay tc301a.ipn.dev
+# meowed: the server has added us as a peer
+# tunnel up
+# connected
+```
+
+and the Go server prints `the quick brown fox` on its own stdout. `make
+live-cli` does exactly that, start to finish.
+
+Everything is a single fat Actually Portable Executable with no dependencies
+beyond a vendored Mbed TLS. See [Limitations](#limitations) for what this
+deliberately does not do, and [Known TODOs](#known-todos) for the loose
+ends.
 
 ## Why this is a big job
 
@@ -66,7 +76,18 @@ make interop    # cross-check against the real Go tailcat library
 make live       # connect to a real DERP relay and relay a packet (needs network)
 make live-wg    # handshake against a real wireguard-go device
 make live-tailcat  # full tunnel with a real tailcat server (needs network)
+make live-cli      # drive the CLI end to end against a real server
 ```
+
+Then:
+
+```console
+$ tailcat-c parse <tc-address>          # describe an address
+$ echo hello | tailcat-c <tc-address>   # pipe to a tailcat server
+```
+
+The address must be self-contained; run `tailcat resolve` on a short one,
+since fetching the DERP map is not implemented.
 
 Mbed TLS is a pinned submodule, so `--recurse-submodules` matters; an
 existing clone needs `git submodule update --init`.
@@ -297,8 +318,11 @@ Current, and deliberate unless noted.
   TCP, and no CLI. tailcat-c can move bytes between two of *its own* clients
   through a relay; it cannot yet talk to a real `tailcat` peer.
 - **No SSH, SFTP, SOCKS, port forwarding, or WASM build.**
-- **No DERP map fetching.** Relay hostnames are supplied by the caller;
-  `make live` hardcodes one. There is no latency-based region selection.
+- **No DERP map fetching**, so a short address cannot be used directly: run
+  `tailcat resolve` on it first. There is no latency-based region selection
+  either, which also means **tailcat-c cannot serve** -- minting an address
+  requires picking a relay.
+- **The CLI is client-only**, and opens one connection at a time.
 
 ### TLS
 
@@ -446,7 +470,11 @@ Roughly in the order they should be picked up.
       in place of gvisor's netstack. Tested against a simulated link with
       loss, duplication and reordering, and end to end against a real
       tailcat server.
-- [ ] **M7 — CLI.** The netcat-style stdin/stdout pipe mode.
+- [x] **M7 — CLI.** `tailcat-c <addr> [port]` pipes stdin and stdout through
+      the tunnel, plus `parse` and `version`. A single-threaded event loop
+      over the relay socket and stdin drives the TCP stack and the WireGuard
+      session, so there are no locks. Verified by `make live-cli` against the
+      upstream Go server.
 
 ## Licence
 

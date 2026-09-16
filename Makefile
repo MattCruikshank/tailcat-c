@@ -158,11 +158,17 @@ LIB_SRCS := \
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 
+CLI := $(BUILD)/tailcat-c
+
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat
-all: $(LIB_OBJS)
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli
+all: $(CLI)
+
+$(CLI): src/cli/main.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) src/cli/main.c $(LIB_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c
 	@mkdir -p $(dir $@)
@@ -176,13 +182,13 @@ $(BUILD)/test_%: tests/test_%.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Itests $< $(LIB_OBJS) $(LDFLAGS) -o $@
 
-test: $(TEST_BINS) check-fat
+test: $(TEST_BINS) $(CLI) check-fat
 	@fail=0; for t in $(TEST_BINS); do ./$$t || fail=1; done; exit $$fail
 
 # Only meaningful for cosmocc output; skipped for host-compiler builds.
-check-fat: $(TEST_BINS)
+check-fat: $(TEST_BINS) $(CLI)
 ifeq ($(findstring cosmocc,$(CC)),cosmocc)
-	@sh scripts/check-fat.sh $(TEST_BINS)
+	@sh scripts/check-fat.sh $(TEST_BINS) $(CLI)
 else
 	@echo "check-fat: skipped (CC=$(CC) is not cosmocc)"
 endif
@@ -256,6 +262,9 @@ live-wg: $(BUILD)/livewg
 $(BUILD)/livetailcat: tests/livetailcat.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) tests/livetailcat.c $(LIB_OBJS) $(LDFLAGS) -o $@
+
+live-cli: $(CLI)
+	CLI=$(CLI) sh scripts/live-cli.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
