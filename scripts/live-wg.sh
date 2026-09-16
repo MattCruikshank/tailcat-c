@@ -10,6 +10,7 @@
 # coordination channel. They are test keys and are not secret.
 set -eu
 
+LIVEWG="${LIVEWG:-build/cosmo/livewg}"
 PORT="${WG_TEST_PORT:-51820}"
 LPORT="${WG_TEST_LPORT:-51830}"
 
@@ -21,7 +22,7 @@ PSK=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 
 # wgpeer needs our public key up front, and we need its public key. Both are
 # derived from the fixed private keys, so ask each side for its own.
-OUR_PUB=$(./build/livewg -private "$OUR_PRIV" -peer "$WGPEER_PRIV" -port 1 2>/dev/null \
+OUR_PUB=$("$LIVEWG" -private "$OUR_PRIV" -peer "$WGPEER_PRIV" -port 1 2>/dev/null \
 	| sed -n 's/^our public key:  //p' || true)
 if [ -z "$OUR_PUB" ]; then
 	echo "live-wg: could not derive our public key" >&2
@@ -57,7 +58,7 @@ cleanup() {
 # Give the device a moment to bind its UDP socket before we send to it.
 sleep 3
 
-if ! ./build/livewg -private "$OUR_PRIV" -peer "$WGPEER_PUB" -psk "$PSK" \
+if ! "$LIVEWG" -private "$OUR_PRIV" -peer "$WGPEER_PUB" -psk "$PSK" \
 		-port "$PORT" -lport "$LPORT"; then
 	echo "live-wg: the C side failed" >&2
 	cleanup

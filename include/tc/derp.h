@@ -207,6 +207,15 @@ int tc_derp_send(tc_derp_client *c, const uint8_t dst_key[TC_DERP_KEY_LEN],
 int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
                  uint8_t *buf, size_t cap, size_t *pkt_len);
 
+/* tc_derp_set_read_timeout bounds how long tc_derp_recv waits before
+ * returning TC_ERR_TIMEOUT. 0 waits indefinitely.
+ *
+ * A timeout is recoverable: the connection stays usable and the caller can
+ * send something and try again. That is what the meow exchange needs, since
+ * DERP delivery is best effort and the ping has to be resent while waiting
+ * for the acknowledgment. */
+int tc_derp_set_read_timeout(tc_derp_client *c, int ms);
+
 /* tc_derp_close tears down the connection. Safe on a zeroed or already
  * closed client. */
 void tc_derp_close(tc_derp_client *c);

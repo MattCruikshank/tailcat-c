@@ -6,11 +6,14 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: in progress.** The address layer, the cryptography, the DERP relay
-client and the WireGuard tunnel are done. tailcat-c connects to production
-Tailscale DERP relays, and its Noise IKpsk2 implementation interoperates with
-real wireguard-go. What remains is joining the two: the meow bootstrap, a
-userspace TCP, and the CLI. See [Roadmap](#roadmap).
+**Status: in progress.** tailcat-c establishes an encrypted WireGuard tunnel
+with a **real tailcat server**, through a production DERP relay: it parses the
+server's address, connects to the relay over TLS, introduces itself with the
+meow exchange, and completes the Noise IKpsk2 handshake. `make live-tailcat`
+does exactly that against the upstream Go binary.
+
+What is missing is what goes *inside* the tunnel: a userspace TCP stack (M6)
+and the netcat-style CLI (M7). See [Roadmap](#roadmap).
 
 ## Why this is a big job
 
@@ -61,6 +64,7 @@ make fuzz       # fuzz/property tests under ASan + UBSan (host gcc)
 make interop    # cross-check against the real Go tailcat library
 make live       # connect to a real DERP relay and relay a packet (needs network)
 make live-wg    # handshake against a real wireguard-go device
+make live-tailcat  # full tunnel with a real tailcat server (needs network)
 ```
 
 Mbed TLS is a pinned submodule, so `--recurse-submodules` matters; an
@@ -200,6 +204,18 @@ Opening the server's `FRAME_SERVER_INFO` box is also a real check rather than
 a formality: it proves the relay holds the private key matching the public key
 it greeted us with.
 
+The tailcat layer is checked the same way again: `tools/genaddrs -vectors`
+emits `tests/meow_vectors.h` using upstream's own `EncodeMeowPing`,
+`EncodeMeowed` and `DiscoPublicForNode`, so the encoded packets and the
+derived disco keys are pinned against the real implementation rather than
+against our reading of it.
+
+`make live-tailcat` is the end-to-end check: it builds the upstream Go
+binary, starts a real server, resolves the address it prints, and requires
+the C side to parse it, reach the relay, be meowed, and complete a
+handshake. Every milestone at once, against the thing we have to
+interoperate with.
+
 ## Bugs this verification has actually caught
 
 Kept as a record, because each one says something about where the risk in this
@@ -318,10 +334,10 @@ Current, and deliberate unless noted.
 
 ### Implementation
 
-- **Blocking I/O with no read/write timeout.** `tc_tcp_connect` bounds the
-  connect, but a relay that accepts a connection and then goes silent will
-  block `tc_derp_recv` indefinitely. This is the most likely thing to bite in
-  real use and is the first item on the TODO list.
+- **Writes have no timeout.** Reads are bounded by
+  `tc_derp_set_read_timeout`, and a timed-out read is recoverable rather than
+  fatal -- the TLS record layer keeps what it had, so a later read resumes
+  mid-record. Writes can still block indefinitely on a stalled relay.
 - **No reconnection.** `FRAME_RESTARTING` is parsed and ignored; a dropped
   connection is simply an error to the caller.
 - **A `tc_derp_client` is not safe for concurrent use.** Send and receive both
@@ -364,8 +380,8 @@ Roughly in the order they should be picked up.
       running until the counter limit.
 - [ ] **Initiation replay protection**: remember the last TAI64N timestamp
       per peer and reject anything not strictly newer.
-- [ ] **Read/write timeouts** on the DERP stream. Currently the only bounded
-      operation is the initial connect.
+- [ ] **Write timeouts** on the DERP stream. Reads are now bounded by
+      `tc_derp_set_read_timeout`; writes still are not.
 - [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
       ignoring it, and tracking keep-alives to notice a dead relay.
 - [ ] **DERP map fetching** from `https://tailcat.dev/derpmap.json`, plus
@@ -399,8 +415,11 @@ Roughly in the order they should be picked up.
       handshake and gets an encrypted IPv4 packet delivered to its TUN.
       Rekeying and the cookie/DoS exchange are not implemented; see
       Limitations.
-- [ ] **M5 — meow bootstrap.** The 4-byte-magic ping/pong tailcat uses over
-      DERP to introduce the two peers (see upstream `disco.go`).
+- [x] **M5 — meow bootstrap.** The introduction exchange, the disco key
+      derivation a peer must advertise, and tunnel addressing. Verified
+      end to end by `make live-tailcat`: a real tailcat server accepts our
+      meow, adds us as a peer, and completes a WireGuard handshake through
+      the relay.
 - [ ] **M6 — Minimal TCP.** A two-peer userspace TCP: state machine, RTO,
       fast retransmit, window management. Replaces gvisor's netstack.
 - [ ] **M7 — CLI.** The netcat-style stdin/stdout pipe mode.

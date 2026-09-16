@@ -27,9 +27,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* ---- shared helpers -------------------------------------------------- */
+
+int tc_stream_set_read_timeout(tc_stream *s, int ms)
+{
+	if (s == NULL)
+		return TC_ERR_INVAL;
+	if (s->set_read_timeout == NULL)
+		return TC_ERR_UNSUPPORTED;
+	return s->set_read_timeout(s, ms);
+}
 
 int tc_stream_read_full(tc_stream *s, uint8_t *buf, size_t len)
 {
@@ -82,6 +92,10 @@ static int tcp_read_some(tc_stream *s, uint8_t *buf, size_t len, size_t *nread)
 			return TC_ERR_TRUNC; /* orderly shutdown */
 		if (errno == EINTR)
 			continue;
+		/* SO_RCVTIMEO expiring looks exactly like a non-blocking socket
+		 * with nothing to read; the socket is otherwise fine. */
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return TC_ERR_TIMEOUT;
 		return TC_ERR_INVAL;
 	}
 }
@@ -100,6 +114,18 @@ static int tcp_write_all(tc_stream *s, const uint8_t *buf, size_t len)
 			continue;
 		return TC_ERR_INVAL;
 	}
+	return TC_OK;
+}
+
+static int tcp_set_read_timeout(tc_stream *s, int ms)
+{
+	tcp_ctx *c = (tcp_ctx *)s->ctx;
+	struct timeval tv;
+	tv.tv_sec = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const void *)&tv,
+	               sizeof tv) != 0)
+		return TC_ERR_INVAL;
 	return TC_OK;
 }
 
@@ -201,6 +227,7 @@ int tc_tcp_connect(tc_stream *out, const char *host, uint16_t port,
 
 	out->read_some = tcp_read_some;
 	out->write_all = tcp_write_all;
+	out->set_read_timeout = tcp_set_read_timeout;
 	out->close = tcp_close;
 	out->ctx = c;
 	return TC_OK;
@@ -215,6 +242,9 @@ typedef struct {
 	mbedtls_entropy_context entropy;
 	mbedtls_ctr_drbg_context drbg;
 	tc_stream tcp; /* owned once the handshake succeeds */
+	/* Set by the BIO when the underlying read timed out, so tls_read_some can
+	 * tell that apart from an ordinary "no data yet". */
+	bool timed_out;
 } tls_ctx;
 
 /* mbedTLS calls these to move bytes; they just forward to the TCP stream. */
@@ -233,6 +263,14 @@ static int tls_bio_recv(void *p, unsigned char *buf, size_t len)
 	int rc = t->tcp.read_some(&t->tcp, buf, len, &n);
 	if (rc == TC_ERR_TRUNC)
 		return 0; /* clean EOF */
+	if (rc == TC_ERR_TIMEOUT) {
+		/* WANT_READ rather than an error: the record layer keeps whatever it
+		 * has already consumed, so a later read resumes mid-record instead of
+		 * tearing the session down. The flag tells tls_read_some to surface
+		 * this to the caller rather than spin. */
+		t->timed_out = true;
+		return MBEDTLS_ERR_SSL_WANT_READ;
+	}
 	if (rc != TC_OK)
 		return MBEDTLS_ERR_NET_RECV_FAILED;
 	return (int)n;
@@ -247,8 +285,13 @@ static int tls_read_some(tc_stream *s, uint8_t *buf, size_t len, size_t *nread)
 			*nread = (size_t)n;
 			return TC_OK;
 		}
-		if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE)
+		if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+			if (t->timed_out) {
+				t->timed_out = false;
+				return TC_ERR_TIMEOUT;
+			}
 			continue;
+		}
 		if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY)
 			return TC_ERR_TRUNC;
 		set_tls_err("tls read", n);
@@ -282,6 +325,12 @@ static void tls_free(tls_ctx *t)
 	mbedtls_ctr_drbg_free(&t->drbg);
 	mbedtls_entropy_free(&t->entropy);
 	free(t);
+}
+
+static int tls_set_read_timeout(tc_stream *s, int ms)
+{
+	tls_ctx *t = (tls_ctx *)s->ctx;
+	return tc_stream_set_read_timeout(&t->tcp, ms);
 }
 
 static void tls_close(tc_stream *s)
@@ -399,6 +448,7 @@ int tc_tls_client(tc_stream *out, tc_stream *tcp, const tc_tls_config *cfg)
 
 	out->read_some = tls_read_some;
 	out->write_all = tls_write_all;
+	out->set_read_timeout = tls_set_read_timeout;
 	out->close = tls_close;
 	out->ctx = t;
 

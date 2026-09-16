@@ -367,6 +367,13 @@ int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
 	}
 }
 
+int tc_derp_set_read_timeout(tc_derp_client *c, int ms)
+{
+	if (c == NULL || !c->connected)
+		return TC_ERR_INVAL;
+	return tc_stream_set_read_timeout(&c->stream, ms);
+}
+
 void tc_derp_close(tc_derp_client *c)
 {
 	if (c == NULL)

@@ -28,9 +28,22 @@ struct tc_stream {
 	int (*read_some)(tc_stream *s, uint8_t *buf, size_t len, size_t *nread);
 	/* write_all writes every byte or fails. */
 	int (*write_all)(tc_stream *s, const uint8_t *buf, size_t len);
+	/* set_read_timeout bounds how long a read waits before returning
+	 * TC_ERR_TIMEOUT. 0 means wait indefinitely. May be NULL on transports
+	 * that cannot do it. */
+	int (*set_read_timeout)(tc_stream *s, int ms);
 	void (*close)(tc_stream *s);
 	void *ctx;
 };
+
+/* tc_stream_set_read_timeout bounds subsequent reads on s.
+ *
+ * A timed-out read is recoverable rather than fatal: for TLS the record layer
+ * keeps whatever it had, so a later read resumes mid-record cleanly. That is
+ * what lets a caller poll for one thing while another is still in flight,
+ * which is exactly what the meow exchange needs -- DERP delivery is best
+ * effort, so the ping has to be resent while waiting for the ack. */
+int tc_stream_set_read_timeout(tc_stream *s, int ms);
 
 /* tc_stream_read_full reads exactly len bytes, looping over short reads.
  * Returns TC_ERR_TRUNC if the stream ends first. */

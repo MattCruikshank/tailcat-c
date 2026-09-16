@@ -23,6 +23,18 @@ endif
 
 BUILD ?= build
 
+# Objects from two toolchains cannot share a directory. cosmocc emits a paired
+# object in a sibling .aarch64/ directory beside each one, and a host-gcc
+# object of the same name leaves that pair half-missing -- which surfaces much
+# later as "linker input missing concomitant ... .aarch64/foo.o", an error that
+# says nothing about the actual cause. Key the directory by toolchain so
+# `make` and `make CC=gcc` can coexist without an explicit clean in between.
+ifeq ($(findstring cosmocc,$(CC)),cosmocc)
+BUILD := $(BUILD)/cosmo
+else
+BUILD := $(BUILD)/host
+endif
+
 # -Wconversion is deliberately on: this code parses attacker-controlled bytes
 # and silent integer narrowing is exactly the bug class we care about.
 WARNINGS := \
@@ -137,6 +149,7 @@ LIB_SRCS := \
 	src/crypto/salsa20.c \
 	src/crypto/random.c \
 	src/wg/noise.c \
+	src/tailcat/meow.c \
 	src/derp/frame.c \
 	src/derp/client.c \
 	src/net/tls.c \
@@ -147,7 +160,7 @@ LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat
 all: $(LIB_OBJS)
 
 $(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c
@@ -236,7 +249,15 @@ $(BUILD)/livewg: tests/livewg.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) tests/livewg.c $(LIB_OBJS) $(LDFLAGS) -o $@
 
 live-wg: $(BUILD)/livewg
-	sh scripts/live-wg.sh
+	LIVEWG=$(BUILD)/livewg sh scripts/live-wg.sh
+
+# End-to-end against a real tailcat server: address, relay, meow, handshake.
+$(BUILD)/livetailcat: tests/livetailcat.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) tests/livetailcat.c $(LIB_OBJS) $(LDFLAGS) -o $@
+
+live-tailcat: $(BUILD)/livetailcat
+	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build
