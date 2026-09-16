@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"encoding/binary"
+	"net/netip"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/tailscale/wireguard-go/device"
+	"tailscale.com/net/stun"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -552,6 +554,49 @@ func main() {
 		b.line("\t{ %q, %q, %q, %q, %q },",
 			fmt.Sprintf("exchange-%d", i), h(pk[:]), h(msg1),
 			h(wire.Bytes()), h(msg2))
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- STUN --------------------------------------------------------
+	//
+	// Binding requests built by tailscale.com/net/stun for fixed transaction
+	// IDs. The FINGERPRINT is the point: a wrong CRC-32 makes every request
+	// silently dropped by the server, and the only symptom is a timeout, so
+	// it has to be checked against the implementation the servers see.
+	b.line("/* STUN binding requests, via tailscale.com/net/stun. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *txid, *want;")
+	b.line("} kStunRequestVectors[] = {")
+	for i := 0; i < 4; i++ {
+		var tx stun.TxID
+		copy(tx[:], rb(12))
+		req := stun.Request(tx)
+		b.line("\t{ %q, %q, %q },", fmt.Sprintf("req-%d", i), h(tx[:]),
+			h(req))
+	}
+	b.line("};")
+	b.line("")
+
+	// Responses built by the same package, so our parser is checked against
+	// the encoder it will meet in the wild as well as against the RFC.
+	b.line("/* STUN binding responses, via tailscale.com/net/stun. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *txid, *msg, *want_ip;")
+	b.line("\tint want_port;")
+	b.line("} kStunResponseVectors[] = {")
+	for i, a := range []string{
+		"1.2.3.4:5", "203.0.113.7:41641", "255.255.255.255:65535",
+		"[2001:db8::1]:443", "[::1]:1",
+		"[2001:db8:1234:5678:11:2233:4455:6677]:32853",
+	} {
+		ap := netip.MustParseAddrPort(a)
+		var tx stun.TxID
+		copy(tx[:], rb(12))
+		msg := stun.Response(tx, ap)
+		b.line("\t{ %q, %q, %q, %q, %d },",
+			fmt.Sprintf("resp-%d", i), h(tx[:]), h(msg),
+			h(ap.Addr().AsSlice()), int(ap.Port()))
 	}
 	b.line("};")
 	b.line("")

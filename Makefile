@@ -164,6 +164,7 @@ LIB_SRCS := \
 	src/derp/frame.c \
 	src/derp/client.c \
 	src/derp/derpmap.c \
+	src/net/stun.c \
 	src/net/tcp.c \
 	src/net/tcpmux.c \
 	src/net/proxy.c \
@@ -178,7 +179,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -285,6 +286,14 @@ live-wg: $(BUILD)/livewg
 $(BUILD)/livetailcat: tests/livetailcat.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) tests/livetailcat.c $(LIB_OBJS) $(LDFLAGS) -o $@
+
+# A real STUN binding exchange against Tailscale's DERP servers.
+$(BUILD)/livestun: tests/livestun.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) tests/livestun.c $(LIB_OBJS) $(LDFLAGS) -o $@
+
+live-stun: $(BUILD)/livestun
+	./$(BUILD)/livestun
 
 live-cli: $(CLI)
 	CLI=$(CLI) sh scripts/live-cli.sh

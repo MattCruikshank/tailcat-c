@@ -5,6 +5,7 @@ go 1.27.1
 require (
 	github.com/tailscale/wireguard-go v0.0.0-20260911194433-e3222a3340cd
 	golang.org/x/crypto v0.57.0
+	tailscale.com v1.102.4
 )
 
 require (
