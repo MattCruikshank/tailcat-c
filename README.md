@@ -67,8 +67,9 @@ WebAssembly web demo does today. That drops `magicsock`'s hardest parts
 real thing, and it is a strict subset of the full data plane, so direct
 paths can be added later without redesign.
 
-Out of scope for now: direct P2P/NAT traversal, the SSH server, SFTP, the
-SOCKS proxy, and the browser/WASM build.
+Out of scope for now: direct P2P/NAT traversal, the SSH and SFTP *servers*
+(and therefore `recv` and `ls`), and the browser/WASM build. `forward`,
+`socks`, and `ssh`/`cp` as clients are all here.
 
 ## How it compares
 
@@ -105,6 +106,7 @@ largest thing we add is the 181 KB CA bundle.
 | DERP map fetch | ✅ | ✅ |
 | Region choice by latency | approximate | ✅ (netcheck) |
 | Multiple concurrent connections | ✅ | ✅ |
+| Multiple concurrent clients | ✅ (8) | ✅ |
 | UDP forwarding | ❌ | ✅ |
 | IPv4 into the tunnel via NAT64 | ❌ | ✅ |
 | TLS to the relay | 1.2 | 1.2 + 1.3 |
@@ -115,7 +117,6 @@ largest thing we add is the 181 KB CA bundle.
 | `version` | ✅ | ✅ |
 | `ping` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
-| Multiple concurrent clients | ✅ (8) | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
 | `socks` (SOCKS5 proxy) | ✅ (one server) | ✅ (many) |
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
@@ -131,11 +132,13 @@ largest thing we add is the 181 KB CA bundle.
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
 | aarch64 | built, never executed | ✅ |
 | Browser (WebAssembly) | ❌ | ✅ |
-| Persistent keys on disk | ❌ | ✅ |
+| Persistent keys on disk | ✅ | ✅ |
 
 So: tailcat-c does the **core data path** — address, relay, tunnel, TCP — in
-both roles and interoperably. Everything built *on top* of that data path is
-upstream's, and that is most of what a user actually reaches for.
+both roles and interoperably, and now most of what is built on top of it:
+serving ports, forwarding, SOCKS, ssh and cp, and saved identities. What is
+left is the direct peer-to-peer path, and the SSH server that `recv`, `ls`
+and `serve ssh` all sit behind.
 
 ## Build
 
