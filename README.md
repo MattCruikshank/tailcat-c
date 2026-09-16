@@ -104,17 +104,18 @@ largest thing we add is the 181 KB CA bundle.
 | Cookie reply (DoS mitigation) | ✅ | ✅ |
 | DERP map fetch | ✅ | ✅ |
 | Region choice by latency | approximate | ✅ (netcheck) |
-| Multiple concurrent connections | ✅ (library) | ✅ |
+| Multiple concurrent connections | ✅ | ✅ |
 | UDP forwarding | ❌ | ✅ |
 | IPv4 into the tunnel via NAT64 | ❌ | ✅ |
 | TLS to the relay | 1.2 | 1.2 + 1.3 |
 | **Commands** | | |
 | pipe stdin/stdout to a server | ✅ | ✅ |
-| `serve` | one client, one connection | full |
+| `serve` | ports, ranges, `all`; many clients | full |
 | `parse` | ✅ | ✅ (JSON) |
 | `version` | ✅ | ✅ |
 | `ping` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
+| Multiple concurrent clients | ✅ (8) | ✅ |
 | `forward` (local TCP port forwarding) | ❌ | ✅ |
 | `socks` (SOCKS5 proxy) | ❌ | ✅ |
 | `ssh` / `cp` / `ls` (SSH, SFTP, remote listing) | ❌ | ✅ |
@@ -469,6 +470,15 @@ with `-MMD -MP` and `-include`. ASan named the overflowing variable, its
 frame and the byte offset, which turned a mystifying crash into an obvious
 struct mismatch in about a minute.
 
+**15. The proxy killed its own process with SIGPIPE.** *(Phase 3.1, found by
+the first run of test_proxy.)* Writing to a socket whose peer has gone raises
+SIGPIPE, whose default disposition terminates the process -- and for a proxy,
+a local service exiting mid-stream is ordinary rather than exceptional. The
+test did not report a failure; it died with exit 141 and printed nothing.
+Fixed with `MSG_NOSIGNAL` per call rather than by changing the signal
+disposition of whatever program links the library, which is not a library's
+decision to make.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -480,6 +490,14 @@ Bugs 7 and 8 are worth separating out, because they are the opposite failure:
 cases with a symptom that pointed squarely at the implementation. When an
 interop test fails, the scaffolding deserves as much suspicion as the code
 under test.
+
+Multi-client serving repeated that lesson three times in one sitting, and all
+three looked like the server hanging: a bare `wait` that also waited on the
+server and the local service, which never exit; a background job inheriting
+stdout and holding the pipe open after the test had finished; and a
+`pkill -f tailcat-c` that matched the shell whose own command line contained
+that string, so the cleanup killed the thing running it. The feature under
+test worked first time. The harness cost more than the feature.
 
 Bugs 10 and 13 are the uncomfortable ones, and they are the same failure in
 two shapes: a check that cannot fail is not a check. One was a sanitizer whose
@@ -509,10 +527,13 @@ Current, and deliberate unless noted.
   DERP connection (TCP, TLS and the key exchange), not by STUN probes as
   upstream's netcheck does. It measures the path a relayed session actually
   uses, but will choose differently where TCP and UDP diverge.
-- **`serve` handles one client and one connection**, then exits. The
-  demultiplexer underneath supports many, and the CLI routes through it, but
-  the pipe has one stdin to give out so it takes the first connection only.
-  The commands that use the rest of it are Phase 3.
+- **`serve` with no ports handles one client and one connection**, then
+  exits -- it writes to one stdout, so a second client would have nowhere to
+  go. That is upstream's behaviour too. `serve <ports>` has no such limit and
+  takes up to 8 clients and 64 connections at once.
+- **No `--allow` list.** Anyone holding the address can connect. Upstream can
+  restrict by client public key; we cannot, so the address is the only
+  credential.
 
 ### TLS
 
@@ -713,9 +734,15 @@ Roughly in the order they should be picked up.
       write timeouts. A tunnel now survives its relay restarting, because
       WireGuard is keyed to the peers rather than to the path.
 
-Beyond here, see [PLAN.md](PLAN.md). Phase 3 is next and is now unblocked:
-`serve` with ports, `forward`, `socks` and the `ssh`/`cp` wrappers were all
-waiting on the demultiplexer and on a session that lasts.
+- [x] **Phase 3.1 — `serve <ports>`.** Port specs with ranges and `all`, a
+      reusable splice that carries half closes in both directions, and many
+      clients at once, each with its own WireGuard session and demultiplexer.
+      `make live-serve-ports` proves a real Go client reaching a real local
+      service; `make live-multi` proves four of them at once seeing only
+      their own traffic.
+
+Beyond here, see [PLAN.md](PLAN.md). Next are `forward` and `socks`, both of
+which are now mostly `tc_proxy` with a different front end.
 
 ## Licence
 

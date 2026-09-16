@@ -184,24 +184,43 @@ under it, replays and floods are refused, and no call can block forever.
 
 ## Phase 3 — the commands people actually use
 
-All of these depend on 2.1, which is now in place, so none of them is blocked.
+All of these depend on 2.1, which is in place, so none of them is blocked.
+3.2 and 3.3 also reuse `src/net/proxy.c` from 3.1, which is most of their
+bulk already written.
 
-### 3.1 `serve` with ports · ~200 lines · low risk
+### 3.1 `serve` with ports ✅ · 690 lines
 
-`serve 8080,8443` and `serve all`: accept connections inside the tunnel and
-proxy them to localhost ports. Needs 2.1 plus an outbound connector using the
-host stack (`tc_net_tcp_connect`, which exists).
+`serve 8080,8443`, `serve all`, port ranges, and as many clients at once as
+the table holds.
 
-### 3.2 `forward` · ~250 lines · low risk
+Three pieces rather than one: `src/portset.c` for the spec syntax,
+`src/net/proxy.c` for the splice (which 3.2 and 3.3 reuse, so it is in the
+library with its own tests), and an accept filter on the mux, since neither
+`all` nor "any port" fits an array of sixteen listeners.
+
+**Multi-client was folded in here** rather than left for later. Each client is
+a separate WireGuard session, tunnel address and demultiplexer; nothing is
+shared but the relay connection and the socket pool. Doing it now meant the
+proxy and the accept filter were designed against the real shape of the
+problem instead of being retrofitted.
+
+Half close is most of the work: the tunnel FIN becomes `shutdown(SHUT_WR)` on
+the socket, and the socket EOF becomes a tunnel FIN once everything read has
+been acknowledged. A proxy without it passes every request-response test and
+hangs on anything that signals completion with an EOF.
+
+### 3.2 `forward` · ~120 lines · low risk
 
 The inverse: listen on local TCP ports with the host stack, and proxy each
-accepted connection through the tunnel. Needs 2.1 and a poll loop over many
-descriptors rather than two.
+accepted connection through the tunnel. Smaller than estimated now that
+`tc_proxy` exists -- it is the same splice with the two ends swapped, plus
+parsing the `[bind:]port:remoteport` spec.
 
-### 3.3 `socks` · ~300 lines · low risk
+### 3.3 `socks` · ~200 lines · low risk
 
 A SOCKS5 server on localhost that dials through the tunnel. The protocol is
-small and well specified. Needs 2.1.
+small and well specified, and the byte-moving half is `tc_proxy` again; what
+is new is the negotiation in front of it.
 
 ### 3.4 `ssh` and `cp` clients · ~150 lines · low risk
 
@@ -221,7 +240,8 @@ since it writes attacker-named files. Path traversal is the obvious hazard.
 Persistent keys on disk (with sane permissions), printing a public key, and
 opening a browser. Mostly plumbing.
 
-**Phase 3 total: ~1,400 lines.**
+**Phase 3: 3.1 done (690 lines). Remaining: ~1,000 lines**, most of it 3.5
+and 3.6; 3.2 and 3.3 shrank once `tc_proxy` existed.
 
 ---
 
@@ -328,7 +348,7 @@ These are already in the README's TODO list and do not depend on any feature.
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
 | 2 — robust | ~1,390 ✅ | done |
-| 3 — commands | ~1,400 | low |
+| 3 — commands | ~1,000 left (690 done) | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
 | 5 — SSH + SFTP | ~5,500 | high |
