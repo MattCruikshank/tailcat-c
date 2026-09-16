@@ -32,6 +32,7 @@
 #include "tc/tailcat.h"
 #include "tc/fwdspec.h"
 #include "tc/keyfile.h"
+#include "tc/netcheck.h"
 #include "tc/portset.h"
 #include "tc/shquote.h"
 #include "tc/proxy.h"
@@ -106,6 +107,8 @@ static void usage(FILE *f)
 	        "  tailcat-c resolve <tc-address>          embed the relay, for "
 	        "offline use\n"
 	        "  tailcat-c parse <tc-address>            describe an address\n"
+	        "  tailcat-c netcheck                      report UDP, NAT and relay\n"
+	        "                                          latency\n"
 	        "  tailcat-c genkey --key <name> [--client] [--region N]\n"
 	        "  tailcat-c printpub                      the client key that "
 	        "would be used\n"
@@ -132,6 +135,90 @@ static void usage(FILE *f)
 	        "`serve <ports>` proxies each port to the same port on localhost "
 	        "and stays up.\n"
 	        "Short addresses work: the relay list is fetched as needed.\n");
+}
+
+/* ---- netcheck subcommand ---------------------------------------------- */
+
+/* What the network can do, printed rather than guessed at.
+ *
+ * Every other subcommand acts on the answer; this one just shows it, which is
+ * what makes it useful when a direct path is not happening and the question
+ * is whether the network or the code is at fault.
+ */
+static int cmd_netcheck(const char *derpmap_url, bool insecure,
+                        unsigned timeout_s)
+{
+	tc_derp_map *m = (tc_derp_map *)malloc(sizeof *m);
+	if (m == NULL)
+		return 1;
+
+	int timeout_ms = (timeout_s > 0 && timeout_s < 600) ? (int)timeout_s * 1000
+	                                                    : 60000;
+	if (tc_derpmap_fetch(m, derpmap_url, insecure, timeout_ms) != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_derpmap_error_string());
+		free(m);
+		return 1;
+	}
+
+	tc_udp u;
+	if (tc_udp_open(&u, 0) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not open a UDP socket\n");
+		free(m);
+		return 1;
+	}
+
+	tc_netcheck_opts o;
+	memset(&o, 0, sizeof o);
+	o.timeout_ms = 3000;
+
+	tc_netcheck_report rep;
+	int rc = tc_netcheck_run(&rep, m, &u, &o, NULL, NULL);
+	tc_udp_close(&u);
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_strerror(rc));
+		free(m);
+		return 1;
+	}
+
+	printf("UDP:  %s\n", rep.udp ? "yes" : "no (the relay is the only path)");
+	printf("IPv4: %s\n", rep.ipv4 ? "yes" : "no");
+	printf("IPv6: %s\n", rep.ipv6 ? "yes" : "no");
+
+	char s2[80];
+	if (rep.global_v4.ip_len != 0 &&
+	    tc_endpoint_format(s2, sizeof s2, &rep.global_v4) == TC_OK)
+		printf("public IPv4: %s\n", s2);
+	if (rep.global_v6.ip_len != 0 &&
+	    tc_endpoint_format(s2, sizeof s2, &rep.global_v6) == TC_OK)
+		printf("public IPv6: %s\n", s2);
+
+	if (!rep.mapping_varies_known)
+		printf("NAT mapping: unknown (fewer than two relays answered)\n");
+	else if (rep.mapping_varies)
+		printf("NAT mapping: varies by destination -- direct paths are "
+		       "unlikely\n");
+	else
+		printf("NAT mapping: stable\n");
+
+	printf("\nlatency by region:\n");
+	for (size_t i = 0; i < rep.num_regions; i++) {
+		const tc_netcheck_region *r = &rep.regions[i];
+		const tc_derp_region *reg = tc_derpmap_find(m, r->region_id);
+		const char *code = (reg != NULL) ? reg->region_code : "?";
+		char v4[16] = "-", v6[16] = "-";
+		if (r->rtt_v4_ms >= 0)
+			snprintf(v4, sizeof v4, "%dms", r->rtt_v4_ms);
+		if (r->rtt_v6_ms >= 0)
+			snprintf(v6, sizeof v6, "%dms", r->rtt_v6_ms);
+		printf("  %-5lld %-8s v4 %-8s v6 %-8s%s\n", (long long)r->region_id,
+		       code, v4, v6,
+		       (r->region_id == rep.preferred_region) ? "  <- preferred" : "");
+	}
+	if (rep.preferred_region == 0)
+		printf("  (nothing answered)\n");
+
+	free(m);
+	return 0;
 }
 
 /* ---- parse subcommand ------------------------------------------------- */
@@ -191,6 +278,56 @@ static int cmd_parse(const char *addr_str)
 
 /* ---- relay resolution ------------------------------------------------- */
 
+/* pick_region chooses a relay by STUN round trip.
+ *
+ * Phase 1.4 timed a DERP connection instead -- TCP, TLS and the relay's key
+ * exchange -- and said at the time that it was the cheap version. It probed
+ * four regions one after another, so a slow network cost four timeouts;
+ * netcheck sends every probe at once and the whole thing costs one.
+ *
+ * The socket here is a throwaway. The mapped address a netcheck learns
+ * belongs to the socket the probes went out on, and this one is closed
+ * immediately, so only the latencies are kept. Phase 4.4 will run a netcheck
+ * on the socket that carries the session, which is the only way the address
+ * is worth anything.
+ *
+ * Falls back to the old DERP timing if UDP gets nowhere: a network that
+ * blocks UDP still relays fine, and refusing to pick a relay because we could
+ * not measure one would turn a working setup into no service at all.
+ */
+static const tc_derp_region *pick_region(const tc_derp_map *m, int timeout_ms,
+                                         bool insecure)
+{
+	tc_udp u;
+	if (tc_udp_open(&u, 0) == TC_OK) {
+		tc_netcheck_opts o;
+		memset(&o, 0, sizeof o);
+		/* A ceiling, not a cost: the check ends as soon as every probe is
+		 * answered, which on a working network is one round trip. */
+		o.timeout_ms = (timeout_ms > 0 && timeout_ms < 3000) ? timeout_ms
+		                                                     : 3000;
+
+		tc_netcheck_report rep;
+		int rc = tc_netcheck_run(&rep, m, &u, &o, NULL, NULL);
+		tc_udp_close(&u);
+
+		if (rc == TC_OK) {
+			char line[200];
+			if (tc_netcheck_describe(line, sizeof line, &rep, m) == TC_OK)
+				vlogf("netcheck: %s", line);
+			if (rep.preferred_region != 0) {
+				const tc_derp_region *reg =
+				    tc_derpmap_find(m, rep.preferred_region);
+				if (reg != NULL)
+					return reg;
+			}
+		}
+	}
+
+	vlogf("no STUN answer; falling back to timing relay connections");
+	return tc_derpmap_pick_fastest(m, 4, timeout_ms, insecure);
+}
+
 /* ensure_relay makes sure ci names a relay we can actually dial.
  *
  * A short address carries only a region number, which means fetching the
@@ -227,7 +364,7 @@ static int ensure_relay(tc_conn_info *ci, const char *derpmap_url,
 	} else {
 		/* Either -1 (choose for me) or absent. */
 		vlogf("probing relays to pick one");
-		reg = tc_derpmap_pick_fastest(m, 4, timeout_ms, insecure);
+		reg = pick_region(m, timeout_ms, insecure);
 		if (reg == NULL) {
 			fprintf(stderr, "tailcat-c: no usable relay\n");
 			free(m);
@@ -2817,6 +2954,8 @@ int main(int argc, char **argv)
 		}
 		return cmd_resolve(args[1], derpmap_url, insecure);
 	}
+	if (strcmp(args[0], "netcheck") == 0)
+		return cmd_netcheck(derpmap_url, insecure, timeout_s);
 	if (strcmp(args[0], "ping") == 0) {
 		if (nargs < 2) {
 			fprintf(stderr, "tailcat-c: ping needs an address\n");

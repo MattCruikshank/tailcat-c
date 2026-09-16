@@ -104,7 +104,7 @@ largest thing we add is the 181 KB CA bundle.
 | Rekeying / session renewal | ✅ | ✅ |
 | Cookie reply (DoS mitigation) | ✅ | ✅ |
 | DERP map fetch | ✅ | ✅ |
-| Region choice by latency | approximate | ✅ (netcheck) |
+| Region choice by latency | ✅ (netcheck) | ✅ (netcheck) |
 | Multiple concurrent connections | ✅ | ✅ |
 | Multiple concurrent clients | ✅ (8) | ✅ |
 | UDP forwarding | ❌ | ✅ |
@@ -218,6 +218,7 @@ $ tailcat-c ssh <tc-addr> uptime           # via the system ssh
 $ tailcat-c ping <tc-address>              # time the round trip
 $ tailcat-c resolve <tc-address>           # embed the relay, for offline use
 $ tailcat-c parse <tc-address>             # describe an address
+$ tailcat-c netcheck                       # UDP, NAT type, relay latency
 ```
 
 The address must be self-contained; run `tailcat resolve` on a short one,
@@ -538,10 +539,11 @@ Current, and deliberate unless noted.
 
 ### Protocol scope
 
-- **Relay-only.** No direct peer-to-peer path, so no NAT traversal, no disco,
-  no STUN, no netcheck, no endpoint scoring. Every packet goes through DERP.
-  This is the agreed scope, and it is a strict subset of the full data plane,
-  but it means higher latency than real tailcat once that would have gone
+- **Relay-only, for now.** Every packet still goes through DERP. The pieces a
+  direct path is made of are here and tested -- a UDP transport, a STUN
+  client, netcheck, and the disco protocol -- but nothing yet probes candidate
+  paths, scores them, or moves a live session off the relay. Until that lands
+  this means higher latency than real tailcat wherever it would have gone
   direct.
 - **One pipe at a time.** The data path is real — WireGuard, userspace TCP,
   and interop with the Go binary in both directions — but a session carries a
@@ -559,10 +561,12 @@ Current, and deliberate unless noted.
   destination host in each CONNECT request -- only the port is used. Upstream
   routes by hostname across several servers at once. Ours would be inventing
   a destination it cannot reach.
-- **Region selection is an approximation.** A relay is chosen by timing a
-  DERP connection (TCP, TLS and the key exchange), not by STUN probes as
-  upstream's netcheck does. It measures the path a relayed session actually
-  uses, but will choose differently where TCP and UDP diverge.
+- **netcheck does not probe hairpinning or port mapping.** A relay is chosen
+  by STUN round trip as upstream's netcheck does, and the NAT mapping is
+  classified as stable or destination-dependent. What is missing is whether
+  we can reach our own mapped address, and UPnP/PMP/PCP -- each a separate
+  mechanism rather than a reading of these probes. `tailcat-c netcheck`
+  prints what is measured.
 - **`serve` with no ports handles one client and one connection**, then
   exits -- it writes to one stdout, so a second client would have nowhere to
   go. That is upstream's behaviour too. `serve <ports>` has no such limit and
@@ -700,8 +704,6 @@ Roughly in the order they should be picked up.
 - [ ] Revisit **TLS 1.3** once the PSA dependency is worth paying for.
 - [ ] Refresh the **CA bundle** and decide on a cadence for it.
 - [ ] Consider making the address-parser limits runtime-configurable.
-- [ ] **Replace the region heuristic with netcheck** once Phase 4 brings STUN;
-      until then a relay is chosen by DERP handshake time, not path quality.
 - [ ] **Refresh the DERP map cache in the background** rather than only on a
       miss, so a long-lived process does not pay a fetch mid-session.
 

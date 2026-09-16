@@ -5,6 +5,7 @@
 
 #include "tc/endpoint.h"
 
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -188,4 +189,26 @@ void tc_endpoint_from16(tc_endpoint *out, const uint8_t in[16], uint16_t port)
 	}
 	memcpy(out->ip, in, 16);
 	out->ip_len = 16;
+}
+
+int tc_endpoint_parse(tc_endpoint *out, const char *ip, uint16_t port)
+{
+	if (out == NULL || ip == NULL || ip[0] == '\0')
+		return TC_ERR_INVAL;
+	memset(out, 0, sizeof *out);
+
+	uint8_t buf[16];
+	if (inet_pton(AF_INET, ip, buf) == 1) {
+		memcpy(out->ip, buf, 4);
+		out->ip_len = 4;
+		out->port = port;
+		return TC_OK;
+	}
+	if (inet_pton(AF_INET6, ip, buf) == 1) {
+		/* Through from16, so "::ffff:203.0.113.7" and "203.0.113.7" become
+		 * the same endpoint rather than two that never compare equal. */
+		tc_endpoint_from16(out, buf, port);
+		return TC_OK;
+	}
+	return TC_ERR_INVAL;
 }

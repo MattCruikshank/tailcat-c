@@ -344,10 +344,35 @@ Testable the same way the TCP stack was — a simulated network with
 configurable NAT behaviour — but the failure modes are timing-dependent and
 the interop surface is large.
 
-### 4.5 netcheck · ~400 lines · medium risk
+### 4.5 netcheck ✅ · 620 lines
 
-Proper per-region latency and NAT-type probing, replacing the cheap 1.4
-heuristic.
+Per-region latency and NAT-type probing over UDP, replacing the 1.4
+heuristic. Every probe goes out at once, so the timeout is a ceiling on the
+whole check rather than a per-region cost; 1.4 probed four regions in
+sequence and a slow network cost four timeouts.
+
+The scheduling and accounting are separated from the socket, which is the
+design decision worth recording. A netcheck whose logic only runs against
+live servers can only be *tested* against live servers, and this project does
+not put load on Tailscale's infrastructure to check its own arithmetic.
+Driven by hand with the clock as an argument, the core is fully exercised
+offline -- latency ordering, retransmit rounds, answers arriving after the
+deadline, a response bearing a transaction ID we never sent, a response from
+the wrong address -- and a whole three-second check runs in microseconds.
+`tc_netcheck_run` is the thin loop that wires it to a tc_udp, tested against
+STUN responders on loopback.
+
+Seven mutations of the accounting were applied to confirm the tests bite;
+all seven were caught.
+
+The mapped address belongs to the socket the probes went out on, so
+`tc_netcheck_run` takes the caller's tc_udp rather than opening its own. The
+CLI's region selection uses a throwaway socket and keeps only the latencies;
+4.4 will run a netcheck on the socket that carries the session.
+
+Not implemented, deliberately: hairpinning, UPnP/PMP/PCP, captive portal
+detection. Each is a separate mechanism rather than a reading of these
+probes.
 
 **Phase 4 total: ~1,950 lines.** Realistically the longest phase in calendar
 time regardless of line count.

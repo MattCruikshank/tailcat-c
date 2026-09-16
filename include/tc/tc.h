@@ -24,7 +24,8 @@ enum {
 	TC_ERR_TIMEOUT = -7,     /* the deadline passed with nothing to read */
 	TC_ERR_EXIST = -8,       /* the thing being created is already there */
 	TC_ERR_AGAIN = -9,       /* not ready yet; the caller should retry */
-	TC_ERR_CLOSED = -10      /* the peer hung up; reconnecting may help */
+	TC_ERR_CLOSED = -10,     /* the peer hung up; reconnecting may help */
+	TC_ERR_DONE = -11        /* nothing left to do; not a failure */
 };
 
 /* tc_strerror returns a short static description of a TC_ERR_* code.

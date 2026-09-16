@@ -119,6 +119,8 @@ if [ "$LEVEL" -eq 1 ]; then
 	# pointed at someone else'"'"'s infrastructure on every push is rude, and
 	# network flakiness would train everyone to ignore the result.
 	stage "live: DERP relay round trip and reconnection" "make live"
+	stage "live: STUN binding exchange" "make live-stun"
+	stage "live: netcheck against the real relay list" "make live-netcheck"
 	stage "live: wireguard-go handshake" "make live-wg"
 	stage "live: real tailcat server" "make live-tailcat"
 	stage "live: CLI to a Go server" "make live-cli"

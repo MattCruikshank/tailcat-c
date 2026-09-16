@@ -47,4 +47,13 @@ void tc_endpoint_to16(const tc_endpoint *ep, uint8_t out[16]);
  * the four-byte one it stands for. */
 void tc_endpoint_from16(tc_endpoint *out, const uint8_t in[16], uint16_t port);
 
+/* tc_endpoint_parse reads a literal address -- "203.0.113.7" or
+ * "2001:db8::1" -- and pairs it with a port. No DNS: a name that needs
+ * resolving is a different operation with different failure modes, and a
+ * function that sometimes blocks for seconds is not one to call casually.
+ *
+ * A v4-mapped literal comes back as IPv4, for the same reason
+ * tc_endpoint_from16 unmaps one. */
+int tc_endpoint_parse(tc_endpoint *out, const char *ip, uint16_t port);
+
 #endif /* TC_ENDPOINT_H_ */
