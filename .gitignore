@@ -1,0 +1,7 @@
+upstream-tailcat/
+upstream-tailscale/
+build/
+*.o
+*.a
+*.dbg
+*.com

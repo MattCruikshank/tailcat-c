@@ -1,0 +1,4 @@
+# This project is built under WSL/Linux with cosmocc. CRLF would break the
+# shell scripts (a  in the shebang) and is wrong for C sources here, so
+# normalise everything to LF in both the repo and the working tree.
+* text=auto eol=lf
