@@ -209,18 +209,24 @@ the socket, and the socket EOF becomes a tunnel FIN once everything read has
 been acknowledged. A proxy without it passes every request-response test and
 hangs on anything that signals completion with an EOF.
 
-### 3.2 `forward` · ~120 lines · low risk
+### 3.2 `forward` ✅ · 230 lines
 
-The inverse: listen on local TCP ports with the host stack, and proxy each
-accepted connection through the tunnel. Smaller than estimated now that
-`tc_proxy` exists -- it is the same splice with the two ends swapped, plus
-parsing the `[bind:]port:remoteport` spec.
+`forward <addr> 8080 18080:8080 0:443`. Listeners bind before the tunnel is
+dialled, so a port already in use fails immediately rather than after a
+handshake with a relay, and an OS-chosen port is read back with `getsockname`
+so the number printed is the one that was actually used.
 
-### 3.3 `socks` · ~200 lines · low risk
+The `local:host:port` form needs an exit node and is refused by name.
 
-A SOCKS5 server on localhost that dials through the tunnel. The protocol is
-small and well specified, and the byte-moving half is `tc_proxy` again; what
-is new is the negotiation in front of it.
+### 3.3 `socks` ✅ · 180 lines
+
+A SOCKS5 server that dials through the tunnel: no authentication, CONNECT
+only, proper reply codes for refusals.
+
+The destination **host** is read and discarded. There is exactly one place
+this proxy can go -- the server at the far end of the tunnel -- so only the
+port means anything. Upstream routes by hostname because it can hold several
+servers at once; with one, doing so would be a fiction.
 
 ### 3.4 `ssh` and `cp` clients · ~150 lines · low risk
 
@@ -240,8 +246,12 @@ since it writes attacker-named files. Path traversal is the obvious hazard.
 Persistent keys on disk (with sane permissions), printing a public key, and
 opening a browser. Mostly plumbing.
 
-**Phase 3: 3.1 done (690 lines). Remaining: ~1,000 lines**, most of it 3.5
-and 3.6; 3.2 and 3.3 shrank once `tc_proxy` existed.
+**Phase 3: 3.1, 3.2 and 3.3 done (1,100 lines). Remaining: ~650 lines** for
+3.4, 3.5 and 3.6. The three commands that move bytes are finished; what is
+left is process spawning, a file drop box and key management.
+
+`client_up` now does the dial-a-server bring-up once for pipe, forward and
+socks, so 3.4's `ssh` and `cp` inherit it.
 
 ---
 
@@ -348,7 +358,7 @@ These are already in the README's TODO list and do not depend on any feature.
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
 | 2 — robust | ~1,390 ✅ | done |
-| 3 — commands | ~1,000 left (690 done) | low |
+| 3 — commands | ~650 left (1,100 done) | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
 | 5 — SSH + SFTP | ~5,500 | high |

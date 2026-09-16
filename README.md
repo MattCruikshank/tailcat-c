@@ -116,8 +116,8 @@ largest thing we add is the 181 KB CA bundle.
 | `ping` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
 | Multiple concurrent clients | ✅ (8) | ✅ |
-| `forward` (local TCP port forwarding) | ❌ | ✅ |
-| `socks` (SOCKS5 proxy) | ❌ | ✅ |
+| `forward` (local TCP port forwarding) | ✅ | ✅ |
+| `socks` (SOCKS5 proxy) | ✅ (one server) | ✅ (many) |
 | `ssh` / `cp` / `ls` (SSH, SFTP, remote listing) | ❌ | ✅ |
 | `recv` (file drop box) | ❌ | ✅ |
 | `browse`, `genkey`, `printpub`, `readme` | ❌ | ✅ |
@@ -202,6 +202,9 @@ Then:
 ```console
 $ tailcat-c serve                          # listen; prints an address
 $ echo hello | tailcat-c <tc-address>      # pipe to a server
+$ tailcat-c serve 22,80,8000-8999          # proxy local ports
+$ tailcat-c forward <tc-addr> 18080:80     # reach its port 80 on ours
+$ tailcat-c socks <tc-addr> 1080           # or via a SOCKS5 proxy
 $ tailcat-c ping <tc-address>              # time the round trip
 $ tailcat-c resolve <tc-address>           # embed the relay, for offline use
 $ tailcat-c parse <tc-address>             # describe an address
@@ -522,7 +525,11 @@ Current, and deliberate unless noted.
   and interop with the Go binary in both directions — but a session carries a
   single stream of bytes. The port-based commands all wait on the
   demultiplexer (PLAN.md 2.1).
-- **No SSH, SFTP, SOCKS, port forwarding, or WASM build.**
+- **No SSH, SFTP or WASM build.**
+- **`socks` reaches one server**, the one in its address, and ignores the
+  destination host in each CONNECT request -- only the port is used. Upstream
+  routes by hostname across several servers at once. Ours would be inventing
+  a destination it cannot reach.
 - **Region selection is an approximation.** A relay is chosen by timing a
   DERP connection (TCP, TLS and the key exchange), not by STUN probes as
   upstream's netcheck does. It measures the path a relayed session actually
@@ -741,8 +748,15 @@ Roughly in the order they should be picked up.
       service; `make live-multi` proves four of them at once seeing only
       their own traffic.
 
-Beyond here, see [PLAN.md](PLAN.md). Next are `forward` and `socks`, both of
-which are now mostly `tc_proxy` with a different front end.
+- [x] **Phase 3.2 and 3.3 — `forward` and `socks`.** Both listen locally and
+      dial through the tunnel, sharing one loop and the splice from 3.1.
+      `make live-forward` runs each against a real Go `tailcat serve`, which
+      is the mirror of `live-serve-ports`: between them, both ends of the
+      proxy have now been driven by something that is not ours.
+
+Beyond here, see [PLAN.md](PLAN.md). What is left in Phase 3 is process
+spawning (`ssh`, `cp`), a file drop box (`recv`) and key management
+(`genkey`) -- none of which move bytes, so none of them touch the data path.
 
 ## Licence
 
