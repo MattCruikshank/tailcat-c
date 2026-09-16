@@ -100,6 +100,48 @@ void tc_wg_peer_force_rng(tc_wg_peer *p, uint64_t seed)
 		p->rng = seed | 1u;
 }
 
+/* ---- cookies ----------------------------------------------------------- */
+
+/* have_cookie reports whether the peer's last cookie is still worth using.
+ * The responder rotates its secret on the same interval, so an older one
+ * would simply fail to verify. */
+static bool have_cookie(const tc_wg_peer *p, uint64_t now)
+{
+	return p->has_cookie &&
+	       now - p->cookie_at_ms < TC_WG_COOKIE_REFRESH_MS;
+}
+
+/* finish_macs adds mac2 when we hold a cookie, and records the message's
+ * mac1. The mac1 has to be kept because a cookie reply is sealed with it as
+ * additional data -- without it the reply cannot be opened. */
+static void finish_macs(tc_wg_peer *p, uint8_t *msg, size_t len, uint64_t now)
+{
+	if (have_cookie(p, now))
+		tc_wg_add_mac2(msg, len, p->cookie);
+	memcpy(p->last_mac1, msg + len - 2 * TC_WG_MAC_LEN, TC_WG_MAC_LEN);
+	p->has_last_mac1 = true;
+}
+
+/* cookie_secret_for returns the secret we issue cookies under, generating or
+ * rotating it as needed. */
+static const uint8_t *cookie_secret_for(tc_wg_peer *p, uint64_t now)
+{
+	if (!p->has_cookie_secret ||
+	    now - p->cookie_secret_at_ms >= TC_WG_COOKIE_REFRESH_MS) {
+		if (tc_random_bytes(p->cookie_secret, sizeof p->cookie_secret) != TC_OK)
+			return NULL;
+		p->cookie_secret_at_ms = now;
+		p->has_cookie_secret = true;
+	}
+	return p->cookie_secret;
+}
+
+void tc_wg_peer_set_under_load(tc_wg_peer *p, bool under_load)
+{
+	if (p != NULL)
+		p->under_load = under_load;
+}
+
 /* ---- starting a handshake --------------------------------------------- */
 
 /* emit_initiation builds and sends a brand-new initiation, replacing whatever
@@ -113,13 +155,14 @@ void tc_wg_peer_force_rng(tc_wg_peer *p, uint64_t seed)
  * lost handshake packet would strand the tunnel until the attempt is
  * abandoned. wireguard-go calls CreateMessageInitiation on every send for
  * this reason. */
-static int emit_initiation(tc_wg_peer *p)
+static int emit_initiation(tc_wg_peer *p, uint64_t now)
 {
 	if (tc_wg_handshake_init(&p->hs, &p->id, p->remote_static,
 	                         p->has_psk ? p->psk : NULL) != TC_OK)
 		return TC_ERR_INVAL;
 	if (tc_wg_create_initiation(p->hs_msg, &p->hs, &p->id, 0) != TC_OK)
 		return TC_ERR_INVAL;
+	finish_macs(p, p->hs_msg, sizeof p->hs_msg, now);
 	(void)p->send(p->send_ctx, p->hs_msg, sizeof p->hs_msg);
 	return TC_OK;
 }
@@ -131,7 +174,7 @@ int tc_wg_peer_start_handshake(tc_wg_peer *p, uint64_t now_ms)
 	if (p->hs_active)
 		return TC_OK; /* one at a time; the timer will retry it */
 
-	int rc = emit_initiation(p);
+	int rc = emit_initiation(p, now_ms);
 	if (rc != TC_OK)
 		return rc;
 
@@ -275,6 +318,35 @@ static int handle_initiation(tc_wg_peer *p, const uint8_t *msg, size_t len,
 	if (len != TC_WG_INITIATION_SIZE)
 		return TC_OK;
 
+	/* Under load, an initiation must carry a mac2 derived from a cookie we
+	 * issued, which only a peer that can actually receive at the identity it
+	 * claims can produce.
+	 *
+	 * This runs before tc_wg_handshake_init, not merely before consuming the
+	 * message: that call does an X25519 of its own to precompute the static
+	 * shared secret. Checking after it would still do the expensive work for
+	 * every forged initiation, which is the cost the cookie exists to avoid.
+	 *
+	 * The sender identifier is the peer's node key rather than an IP: over a
+	 * relay there is no address to use, and the cookie is opaque to the
+	 * initiator, so the choice is purely local and interoperates either way. */
+	if (p->under_load) {
+		const uint8_t *secret = cookie_secret_for(p, now);
+		if (secret != NULL &&
+		    !tc_wg_check_mac2(msg, len, secret, p->remote_static,
+		                      TC_WG_KEY_LEN)) {
+			uint8_t reply[TC_WG_COOKIE_REPLY_SIZE];
+			if (tc_wg_create_cookie_reply(reply, msg, len, p->id.public_key,
+			                              secret, p->remote_static,
+			                              TC_WG_KEY_LEN) == TC_OK) {
+				(void)p->send(p->send_ctx, reply, sizeof reply);
+				p->stats.cookies_sent++;
+			}
+			p->stats.rejected_mac2++;
+			return TC_OK;
+		}
+	}
+
 	tc_wg_handshake hs;
 	if (tc_wg_handshake_init(&hs, &p->id, p->remote_static,
 	                         p->has_psk ? p->psk : NULL) != TC_OK)
@@ -304,6 +376,7 @@ static int handle_initiation(tc_wg_peer *p, const uint8_t *msg, size_t len,
 		tc_memzero_explicit(&hs, sizeof hs);
 		return TC_OK;
 	}
+	finish_macs(p, resp, sizeof resp, now);
 
 	tc_wg_session s;
 	if (tc_wg_begin_session(&s, &hs) != TC_OK) {
@@ -323,6 +396,32 @@ static int handle_initiation(tc_wg_peer *p, const uint8_t *msg, size_t len,
 
 	tc_memzero_explicit(&s, sizeof s);
 	tc_memzero_explicit(&hs, sizeof hs);
+	return TC_OK;
+}
+
+/* handle_cookie_reply stores a cookie a loaded peer issued us, so the next
+ * initiation can prove we are reachable. */
+static int handle_cookie_reply(tc_wg_peer *p, const uint8_t *msg, size_t len,
+                               uint64_t now)
+{
+	if (len != TC_WG_COOKIE_REPLY_SIZE || !p->has_last_mac1)
+		return TC_OK;
+
+	uint8_t cookie[TC_WG_COOKIE_LEN];
+	if (tc_wg_consume_cookie_reply(cookie, msg, p->remote_static,
+	                               p->last_mac1) != TC_OK)
+		return TC_OK; /* forged, or answering a handshake that is not ours */
+
+	memcpy(p->cookie, cookie, sizeof cookie);
+	p->cookie_at_ms = now;
+	p->has_cookie = true;
+	p->stats.cookies_received++;
+	tc_memzero_explicit(cookie, sizeof cookie);
+
+	/* Retry at once rather than waiting out REKEY_TIMEOUT: the peer told us
+	 * exactly what was missing, and the next attempt will carry it. */
+	if (p->hs_active)
+		p->hs_next_ms = now;
 	return TC_OK;
 }
 
@@ -435,9 +534,7 @@ int tc_wg_peer_input(tc_wg_peer *p, const uint8_t *msg, size_t len,
 			return TC_ERR_INVAL;
 		return handle_transport(p, msg, len, out, cap, out_len, now_ms);
 	case TC_WG_MSG_COOKIE_REPLY:
-		/* Not implemented; see PLAN.md 2.3. A peer under load that demands a
-		 * cookie will not get one, and our handshake will simply time out. */
-		return TC_OK;
+		return handle_cookie_reply(p, msg, len, now_ms);
 	default:
 		return TC_OK;
 	}
@@ -471,7 +568,7 @@ int tc_wg_peer_tick(tc_wg_peer *p, uint64_t now_ms)
 			/* A fresh initiation, not the previous one again: see
 			 * emit_initiation. The attempt clock is not reset, so the whole
 			 * sequence still gives up after REKEY_ATTEMPT_TIME. */
-			(void)emit_initiation(p);
+			(void)emit_initiation(p, now_ms);
 			p->hs_next_ms = now_ms + TC_WG_REKEY_TIMEOUT_MS + jitter(p);
 			p->stats.handshakes_retried++;
 		}

@@ -210,6 +210,74 @@ int tc_wg_decrypt(uint8_t *out, size_t cap, size_t *out_len, tc_wg_session *s,
 /* tc_wg_session_clear wipes the keys. */
 void tc_wg_session_clear(tc_wg_session *s);
 
+/* ---- cookies (DoS mitigation) ----------------------------------------- */
+
+#define TC_WG_COOKIE_LEN 16
+#define TC_WG_COOKIE_NONCE_LEN 24
+#define TC_WG_COOKIE_REPLY_SIZE 64
+
+/* A cookie is valid for two minutes on both sides: the responder rotates its
+ * secret on that interval, so an older cookie would no longer verify. */
+#define TC_WG_COOKIE_REFRESH_MS 120000u
+
+/* Cookie reply, 64 bytes
+ *   0   u32   type = 3
+ *   4   u32   receiver index
+ *   8   [24]  nonce
+ *   32  [32]  XAEAD(cookie) + tag
+ *
+ * A responder under load answers a handshake with one of these instead of a
+ * response. The cookie is a MAC over something that identifies the sender, so
+ * only a peer that can actually receive at the address it claims can echo it
+ * back -- which is what makes flooding from a forged source pointless.
+ *
+ * The cookie's contents are opaque to the initiator, which only echoes them
+ * in mac2. That means the choice of sender identifier is purely local: over
+ * DERP there is no IP to use, so the peer's node key serves instead, and
+ * interoperability is unaffected. */
+
+/* tc_wg_cookie_key derives the key protecting cookie replies addressed to the
+ * holder of public_key: BLAKE2s-256("cookie--" || pk). When replying, use
+ * your own public key; when consuming a reply, use the sender's. */
+void tc_wg_cookie_key(uint8_t out[TC_WG_KEY_LEN],
+                      const uint8_t public_key[TC_WG_KEY_LEN]);
+
+/* tc_wg_compute_cookie is the MAC over a sender identifier under a secret
+ * that the responder rotates every TC_WG_COOKIE_REFRESH_MS. */
+void tc_wg_compute_cookie(uint8_t out[TC_WG_COOKIE_LEN],
+                          const uint8_t secret[TC_WG_KEY_LEN],
+                          const void *src_id, size_t src_id_len);
+
+/* tc_wg_create_cookie_reply builds a reply to the handshake message in msg.
+ * receiver is the sender index taken from that message. */
+int tc_wg_create_cookie_reply(uint8_t out[TC_WG_COOKIE_REPLY_SIZE],
+                              const uint8_t *msg, size_t msg_len,
+                              const uint8_t our_public[TC_WG_KEY_LEN],
+                              const uint8_t secret[TC_WG_KEY_LEN],
+                              const void *src_id, size_t src_id_len);
+
+/* tc_wg_consume_cookie_reply decrypts a reply into out_cookie.
+ *
+ * sent_mac1 must be the mac1 of the message that provoked it: it is the
+ * additional data, so a reply cannot be lifted from one handshake and
+ * replayed into another. */
+int tc_wg_consume_cookie_reply(uint8_t out_cookie[TC_WG_COOKIE_LEN],
+                               const uint8_t msg[TC_WG_COOKIE_REPLY_SIZE],
+                               const uint8_t peer_public[TC_WG_KEY_LEN],
+                               const uint8_t sent_mac1[TC_WG_MAC_LEN]);
+
+/* tc_wg_add_mac2 fills in the mac2 field of a handshake message already
+ * carrying its mac1. Without a cookie the field stays zero, which a peer that
+ * is not under load accepts. */
+void tc_wg_add_mac2(uint8_t *msg, size_t len,
+                    const uint8_t cookie[TC_WG_COOKIE_LEN]);
+
+/* tc_wg_check_mac2 verifies mac2 against the cookie we would have issued to
+ * this sender. */
+bool tc_wg_check_mac2(const uint8_t *msg, size_t len,
+                      const uint8_t secret[TC_WG_KEY_LEN], const void *src_id,
+                      size_t src_id_len);
+
 /* ---- mac1 ------------------------------------------------------------ */
 
 /* tc_wg_mac1_key derives the key used to authenticate handshake messages

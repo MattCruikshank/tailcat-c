@@ -137,6 +137,31 @@ int tc_aead_open_nonce(uint8_t *out, const uint8_t key[TC_AEAD_KEY_LEN],
                        const uint8_t nonce[TC_AEAD_NONCE_LEN], const void *ad,
                        size_t ad_len, const void *ct, size_t ct_len);
 
+/* ---- XChaCha20-Poly1305 ---------------------------------------------- */
+
+/* WireGuard's cookie reply is sealed with XChaCha20-Poly1305 rather than the
+ * ChaCha20-Poly1305 used everywhere else, because the cookie's nonce is
+ * random rather than a counter and 96 bits is not enough room to pick one
+ * safely. XChaCha extends the nonce to 192 bits by deriving a subkey from the
+ * first 128 of them.
+ *
+ * This is the same trick as NaCl's XSalsa20 below, one cipher over. */
+
+#define TC_XAEAD_NONCE_LEN 24
+
+/* tc_hchacha20 derives a subkey from a key and 16 bytes of nonce. It is the
+ * ChaCha20 core without the final feed-forward addition, which is what makes
+ * it a secure PRF rather than a stream cipher block. */
+void tc_hchacha20(uint8_t out[TC_AEAD_KEY_LEN],
+                  const uint8_t key[TC_AEAD_KEY_LEN], const uint8_t nonce[16]);
+
+int tc_xaead_seal(uint8_t *out, const uint8_t key[TC_AEAD_KEY_LEN],
+                  const uint8_t nonce[TC_XAEAD_NONCE_LEN], const void *ad,
+                  size_t ad_len, const void *pt, size_t pt_len);
+int tc_xaead_open(uint8_t *out, const uint8_t key[TC_AEAD_KEY_LEN],
+                  const uint8_t nonce[TC_XAEAD_NONCE_LEN], const void *ad,
+                  size_t ad_len, const void *ct, size_t ct_len);
+
 /* ---- NaCl box (X25519 + HSalsa20 + XSalsa20-Poly1305) ---------------- */
 
 /* DERP's handshake frames are NaCl boxes, not ChaCha20-Poly1305: the client

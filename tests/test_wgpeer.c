@@ -586,6 +586,165 @@ static void test_initiation_replay(void)
 	link_done(&l);
 }
 
+/* ---- cookies (PLAN 2.3) ------------------------------------------------ */
+
+static void test_cookie_exchange(void)
+{
+	TCT_CASE("a peer under load demands a cookie and the handshake completes");
+	/* The exchange costs one extra round trip: the first initiation is
+	 * refused with a cookie, and the retry carries a mac2 derived from it. */
+	link_t l;
+	link_init(&l, 31);
+	tc_wg_peer_set_under_load(&l.b, true);
+
+	TCT_EQ_INT(tc_wg_peer_start_handshake(&l.a, l.now), TC_OK);
+
+	bool up = false;
+	for (int i = 0; i < 200; i++) {
+		advance(&l, 100);
+		if (tc_wg_peer_is_up(&l.a, l.now)) {
+			up = true;
+			break;
+		}
+	}
+	TCT_TRUE(up);
+
+	tc_wg_peer_stats sa, sb;
+	tc_wg_peer_get_stats(&l.a, &sa);
+	tc_wg_peer_get_stats(&l.b, &sb);
+
+	/* It must actually have gone through the cookie path, or this test is
+	 * only checking that handshakes work. */
+	TCT_EQ_INT((int)sb.cookies_sent, 1);
+	TCT_EQ_INT((int)sb.rejected_mac2, 1);
+	TCT_EQ_INT((int)sa.cookies_received, 1);
+	TCT_EQ_INT((int)sb.handshakes_responded, 1);
+
+	TCT_CASE("and the retry was prompt, not a full REKEY_TIMEOUT later");
+	/* The peer said exactly what was missing, so waiting five seconds to
+	 * act on it would be five seconds of dead tunnel for no reason. */
+	if (l.now > 2000)
+		TCT_FAILF("took %llums to complete, so the cookie did not trigger "
+		          "an immediate retry",
+		          (unsigned long long)l.now);
+	tct_checks++;
+
+	TCT_TRUE(ping(&l, 0xE1));
+
+	TCT_CASE("a later handshake reuses the cookie and is not refused again");
+	uint64_t before_cookies = sb.cookies_sent;
+	advance(&l, 2000);
+	l.a.hs_active = false;
+	TCT_EQ_INT(tc_wg_peer_start_handshake(&l.a, l.now), TC_OK);
+	advance(&l, 500);
+	tc_wg_peer_get_stats(&l.b, &sb);
+	TCT_EQ_INT((int)(sb.cookies_sent - before_cookies), 0);
+	TCT_EQ_INT((int)sb.handshakes_responded, 2);
+
+	link_done(&l);
+}
+
+static void test_cookie_expiry(void)
+{
+	TCT_CASE("a cookie older than the refresh interval is demanded again");
+	/* The responder rotates its secret every two minutes, so a cookie past
+	 * that no longer verifies and the exchange has to happen afresh. */
+	link_t l;
+	link_init(&l, 33);
+	tc_wg_peer_set_under_load(&l.b, true);
+
+	TCT_TRUE(bring_up(&l));
+	TCT_TRUE(ping(&l, 0xE2));
+
+	tc_wg_peer_stats sb;
+	tc_wg_peer_get_stats(&l.b, &sb);
+	TCT_EQ_INT((int)sb.cookies_sent, 1);
+
+	/* Past the refresh interval, with the session dead too. */
+	advance(&l, TC_WG_COOKIE_REFRESH_MS + 10000);
+	uint8_t msg[16];
+	memset(msg, 0xE3, sizeof msg);
+	bool back = false;
+	for (int i = 0; i < 100; i++) {
+		(void)tc_wg_peer_send(&l.a, msg, sizeof msg, l.now);
+		advance(&l, 500);
+		if (tc_wg_peer_is_up(&l.a, l.now)) {
+			back = true;
+			break;
+		}
+	}
+	TCT_TRUE(back);
+
+	tc_wg_peer_get_stats(&l.b, &sb);
+	if (sb.cookies_sent < 2)
+		TCT_FAILF("the stale cookie was accepted: only %llu were ever issued",
+		          (unsigned long long)sb.cookies_sent);
+	tct_checks++;
+
+	link_done(&l);
+}
+
+static void test_cookie_reply_cannot_be_forged(void)
+{
+	TCT_CASE("a cookie reply from anyone else is ignored");
+	link_t l;
+	link_init(&l, 35);
+	tc_wg_peer_set_under_load(&l.b, true);
+	TCT_TRUE(bring_up(&l));
+
+	tc_wg_peer_stats before, after;
+	tc_wg_peer_get_stats(&l.a, &before);
+
+	/* A well-formed reply sealed under a key A does not expect. */
+	uint8_t junk[TC_WG_COOKIE_REPLY_SIZE];
+	memset(junk, 0, sizeof junk);
+	junk[0] = TC_WG_MSG_COOKIE_REPLY;
+	TCT_EQ_INT(tc_random_bytes(junk + 8, sizeof junk - 8), TC_OK);
+
+	uint8_t out[64];
+	size_t n = 1;
+	TCT_EQ_INT(tc_wg_peer_input(&l.a, junk, sizeof junk, out, sizeof out, &n,
+	                            l.now),
+	           TC_OK);
+	TCT_EQ_INT((int)n, 0);
+	tc_wg_peer_get_stats(&l.a, &after);
+	TCT_EQ_INT((int)(after.cookies_received - before.cookies_received), 0);
+
+	TCT_CASE("a truncated cookie reply is ignored");
+	TCT_EQ_INT(tc_wg_peer_input(&l.a, junk, 20, out, sizeof out, &n, l.now),
+	           TC_OK);
+	TCT_EQ_INT((int)n, 0);
+
+	TCT_CASE("and the session is undisturbed");
+	TCT_TRUE(ping(&l, 0xE4));
+
+	link_done(&l);
+}
+
+static void test_not_under_load_by_default(void)
+{
+	TCT_CASE("a peer not under load never demands a cookie");
+	/* The default has to stay off: an extra round trip on every handshake
+	 * would be a real cost for a tool whose traffic is already bounded by
+	 * the relay. */
+	link_t l;
+	link_init(&l, 37);
+	TCT_TRUE(bring_up(&l));
+	TCT_TRUE(ping(&l, 0xE5));
+
+	tc_wg_peer_stats sa, sb;
+	tc_wg_peer_get_stats(&l.a, &sa);
+	tc_wg_peer_get_stats(&l.b, &sb);
+	TCT_EQ_INT((int)sb.cookies_sent, 0);
+	TCT_EQ_INT((int)sa.cookies_received, 0);
+	TCT_EQ_INT((int)sb.rejected_mac2, 0);
+	/* And no extra round trip: one initiation, one response. */
+	TCT_EQ_INT((int)sa.handshakes_initiated, 1);
+	TCT_EQ_INT((int)sa.handshakes_retried, 0);
+
+	link_done(&l);
+}
+
 /* ---- dispatch and malformed input -------------------------------------- */
 
 static void test_rejects_junk(void)
@@ -710,6 +869,10 @@ int main(void)
 	test_expiry();
 	test_keepalive();
 	test_initiation_replay();
+	test_cookie_exchange();
+	test_cookie_expiry();
+	test_cookie_reply_cannot_be_forged();
+	test_not_under_load_by_default();
 	test_rejects_junk();
 	test_rekeys_on_message_count();
 	return tct_report("wgpeer");

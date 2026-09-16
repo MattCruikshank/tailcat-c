@@ -84,6 +84,9 @@ typedef struct {
 	uint64_t rejected_expired;
 	uint64_t rejected_replay;      /* initiations with a stale timestamp */
 	uint64_t rejected_unknown_key; /* transport for no keypair we hold */
+	uint64_t cookies_sent;         /* cookie replies we issued */
+	uint64_t cookies_received;     /* cookie replies we accepted */
+	uint64_t rejected_mac2;        /* initiations refused while under load */
 } tc_wg_peer_stats;
 
 typedef struct {
@@ -114,6 +117,26 @@ typedef struct {
 	uint8_t last_timestamp[TC_WG_TIMESTAMP_LEN];
 	bool has_last_timestamp;
 
+	/* Cookies, as initiator: what the peer last issued us, and the mac1 of
+	 * the most recent handshake message we sent -- the reply is bound to it,
+	 * so it has to be remembered to open one. */
+	uint8_t cookie[TC_WG_COOKIE_LEN];
+	uint64_t cookie_at_ms;
+	bool has_cookie;
+	uint8_t last_mac1[TC_WG_MAC_LEN];
+	bool has_last_mac1;
+
+	/* Cookies, as responder: the rotating secret every cookie we issue is
+	 * derived from. Rotating it is what bounds how long a stolen cookie is
+	 * worth anything. */
+	uint8_t cookie_secret[TC_WG_KEY_LEN];
+	uint64_t cookie_secret_at_ms;
+	bool has_cookie_secret;
+
+	/* When set, an initiation without a valid mac2 is answered with a cookie
+	 * rather than a handshake. Off by default: see tc_wg_peer_set_under_load. */
+	bool under_load;
+
 	tc_wg_send_fn send;
 	void *send_ctx;
 
@@ -129,6 +152,19 @@ int tc_wg_peer_init(tc_wg_peer *p, const tc_wg_identity *id,
                     const uint8_t remote_static[TC_WG_KEY_LEN],
                     const uint8_t psk[TC_WG_KEY_LEN], tc_wg_send_fn send,
                     void *send_ctx);
+
+/* tc_wg_peer_set_under_load decides whether an initiation without a valid
+ * mac2 is answered with a cookie instead of a handshake.
+ *
+ * Off by default, because a cookie exchange costs the peer an extra round
+ * trip and this is a netcat, not a relay: the traffic that reaches us is
+ * already bounded by DERP. Turning it on is what makes a flood of forged
+ * initiations cheap to refuse, since only a peer that can actually receive
+ * at the identity it claims can echo a cookie back.
+ *
+ * Consuming a cookie reply is unconditional and does not depend on this: a
+ * peer that demands one from us gets an answer whatever our own policy. */
+void tc_wg_peer_set_under_load(tc_wg_peer *p, bool under_load);
 
 /* tc_wg_peer_clear wipes every key the peer holds. */
 void tc_wg_peer_clear(tc_wg_peer *p);

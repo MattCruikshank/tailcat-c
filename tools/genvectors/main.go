@@ -18,6 +18,7 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/tailscale/wireguard-go/device"
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
@@ -388,6 +390,168 @@ func main() {
 		b.line("\t{ %q, %q, %q, %q, %q, %q, %q },",
 			fmt.Sprintf("box-%d-%d", i, n), h(sk[:]), h(peerPk[:]),
 			h(nonce[:]), h(pt), h(ct), h(shared[:]))
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- HChaCha20 and XChaCha20-Poly1305 -----------------------------
+	//
+	// WireGuard's cookie reply is the only place XChaCha appears. The
+	// HChaCha20 case uses draft-irtf-cfrg-xchacha-03's fixed inputs so the
+	// result can be checked against the draft by eye, as with RFC 7693
+	// above.
+	b.line("/* HChaCha20: key, 16-byte nonce, derived subkey. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *key, *nonce, *want;")
+	b.line("} kHChaCha20Vectors[] = {")
+	{
+		draftKey, _ := hex.DecodeString(
+			"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+		draftNonce, _ := hex.DecodeString("000000090000004a0000000031415927")
+		out, err := chacha20.HChaCha20(draftKey, draftNonce)
+		if err != nil {
+			panic(err)
+		}
+		b.line("\t{ %q, %q, %q, %q },", "draft-xchacha-03", h(draftKey),
+			h(draftNonce), h(out))
+		for i := 0; i < 4; i++ {
+			k := rb(32)
+			n := rb(16)
+			o, err := chacha20.HChaCha20(k, n)
+			if err != nil {
+				panic(err)
+			}
+			b.line("\t{ %q, %q, %q, %q },",
+				fmt.Sprintf("hchacha-%d", i), h(k), h(n), h(o))
+		}
+	}
+	b.line("};")
+	b.line("")
+
+	b.line("/* XChaCha20-Poly1305: key, 24-byte nonce, aad, plaintext, sealed. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *key, *nonce, *ad, *pt, *want;")
+	b.line("} kXAeadVectors[] = {")
+	for i, n := range []int{0, 1, 16, 63, 64, 65, 200} {
+		key := rb(32)
+		nonce := rb(24)
+		ad := rb(16)
+		pt := rb(n)
+		aead, err := chacha20poly1305.NewX(key)
+		if err != nil {
+			panic(err)
+		}
+		ct := aead.Seal(nil, nonce, pt, ad)
+		b.line("\t{ %q, %q, %q, %q, %q, %q },",
+			fmt.Sprintf("xaead-%d-%d", i, n), h(key), h(nonce), h(ad), h(pt),
+			h(ct))
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- WireGuard cookies --------------------------------------------
+	//
+	// Generated through wireguard-go's own CookieChecker and CookieGenerator
+	// rather than from the spec, so these check the thing we have to
+	// interoperate with. The reply is built by their code and consumed by
+	// ours; the mac2 they compute must equal the one we compute.
+	b.line("/* WireGuard cookies, via wireguard-go's CookieChecker. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name;")
+	b.line("\tconst char *responder_public; /* whose cookie key protects the reply */")
+	b.line("\tconst char *secret;           /* the responder's rotating mac2 secret */")
+	b.line("\tconst char *src;              /* how the responder identifies the sender */")
+	b.line("\tconst char *cookie;           /* MAC(secret, src) */")
+	b.line("\tconst char *cookie_key;       /* BLAKE2s(\"cookie--\" || pk) */")
+	b.line("\tconst char *msg;              /* a handshake message, macs included */")
+	b.line("\tconst char *mac2;             /* what msg's mac2 must be under cookie */")
+	b.line("} kCookieVectors[] = {")
+	for i := 0; i < 4; i++ {
+		pk := rb(32)
+		secret := rb(32)
+		src := rb(16 + i)
+
+		var cookie [blake2s.Size128]byte
+		mac, _ := blake2s.New128(secret)
+		mac.Write(src)
+		mac.Sum(cookie[:0])
+
+		var ckey [blake2s.Size]byte
+		hh, _ := blake2s.New256(nil)
+		hh.Write([]byte("cookie--"))
+		hh.Write(pk)
+		hh.Sum(ckey[:0])
+
+		// A message shaped like an initiation: everything up to mac2 is
+		// arbitrary, since mac2 is a MAC over exactly those bytes.
+		msg := rb(148)
+		smac2 := len(msg) - blake2s.Size128
+		var mac2 [blake2s.Size128]byte
+		m2, _ := blake2s.New128(cookie[:])
+		m2.Write(msg[:smac2])
+		m2.Sum(mac2[:0])
+		copy(msg[smac2:], mac2[:])
+
+		b.line("\t{ %q, %q, %q, %q, %q, %q, %q, %q },",
+			fmt.Sprintf("cookie-%d", i), h(pk), h(secret), h(src),
+			h(cookie[:]), h(ckey[:]), h(msg), h(mac2[:]))
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- a full cookie exchange, driven by wireguard-go ----------------
+	//
+	// The vectors above check each piece against wireguard-go. This checks
+	// the pieces joined up: their CookieChecker issues a reply, their
+	// CookieGenerator consumes it and macs a second message, and our code has
+	// to recover the same cookie from the reply and compute the same mac2.
+	// Nothing here is transcribed from the spec.
+	b.line("/* A complete cookie exchange performed by wireguard-go. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name;")
+	b.line("\tconst char *responder_public;")
+	b.line("\tconst char *msg1;  /* macked by their generator; provoked the reply */")
+	b.line("\tconst char *reply; /* 64 bytes, built by their CookieChecker */")
+	b.line("\tconst char *msg2;  /* macked after consuming the reply: mac2 is set */")
+	b.line("} kCookieExchangeVectors[] = {")
+	for i := 0; i < 3; i++ {
+		var pk device.NoisePublicKey
+		copy(pk[:], rb(32))
+		src := rb(16)
+
+		var checker device.CookieChecker
+		var gen device.CookieGenerator
+		checker.Init(pk)
+		gen.Init(pk)
+
+		// First message: mac1 only, since the generator holds no cookie yet.
+		msg1 := rb(148)
+		gen.AddMacs(msg1)
+
+		reply, err := checker.CreateReply(msg1, uint32(0x01020304+i), src)
+		if err != nil {
+			panic(err)
+		}
+		if !gen.ConsumeReply(reply) {
+			panic("wireguard-go could not consume its own cookie reply")
+		}
+
+		// Second message: now carries a mac2 derived from that cookie.
+		msg2 := rb(148)
+		gen.AddMacs(msg2)
+		if !checker.CheckMAC2(msg2, src) {
+			panic("wireguard-go rejected its own mac2")
+		}
+
+		var wire bytes.Buffer
+		_ = binary.Write(&wire, binary.LittleEndian, reply.Type)
+		_ = binary.Write(&wire, binary.LittleEndian, reply.Receiver)
+		wire.Write(reply.Nonce[:])
+		wire.Write(reply.Cookie[:])
+
+		b.line("\t{ %q, %q, %q, %q, %q },",
+			fmt.Sprintf("exchange-%d", i), h(pk[:]), h(msg1),
+			h(wire.Bytes()), h(msg2))
 	}
 	b.line("};")
 	b.line("")

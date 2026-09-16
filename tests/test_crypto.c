@@ -7,6 +7,7 @@
  */
 
 #include "tc/crypto.h"
+#include "tc/noise.h"
 #include "tctest.h"
 
 #include "crypto_vectors.h"
@@ -505,6 +506,251 @@ static void test_box(void)
 	TCT_EQ_INT(tc_box_seal(b_out, nonce, msg, mlen, zero, ska), TC_ERR_INVAL);
 }
 
+/* ---- XChaCha20-Poly1305 ------------------------------------------------ */
+
+static void test_hchacha20(void)
+{
+	TCT_CASE("HChaCha20 derives the subkey XChaCha needs");
+	/* The first vector is draft-irtf-cfrg-xchacha-03's own, so this is
+	 * anchored outside the Go library that generated the rest. */
+	for (size_t i = 0; i < sizeof kHChaCha20Vectors / sizeof kHChaCha20Vectors[0];
+	     i++) {
+		uint8_t key[32], nonce[16], want[32], got[32];
+		TCT_EQ_INT(unhex(key, sizeof key, kHChaCha20Vectors[i].key), 32);
+		TCT_EQ_INT(unhex(nonce, sizeof nonce, kHChaCha20Vectors[i].nonce), 16);
+		TCT_EQ_INT(unhex(want, sizeof want, kHChaCha20Vectors[i].want), 32);
+		tc_hchacha20(got, key, nonce);
+		if (memcmp(got, want, 32) != 0)
+			TCT_FAILF("hchacha20 %s", kHChaCha20Vectors[i].name);
+		tct_checks++;
+	}
+}
+
+static void test_xaead(void)
+{
+	TCT_CASE("XChaCha20-Poly1305 matches x/crypto");
+	for (size_t i = 0; i < sizeof kXAeadVectors / sizeof kXAeadVectors[0]; i++) {
+		uint8_t key[32], nonce[24];
+		static uint8_t ad[MAXBUF], pt[MAXBUF], want[MAXBUF], got[MAXBUF];
+		TCT_EQ_INT(unhex(key, sizeof key, kXAeadVectors[i].key), 32);
+		TCT_EQ_INT(unhex(nonce, sizeof nonce, kXAeadVectors[i].nonce), 24);
+		size_t ad_len = unhex(ad, MAXBUF, kXAeadVectors[i].ad);
+		size_t pt_len = unhex(pt, MAXBUF, kXAeadVectors[i].pt);
+		size_t want_len = unhex(want, MAXBUF, kXAeadVectors[i].want);
+
+		TCT_EQ_INT(tc_xaead_seal(got, key, nonce, ad, ad_len, pt, pt_len),
+		           TC_OK);
+		if (memcmp(got, want, want_len) != 0)
+			TCT_FAILF("xaead seal %s", kXAeadVectors[i].name);
+		tct_checks++;
+
+		static uint8_t back[MAXBUF];
+		TCT_EQ_INT(tc_xaead_open(back, key, nonce, ad, ad_len, want, want_len),
+		           TC_OK);
+		if (pt_len != 0 && memcmp(back, pt, pt_len) != 0)
+			TCT_FAILF("xaead open %s", kXAeadVectors[i].name);
+		tct_checks++;
+
+		/* A changed tag, a changed nonce and changed additional data must
+		 * each break it: an AEAD that only authenticates the ciphertext
+		 * would pass the two tests above and still be useless. */
+		static uint8_t bad[MAXBUF];
+		memcpy(bad, want, want_len);
+		bad[want_len - 1] ^= 1;
+		TCT_EQ_INT(tc_xaead_open(back, key, nonce, ad, ad_len, bad, want_len),
+		           TC_ERR_INVAL);
+		nonce[0] ^= 1;
+		TCT_EQ_INT(tc_xaead_open(back, key, nonce, ad, ad_len, want, want_len),
+		           TC_ERR_INVAL);
+		nonce[0] ^= 1;
+		if (ad_len > 0) {
+			ad[0] ^= 1;
+			TCT_EQ_INT(
+			    tc_xaead_open(back, key, nonce, ad, ad_len, want, want_len),
+			    TC_ERR_INVAL);
+			ad[0] ^= 1;
+		}
+	}
+}
+
+/* ---- WireGuard cookies -------------------------------------------------- */
+
+static void test_cookies(void)
+{
+	TCT_CASE("cookie derivation matches wireguard-go");
+	for (size_t i = 0; i < sizeof kCookieVectors / sizeof kCookieVectors[0];
+	     i++) {
+		uint8_t pk[32], secret[32], want_cookie[16], want_key[32];
+		static uint8_t src[MAXBUF], msg[MAXBUF];
+		uint8_t want_mac2[16];
+
+		TCT_EQ_INT(unhex(pk, sizeof pk, kCookieVectors[i].responder_public),
+		           32);
+		TCT_EQ_INT(unhex(secret, sizeof secret, kCookieVectors[i].secret), 32);
+		size_t src_len = unhex(src, MAXBUF, kCookieVectors[i].src);
+		TCT_EQ_INT(unhex(want_cookie, sizeof want_cookie,
+		                 kCookieVectors[i].cookie),
+		           16);
+		TCT_EQ_INT(unhex(want_key, sizeof want_key,
+		                 kCookieVectors[i].cookie_key),
+		           32);
+		size_t msg_len = unhex(msg, MAXBUF, kCookieVectors[i].msg);
+		TCT_EQ_INT(unhex(want_mac2, sizeof want_mac2, kCookieVectors[i].mac2),
+		           16);
+
+		uint8_t got[32];
+		tc_wg_cookie_key(got, pk);
+		if (memcmp(got, want_key, 32) != 0)
+			TCT_FAILF("cookie key %s", kCookieVectors[i].name);
+		tct_checks++;
+
+		tc_wg_compute_cookie(got, secret, src, src_len);
+		if (memcmp(got, want_cookie, 16) != 0)
+			TCT_FAILF("cookie %s", kCookieVectors[i].name);
+		tct_checks++;
+
+		/* The vector's message already carries the mac2 wireguard-go
+		 * computed, so writing ours over it must not change a byte. */
+		static uint8_t copy[MAXBUF];
+		memcpy(copy, msg, msg_len);
+		tc_wg_add_mac2(copy, msg_len, want_cookie);
+		if (memcmp(copy + msg_len - 16, want_mac2, 16) != 0)
+			TCT_FAILF("mac2 %s", kCookieVectors[i].name);
+		tct_checks++;
+
+		TCT_TRUE(tc_wg_check_mac2(msg, msg_len, secret, src, src_len));
+
+		/* And it must reject a message that was altered anywhere before
+		 * mac2 -- including in mac1, which mac2 covers. */
+		copy[0] ^= 1;
+		TCT_TRUE(!tc_wg_check_mac2(copy, msg_len, secret, src, src_len));
+		copy[0] ^= 1;
+		copy[msg_len - 32] ^= 1; /* inside mac1 */
+		TCT_TRUE(!tc_wg_check_mac2(copy, msg_len, secret, src, src_len));
+
+		/* A different sender gets a different cookie, which is the entire
+		 * point: a flood from a forged source cannot echo one back. */
+		src[0] ^= 1;
+		TCT_TRUE(!tc_wg_check_mac2(msg, msg_len, secret, src, src_len));
+		src[0] ^= 1;
+	}
+}
+
+static void test_cookie_reply(void)
+{
+	TCT_CASE("a cookie reply round-trips");
+	uint8_t sk[32], pk[32], secret[32];
+	TCT_EQ_INT(tc_x25519_keypair(sk, pk), TC_OK);
+	TCT_EQ_INT(tc_random_bytes(secret, sizeof secret), TC_OK);
+
+	static uint8_t msg[TC_WG_INITIATION_SIZE];
+	TCT_EQ_INT(tc_random_bytes(msg, sizeof msg), TC_OK);
+	msg[0] = TC_WG_MSG_INITIATION;
+	const uint8_t *sent_mac1 = msg + sizeof msg - 32;
+	const uint8_t src[32] = { 7 };
+
+	uint8_t reply[TC_WG_COOKIE_REPLY_SIZE];
+	TCT_EQ_INT(tc_wg_create_cookie_reply(reply, msg, sizeof msg, pk, secret,
+	                                     src, sizeof src),
+	           TC_OK);
+	TCT_EQ_INT(reply[0], TC_WG_MSG_COOKIE_REPLY);
+	/* The receiver index echoes the sender index being answered, so the
+	 * initiator can tell which handshake it belongs to. */
+	TCT_EQ_MEM(reply + 4, msg + 4, 4);
+
+	uint8_t cookie[16];
+	TCT_EQ_INT(tc_wg_consume_cookie_reply(cookie, reply, pk, sent_mac1),
+	           TC_OK);
+
+	TCT_CASE("the recovered cookie is the one the responder would check");
+	uint8_t direct[16];
+	tc_wg_compute_cookie(direct, secret, src, sizeof src);
+	TCT_EQ_MEM(cookie, direct, 16);
+
+	static uint8_t signed_msg[TC_WG_INITIATION_SIZE];
+	memcpy(signed_msg, msg, sizeof msg);
+	tc_wg_add_mac2(signed_msg, sizeof signed_msg, cookie);
+	TCT_TRUE(tc_wg_check_mac2(signed_msg, sizeof signed_msg, secret, src,
+	                          sizeof src));
+
+	TCT_CASE("a reply from the wrong handshake does not open");
+	/* The mac1 of the provoking message is the additional data, so a reply
+	 * cannot be lifted out of one handshake and replayed into another. */
+	uint8_t other_mac1[16];
+	memcpy(other_mac1, sent_mac1, 16);
+	other_mac1[0] ^= 1;
+	TCT_EQ_INT(tc_wg_consume_cookie_reply(cookie, reply, pk, other_mac1),
+	           TC_ERR_INVAL);
+
+	TCT_CASE("a reply addressed to another peer does not open");
+	uint8_t sk2[32], pk2[32];
+	TCT_EQ_INT(tc_x25519_keypair(sk2, pk2), TC_OK);
+	TCT_EQ_INT(tc_wg_consume_cookie_reply(cookie, reply, pk2, sent_mac1),
+	           TC_ERR_INVAL);
+
+	TCT_CASE("a corrupted reply does not open");
+	reply[40] ^= 1;
+	TCT_EQ_INT(tc_wg_consume_cookie_reply(cookie, reply, pk, sent_mac1),
+	           TC_ERR_INVAL);
+	reply[40] ^= 1;
+	reply[0] = TC_WG_MSG_TRANSPORT;
+	TCT_EQ_INT(tc_wg_consume_cookie_reply(cookie, reply, pk, sent_mac1),
+	           TC_ERR_INVAL);
+
+	TCT_CASE("two replies never reuse a nonce");
+	/* The nonce is random rather than a counter, which is the reason this
+	 * uses XChaCha at all: 96 bits would not be enough room to pick one
+	 * safely. */
+	uint8_t a[TC_WG_COOKIE_REPLY_SIZE], b[TC_WG_COOKIE_REPLY_SIZE];
+	reply[0] = TC_WG_MSG_COOKIE_REPLY;
+	TCT_EQ_INT(tc_wg_create_cookie_reply(a, msg, sizeof msg, pk, secret, src,
+	                                     sizeof src),
+	           TC_OK);
+	TCT_EQ_INT(tc_wg_create_cookie_reply(b, msg, sizeof msg, pk, secret, src,
+	                                     sizeof src),
+	           TC_OK);
+	TCT_TRUE(memcmp(a + 8, b + 8, 24) != 0);
+}
+
+static void test_cookie_exchange_against_go(void)
+{
+	TCT_CASE("a cookie exchange performed by wireguard-go round-trips here");
+	/* The strongest of the cookie tests: their CookieChecker built the reply
+	 * and their CookieGenerator consumed it and macked a second message. We
+	 * have to recover the same cookie and arrive at the same mac2, with
+	 * nothing transcribed from the specification. */
+	for (size_t i = 0;
+	     i < sizeof kCookieExchangeVectors / sizeof kCookieExchangeVectors[0];
+	     i++) {
+		uint8_t pk[32];
+		static uint8_t msg1[MAXBUF], reply[MAXBUF], msg2[MAXBUF];
+		TCT_EQ_INT(
+		    unhex(pk, sizeof pk, kCookieExchangeVectors[i].responder_public),
+		    32);
+		size_t m1 = unhex(msg1, MAXBUF, kCookieExchangeVectors[i].msg1);
+		size_t rl = unhex(reply, MAXBUF, kCookieExchangeVectors[i].reply);
+		size_t m2 = unhex(msg2, MAXBUF, kCookieExchangeVectors[i].msg2);
+		TCT_EQ_INT((int)rl, TC_WG_COOKIE_REPLY_SIZE);
+
+		uint8_t cookie[TC_WG_COOKIE_LEN];
+		if (tc_wg_consume_cookie_reply(cookie, reply, pk,
+		                               msg1 + m1 - 2 * TC_WG_MAC_LEN) != TC_OK)
+			TCT_FAILF("could not open %s", kCookieExchangeVectors[i].name);
+		tct_checks++;
+
+		/* Recompute mac2 over their second message and require it to match
+		 * the one they wrote there. */
+		uint8_t want[TC_WG_MAC_LEN];
+		memcpy(want, msg2 + m2 - TC_WG_MAC_LEN, TC_WG_MAC_LEN);
+		memset(msg2 + m2 - TC_WG_MAC_LEN, 0, TC_WG_MAC_LEN);
+		tc_wg_add_mac2(msg2, m2, cookie);
+		if (memcmp(msg2 + m2 - TC_WG_MAC_LEN, want, TC_WG_MAC_LEN) != 0)
+			TCT_FAILF("mac2 disagrees for %s",
+			          kCookieExchangeVectors[i].name);
+		tct_checks++;
+	}
+}
+
 int main(void)
 {
 	test_blake2s();
@@ -516,6 +762,11 @@ int main(void)
 	test_hsalsa20();
 	test_secretbox();
 	test_box();
+	test_hchacha20();
+	test_xaead();
+	test_cookies();
+	test_cookie_reply();
+	test_cookie_exchange_against_go();
 	test_random();
 	return tct_report("crypto");
 }

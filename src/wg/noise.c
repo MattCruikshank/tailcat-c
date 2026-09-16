@@ -21,6 +21,7 @@
 static const char kConstruction[] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 static const char kIdentifier[] = "WireGuard v1 zx2c4 Jason@zx2c4.com";
 static const char kLabelMac1[] = "mac1----";
+static const char kLabelCookie[] = "cookie--";
 
 /* Message field offsets. */
 enum {
@@ -114,9 +115,9 @@ void tc_wg_mac1_key(uint8_t out[TC_WG_KEY_LEN],
 }
 
 /* add_macs fills in the mac1 and mac2 fields at the end of a handshake
- * message. mac2 is left zero: it is only non-zero once a peer under load has
- * issued a cookie, and we do not implement the cookie exchange. A peer that
- * is not rate-limiting accepts a zero mac2. */
+ * message. mac2 is left zero here; tc_wg_add_mac2 fills it in afterwards for
+ * a caller that holds a cookie. A peer that is not under load accepts a zero
+ * mac2, which is why the two steps are separate. */
 static void add_macs(uint8_t *msg, size_t len, const uint8_t mac1_key[32])
 {
 	size_t mac2_off = len - TC_WG_MAC_LEN;
@@ -142,6 +143,119 @@ static bool check_mac1(const uint8_t *msg, size_t len,
 	bool ok = tc_ct_equal(want, msg + mac1_off, sizeof want);
 	tc_memzero_explicit(want, sizeof want);
 	return ok;
+}
+
+/* ---- cookies ---------------------------------------------------------- */
+
+void tc_wg_cookie_key(uint8_t out[TC_WG_KEY_LEN],
+                      const uint8_t public_key[TC_WG_KEY_LEN])
+{
+	tc_blake2s_ctx ctx;
+	tc_blake2s_init(&ctx, 32);
+	tc_blake2s_update(&ctx, kLabelCookie, sizeof kLabelCookie - 1);
+	tc_blake2s_update(&ctx, public_key, TC_WG_KEY_LEN);
+	tc_blake2s_final(&ctx, out);
+}
+
+void tc_wg_compute_cookie(uint8_t out[TC_WG_COOKIE_LEN],
+                          const uint8_t secret[TC_WG_KEY_LEN],
+                          const void *src_id, size_t src_id_len)
+{
+	tc_blake2s(out, TC_WG_COOKIE_LEN, src_id, src_id_len, secret,
+	           TC_WG_KEY_LEN);
+}
+
+void tc_wg_add_mac2(uint8_t *msg, size_t len,
+                    const uint8_t cookie[TC_WG_COOKIE_LEN])
+{
+	if (msg == NULL || cookie == NULL || len < 2 * TC_WG_MAC_LEN)
+		return;
+	size_t mac2_off = len - TC_WG_MAC_LEN;
+	/* mac2 covers mac1 as well, so this must run after add_macs. */
+	tc_blake2s(msg + mac2_off, TC_WG_MAC_LEN, msg, mac2_off, cookie,
+	           TC_WG_COOKIE_LEN);
+}
+
+bool tc_wg_check_mac2(const uint8_t *msg, size_t len,
+                      const uint8_t secret[TC_WG_KEY_LEN], const void *src_id,
+                      size_t src_id_len)
+{
+	if (msg == NULL || secret == NULL || len < 2 * TC_WG_MAC_LEN)
+		return false;
+
+	uint8_t cookie[TC_WG_COOKIE_LEN];
+	tc_wg_compute_cookie(cookie, secret, src_id, src_id_len);
+
+	size_t mac2_off = len - TC_WG_MAC_LEN;
+	uint8_t want[TC_WG_MAC_LEN];
+	tc_blake2s(want, sizeof want, msg, mac2_off, cookie, sizeof cookie);
+
+	bool ok = tc_ct_equal(want, msg + mac2_off, sizeof want);
+	tc_memzero_explicit(cookie, sizeof cookie);
+	tc_memzero_explicit(want, sizeof want);
+	return ok;
+}
+
+int tc_wg_create_cookie_reply(uint8_t out[TC_WG_COOKIE_REPLY_SIZE],
+                              const uint8_t *msg, size_t msg_len,
+                              const uint8_t our_public[TC_WG_KEY_LEN],
+                              const uint8_t secret[TC_WG_KEY_LEN],
+                              const void *src_id, size_t src_id_len)
+{
+	if (out == NULL || msg == NULL || our_public == NULL || secret == NULL)
+		return TC_ERR_INVAL;
+	if (msg_len < 8 + 2 * TC_WG_MAC_LEN)
+		return TC_ERR_INVAL;
+
+	size_t mac2_off = msg_len - TC_WG_MAC_LEN;
+	size_t mac1_off = mac2_off - TC_WG_MAC_LEN;
+
+	memset(out, 0, TC_WG_COOKIE_REPLY_SIZE);
+	out[0] = TC_WG_MSG_COOKIE_REPLY;
+	/* The receiver index is the sender index of the message being answered,
+	 * echoed back so the initiator can match the reply to its handshake. */
+	memcpy(out + 4, msg + 4, 4);
+
+	if (tc_random_bytes(out + 8, TC_WG_COOKIE_NONCE_LEN) != TC_OK)
+		return TC_ERR_INVAL;
+
+	uint8_t cookie[TC_WG_COOKIE_LEN];
+	tc_wg_compute_cookie(cookie, secret, src_id, src_id_len);
+
+	uint8_t key[TC_WG_KEY_LEN];
+	tc_wg_cookie_key(key, our_public);
+
+	/* The mac1 of the message being answered is the additional data, so a
+	 * reply cannot be lifted from one handshake into another. */
+	int rc = tc_xaead_seal(out + 8 + TC_WG_COOKIE_NONCE_LEN, key, out + 8,
+	                       msg + mac1_off, TC_WG_MAC_LEN, cookie,
+	                       sizeof cookie);
+
+	tc_memzero_explicit(cookie, sizeof cookie);
+	tc_memzero_explicit(key, sizeof key);
+	return rc;
+}
+
+int tc_wg_consume_cookie_reply(uint8_t out_cookie[TC_WG_COOKIE_LEN],
+                               const uint8_t msg[TC_WG_COOKIE_REPLY_SIZE],
+                               const uint8_t peer_public[TC_WG_KEY_LEN],
+                               const uint8_t sent_mac1[TC_WG_MAC_LEN])
+{
+	if (out_cookie == NULL || msg == NULL || peer_public == NULL ||
+	    sent_mac1 == NULL)
+		return TC_ERR_INVAL;
+	if (msg[0] != TC_WG_MSG_COOKIE_REPLY)
+		return TC_ERR_INVAL;
+
+	uint8_t key[TC_WG_KEY_LEN];
+	tc_wg_cookie_key(key, peer_public);
+
+	int rc = tc_xaead_open(out_cookie, key, msg + 8, sent_mac1,
+	                       TC_WG_MAC_LEN,
+	                       msg + 8 + TC_WG_COOKIE_NONCE_LEN,
+	                       TC_WG_COOKIE_LEN + TC_WG_TAG_LEN);
+	tc_memzero_explicit(key, sizeof key);
+	return rc;
 }
 
 /* Set by tc_wg_timestamp_force_offset_ms; zero in every real build. */

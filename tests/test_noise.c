@@ -166,12 +166,13 @@ static void test_rejections(void)
 		TCT_TRUE(tc_wg_consume_initiation(&h, &ir, bad, NULL, NULL) != TC_OK);
 	}
 
-	TCT_CASE("mac2 is deliberately not checked");
-	/* mac2 only carries meaning once a peer under load has issued a cookie.
-	 * We do not implement the cookie exchange, and WireGuard itself ignores
-	 * mac2 unless it is rate-limiting, so a modified mac2 is accepted. This
-	 * is a real limitation -- it is the DoS mitigation we are missing -- and
-	 * asserting it here keeps it visible rather than merely absent. */
+	TCT_CASE("this layer does not check mac2");
+	/* mac2 only carries meaning once a peer under load has issued a cookie,
+	 * and WireGuard ignores it otherwise, so tc_wg_consume_initiation accepts
+	 * a modified one. The check lives a layer up in tc_wg_peer, which knows
+	 * whether it is under load and holds the secret the cookie is derived
+	 * from; tests/test_wgpeer.c covers it there. Asserting the tolerance here
+	 * keeps the division visible rather than looking like an oversight. */
 	for (size_t off = kMac2Off; off < TC_WG_INITIATION_SIZE; off++) {
 		uint8_t bad[TC_WG_INITIATION_SIZE];
 		memcpy(bad, init, sizeof bad);
