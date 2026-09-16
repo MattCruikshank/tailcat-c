@@ -79,14 +79,14 @@ Both columns are release builds: upstream with its own `-s -w` and 75
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **1.72 MB** | 17.67 MB |
+| binary | **1.74 MB** | 17.67 MB |
 | gzipped | **0.86 MB** | 6.77 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
 The ratio is about 10×, and **most of it is the feature gap below, not
 craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
-of the rest. The interesting number is not 1.72 MB, it is that one file covers
+of the rest. The interesting number is not 1.74 MB, it is that one file covers
 every target: our own protocol code is only ~40 KB of it, and the single
 largest thing we add is the 181 KB CA bundle.
 
@@ -100,7 +100,7 @@ largest thing we add is the 181 KB CA bundle.
 | DERP relay transport | ✅ | ✅ |
 | Bring your own relay | ✅ | ✅ |
 | Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ❌ | ✅ |
-| Rekeying / session renewal | ❌ | ✅ |
+| Rekeying / session renewal | ✅ | ✅ |
 | Cookie reply (DoS mitigation) | ❌ | ✅ |
 | DERP map fetch | ✅ | ✅ |
 | Region choice by latency | approximate | ✅ (netcheck) |
@@ -403,6 +403,26 @@ reaps, application accepts) is ordinary. Notably ASan did not catch it either,
 because the freed pointer was returned and compared rather than dereferenced.
 A test for that exact sequence now exists, and the mutation fails it.
 
+**12. Handshake retries resent the identical initiation.** *(Phase 2.2, found
+by a two-hour simulation with 5% loss.)* Resending the same bytes looks like
+the thrifty choice: a fresh initiation carries a new ephemeral key and makes
+the peer repeat the expensive half. It is also exactly what initiation replay
+protection rejects, so one lost handshake packet stranded the tunnel until the
+attempt was abandoned ninety seconds later. wireguard-go builds a new
+initiation on every send for this reason. Nothing shorter than hours of
+simulated time would have found it: it needs a lost handshake message, on a
+session old enough to expire before the retries give up.
+
+**13. The test for bug 12 did not test bug 12.** *(Phase 2.2, found by
+mutation.)* `live-rekey.sh` held a session open for 280 seconds and required
+every line to arrive. With our rekey timer disabled entirely it still passed
+15 of 15 -- because WireGuard is deliberately redundant: the Go server renews
+at its own threshold if we do not. A delivery-only check proves the responder
+path and nothing about our own timer. The script now reads a summary the CLI
+emits and requires that *this* side initiated the rotations. Worth separating
+from the rest: the code was already correct, and the test was the thing that
+was wrong.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -415,10 +435,13 @@ cases with a symptom that pointed squarely at the implementation. When an
 interop test fails, the scaffolding deserves as much suspicion as the code
 under test.
 
-Bug 10 is the uncomfortable one. Every other entry here was found because
-something failed loudly. That one was reported, in plain text, in runs that
-were then described as passing -- which is a reminder that a verification
-story is only worth what its failure signals are worth.
+Bugs 10 and 13 are the uncomfortable ones, and they are the same failure in
+two shapes: a check that cannot fail is not a check. One was a sanitizer whose
+findings did not stop the run; the other was a live test that passed with the
+feature it existed to test switched off. Both were caught by asking what would
+have to break for this to go red -- which is now the habit: **11 and 13 came
+from deliberately breaking working code to see whether anything noticed, and
+12 from a simulation long enough for the bug to have room to appear.**
 
 ## Limitations
 
@@ -463,18 +486,19 @@ Current, and deliberate unless noted.
 
 ### WireGuard
 
-- **No rekeying.** A session uses one pair of keys for its whole life.
-  WireGuard normally rehandshakes every two minutes and after a message
-  count; tailcat-c refuses to send past `REJECT_AFTER_MESSAGES` rather than
-  reuse a nonce, but it will not renew the session for you.
+- **No persistent keepalive.** The passive keepalive is implemented -- a data
+  packet is answered with an empty one if nothing else goes back within ten
+  seconds -- but there is no configurable interval for holding a NAT binding
+  open, which is moot while every path goes through a relay.
 - **No cookie / DoS mitigation.** mac2 is always written as zero and never
   checked. A peer that is not rate-limiting accepts this, which is why the
   interop test passes, but a relay or peer under load that demands a cookie
   will reject us. `tests/test_noise.c` asserts the mac2 tolerance explicitly
   so the gap stays visible rather than merely absent.
-- **No initiation replay protection.** `tc_wg_consume_initiation` reports the
-  TAI64N timestamp but does not remember it; comparing it against the last
-  one seen from that peer is left to the caller, and no caller does that yet.
+- **No handshake rate limit.** Initiation replay is rejected, but a peer that
+  floods us with *fresh* initiations will make us do the expensive half of a
+  handshake each time. wireguard-go caps this at one per 20 ms. Nothing here
+  does, which matters more once 2.3 brings cookies.
 - **No index table.** Handshake indices are random 32-bit values with no
   check for collision, which is fine for one peer and would not be for many.
 
@@ -487,11 +511,11 @@ Current, and deliberate unless noted.
 - **The MSS is fixed at 1140** and derived from tailcat's 1232-byte maximum
   UDP payload. There is no path MTU discovery, and nothing fragments, so a
   smaller path would black-hole rather than degrade.
-- **One connection per object.** There is no demultiplexer, so a second
-  simultaneous stream needs a second `tc_tcp_conn` and a dispatcher above it.
-- **`tc_tcp_force_next_iss` exists for tests only.** A predictable initial
-  sequence number makes blind stream injection practical; it is there so the
-  sequence-number wrap can be tested without moving four gigabytes.
+- **`tc_wg_timestamp_force_offset_ms` and `tc_tcp_force_next_iss` exist for
+  tests only.** The first moves the TAI64N clock, which is precisely what an
+  attacker replaying an initiation would want; the second makes the initial
+  sequence number predictable, which is what makes blind stream injection
+  practical. Both are documented as such at their definitions.
 
 ### Implementation
 
@@ -537,10 +561,6 @@ Current, and deliberate unless noted.
 
 Roughly in the order they should be picked up.
 
-- [ ] **Rekeying**, so a long-lived session renews its keys rather than
-      running until the counter limit.
-- [ ] **Initiation replay protection**: remember the last TAI64N timestamp
-      per peer and reject anything not strictly newer.
 - [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
 - [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
       closed connections hold their table slots; nothing does it on a timer.
@@ -610,8 +630,17 @@ Roughly in the order they should be picked up.
       The CLI routes through it, so dispatch is exercised by every live run.
       `make live-serve` covers the passive open against a real Go client.
 
-Beyond here, see [PLAN.md](PLAN.md). Next is rekeying, which is what stops a
-long-lived session from quietly dying after two minutes.
+- [x] **Phase 2.2 — session lifetime.** The previous/current/next keypair
+      triple, WireGuard's rekey and expiry timers, passive keepalives, and
+      initiation replay protection. A session now renews itself instead of
+      dying after two minutes. `make live-rekey` holds one open for 280
+      seconds against a real tailcat server, across rotations this side
+      initiated; it takes six minutes, which is the shortest honest way to
+      test it.
+
+Beyond here, see [PLAN.md](PLAN.md). Phase 3 is next and is now unblocked:
+`serve` with ports, `forward`, `socks` and the `ssh`/`cp` wrappers were all
+waiting on the demultiplexer and on a session that lasts.
 
 ## Licence
 

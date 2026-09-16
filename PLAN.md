@@ -123,20 +123,19 @@ dispatch is exercised by every live run. `scripts/live-serve.sh` is new and
 covers the passive open against a real Go client -- the direction nothing
 automated reached before.
 
-### 2.2 Rekeying and session lifetime · ~250 lines · high risk
+### 2.2 Rekeying and session lifetime ✅ · 420 lines
 
-WireGuard renews a session after two minutes or a message-count threshold,
-and refuses to use one past `REJECT_AFTER_TIME`. We currently derive one
-session and use it until the counter limit, which is fine for a short pipe
-and wrong for anything long-lived.
+`src/wg/peer.c` holds the previous/current/next keypair triple, the handshake
+timers, passive keepalives and expiry. The CLI is rewired onto it.
 
-Needs the handshake timers (`REKEY_AFTER_TIME`, `REKEY_AFTER_MESSAGES`,
-`REJECT_AFTER_TIME`, `KEEPALIVE_TIMEOUT`), a previous/current/next keypair
-triple so packets in flight during a rekey still decrypt, and passive
-keepalives.
+The risk was real and it landed where expected. Retrying a handshake by
+resending the *identical* initiation looks thrifty and is wrong: the peer's
+own replay protection rejects a repeated timestamp, so one lost packet
+stranded the tunnel for ninety seconds. Only a two-hour simulation with loss
+found it.
 
-High risk because the failure mode is a tunnel that works for two minutes in
-testing and then silently stops.
+`make live-rekey` holds a session open for 280 seconds against the real Go
+server. It takes six minutes and there is no shortcut to proving this one.
 
 ### 2.3 Cookie reply / DoS mitigation · ~200 lines · medium risk
 
@@ -148,11 +147,10 @@ Needs the cookie reply message (type 3), XChaCha20-Poly1305 — which means
 extending `salsa20.c`'s neighbours or adding XChaCha — and the mac2
 computation on both sides.
 
-### 2.4 Initiation replay protection · ~80 lines · low risk
+### 2.4 Initiation replay protection ✅ · 20 lines
 
-`tc_wg_consume_initiation` already reports the TAI64N timestamp; nothing
-remembers it. Store the last one per peer and reject anything not strictly
-newer.
+Done as part of 2.2, because the thing it needs -- the last timestamp seen
+from a peer -- only exists once something tracks a peer over time.
 
 ### 2.5 Reconnection and liveness · ~250 lines · medium risk
 
@@ -160,9 +158,10 @@ Act on `FRAME_RESTARTING` instead of ignoring it, track keep-alives to notice
 a dead relay, reconnect with backoff, and re-meow after reconnecting. Also
 write timeouts, which reads have and writes do not.
 
-**Phase 2: 2.1 done (400 lines). Remaining: ~780 lines**, and 2.2 is the one
-to be careful with -- a tunnel that works for two minutes in testing and then
-stops is the worst failure mode on this list.
+**Phase 2: 2.1, 2.2 and 2.4 done (840 lines). Remaining: 2.3 and 2.5,
+~450 lines.** Neither is now load-bearing for a working tunnel: 2.3 only
+matters against a relay under enough load to demand cookies, and 2.5 is about
+surviving a relay restart rather than a session expiring.
 
 ---
 
@@ -309,7 +308,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | Phase | New C | Risk |
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
-| 2 — robust | ~780 left (400 done) | medium/high |
+| 2 — robust | ~450 left (840 done) | medium |
 | 3 — commands | ~1,400 | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
@@ -326,8 +325,13 @@ dangerous work is where a plausible-looking implementation is subtly wrong,
 and the defence is differential testing against the Go implementation plus a
 second, stricter toolchain.
 
-**Phases 1 and 2.1 are done.** The next thing worth doing is **2.2, rekeying**:
-it is the highest-risk item outside Phase 4, and it is the one limitation that
-makes a long-lived session quietly stop working rather than fail visibly.
-After that Phase 3 is mechanical, since everything in it was waiting on the
-demultiplexer.
+**Phases 1, 2.1, 2.2 and 2.4 are done**, which covers everything that made a
+tunnel unreliable rather than merely incomplete. What remains in Phase 2 is
+robustness against conditions we have not hit: a relay demanding cookies
+(2.3), and a relay restarting under us (2.5).
+
+The next thing worth doing is **Phase 3**, which is now unblocked and mostly
+mechanical -- `serve` with ports, `forward`, `socks`, and the `ssh`/`cp`
+wrappers all wanted the demultiplexer and a session that lasts, and now have
+both. 3.5 (`recv`) is the one to write carefully, since it writes
+attacker-named files.
