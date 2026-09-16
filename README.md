@@ -122,7 +122,8 @@ largest thing we add is the 181 KB CA bundle.
 | `ssh` / `cp` (via the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ❌ | ✅ |
 | SSH *server* (`serve ssh`) | ❌ | ✅ |
-| `recv` (file drop box) | ❌ | ✅ |
+| `recv` (file drop box, receiving) | ❌ (needs SSH+SFTP) | ✅ |
+| `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `browse`, `genkey`, `printpub`, `readme` | ❌ | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
@@ -771,8 +772,12 @@ Roughly in the order they should be picked up.
       `ssh -> tailcat-c -> DERP -> WireGuard -> the Go tailcat's sshd`.
 
 Beyond here, see [PLAN.md](PLAN.md). What is left in Phase 3 is a file drop
-box (`recv`) and key management (`genkey`), neither of which touches the data
-path. `recv` is the one to write carefully: it writes attacker-named files.
+key management (`genkey`). `recv` turned out not to belong there at all: it is
+`serve --files <dir>:wo files`, and the `files` service is SFTP over SSH, so
+the *server* half needs PLAN.md's 5.4 and 5.5 rather than the ~300 lines that
+entry estimated. The *client* half already works -- `make live-recv` delivers
+a file into a real `tailcat recv` drop box -- because `cp` execs the system
+scp, which speaks exactly that protocol.
 
 ## Licence
 

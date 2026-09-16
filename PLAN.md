@@ -247,20 +247,37 @@ cannot hold a full tailcat address.
 `make live-ssh` runs the real ssh and scp against upstream's own SSH server
 through our tunnel.
 
-### 3.5 `recv` (file drop box) · ~300 lines · low risk
+### 3.5 `recv` (file drop box) — **moved to Phase 5**
 
-Serve a directory write-only over the tunnel. Needs a small framing format
-and careful path handling — **the one security-sensitive part of Phase 3**,
-since it writes attacker-named files. Path traversal is the obvious hazard.
+**This estimate was wrong, and the way it was wrong is worth recording.** It
+assumed `recv` would need "a small framing format". It does not: `tailcat
+recv` is exactly `serve --files <dir>:wo files`, and the `files` service is
+**SFTP over SSH**. There is no tailcat-specific file protocol to implement.
+
+So the server half needs an SSH server and an SFTP server — 5.4 and 5.5, some
+5,500 lines, the largest items in the whole plan — not 300 lines. Building a
+bespoke protocol instead would produce a `recv` that no real `tailcat cp`
+could talk to, which is worse than not having one.
+
+**The client half already works**, and did before anyone wrote a line for it:
+`cp` execs the system scp with tailcat-c as the ProxyCommand, scp speaks SFTP
+over SSH, and upstream's `recv` serves that. `make live-recv` delivers a file
+into a real drop box and checks the two properties flat mode promises — the
+server chooses the stored name, and an existing file is untouched.
+
+The security concern the original entry raised is real and still applies, but
+it applies to 5.5: it is the SFTP server that would write attacker-named
+files.
 
 ### 3.6 `genkey`, `printpub`, `browse` · ~200 lines · low risk
 
 Persistent keys on disk (with sane permissions), printing a public key, and
 opening a browser. Mostly plumbing.
 
-**Phase 3: 3.1 through 3.4 done (1,450 lines). Remaining: ~500 lines** for
-3.5 and 3.6 -- a file drop box and key management, neither of which touches
-the data path.
+**Phase 3: 3.1 through 3.4 done (1,450 lines). Remaining: 3.6 only, ~200
+lines.** 3.5 turned out to belong to Phase 5; see above. Phase 3 is therefore
+nearly finished, and what is left of upstream's command set past 3.6 is
+gated on SSH.
 
 ---
 
@@ -329,8 +346,19 @@ The largest single item. Transport, key exchange, userauth, channels, PTY
 handling. Realistically: vendor an existing implementation rather than write
 one. Needed for `ls` (SFTP) and for being an SSH target.
 
-### 5.5 SFTP client and server · ~1,500 lines · medium risk
-Needed by `ls` and the server side of `cp`. Depends on 5.4.
+### 5.5 SFTP server · ~1,500 lines · medium risk
+Needed by `ls`, by the server side of `cp`, and by **`recv`**, which moved
+here from 3.5. Depends on 5.4.
+
+This is where the "writes attacker-named files" hazard lives. Upstream's flat
+write-only mode is the design to copy rather than improve on: the server
+chooses every stored name, so a sender can neither overwrite anything nor
+learn what is already in the directory. The recursive mode (`:wo+`,
+`--accept-dirs`) trades exactly that away, and upstream documents the
+trade-off rather than hiding it.
+
+No SFTP *client* is needed: `cp` and `ls` can keep execing the system scp and
+sftp, as `cp` already does.
 
 ### 5.6 WebAssembly build · unknown · high risk
 Upstream compiles to WASM for the browser demo. Cosmopolitan does **not**
@@ -367,10 +395,10 @@ These are already in the README's TODO list and do not depend on any feature.
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
 | 2 — robust | ~1,390 ✅ | done |
-| 3 — commands | ~500 left (1,450 done) | low |
+| 3 — commands | ~200 left (1,450 done) | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
-| 5 — SSH + SFTP | ~5,500 | high |
+| 5 — SSH + SFTP (incl. `recv`) | ~5,500 | high |
 
 Roughly **7,000 lines** for everything except SSH, SFTP and WASM, on top of
 the ~7,500 that exist — so a little under double the current size. Add SSH and
