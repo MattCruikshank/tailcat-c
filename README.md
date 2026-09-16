@@ -400,9 +400,10 @@ Current, and deliberate unless noted.
   This is the agreed scope, and it is a strict subset of the full data plane,
   but it means higher latency than real tailcat once that would have gone
   direct.
-- **No tunnel yet.** M4–M7 are unwritten, so there is no WireGuard session, no
-  TCP, and no CLI. tailcat-c can move bytes between two of *its own* clients
-  through a relay; it cannot yet talk to a real `tailcat` peer.
+- **One pipe at a time.** The data path is real — WireGuard, userspace TCP,
+  and interop with the Go binary in both directions — but a session carries a
+  single stream of bytes. The port-based commands all wait on the
+  demultiplexer (PLAN.md 2.1).
 - **No SSH, SFTP, SOCKS, port forwarding, or WASM build.**
 - **Region selection is an approximation.** A relay is chosen by timing a
   DERP connection (TCP, TLS and the key exchange), not by STUN probes as
@@ -512,9 +513,6 @@ Roughly in the order they should be picked up.
       `tc_derp_set_read_timeout`; writes still are not.
 - [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
       ignoring it, and tracking keep-alives to notice a dead relay.
-- [ ] **DERP map fetching** from `https://tailcat.dev/derpmap.json`, plus
-      region selection. The `Addr` codec already parses embedded regions, and
-      `Resolve` semantics are understood but unimplemented.
 - [ ] **CI**, building both toolchains and running tests, interop and fuzzing.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
       covered; the other four targets and the entire aarch64 half are not.
@@ -523,6 +521,10 @@ Roughly in the order they should be picked up.
 - [ ] Revisit **TLS 1.3** once the PSA dependency is worth paying for.
 - [ ] Refresh the **CA bundle** and decide on a cadence for it.
 - [ ] Consider making the address-parser limits runtime-configurable.
+- [ ] **Replace the region heuristic with netcheck** once Phase 4 brings STUN;
+      until then a relay is chosen by DERP handshake time, not path quality.
+- [ ] **Refresh the DERP map cache in the background** rather than only on a
+      miss, so a long-lived process does not pay a fetch mid-session.
 
 ## Roadmap
 
@@ -560,6 +562,15 @@ Roughly in the order they should be picked up.
       over the relay socket and stdin drives the TCP stack and the WireGuard
       session, so there are no locks. Verified by `make live-cli` against the
       upstream Go server.
+- [x] **Phase 1 — self-sufficiency.** A strict JSON reader, an HTTPS GET, the
+      DERP map fetched and cached for an hour, a relay chosen by measured
+      handshake time, and the `resolve` and `ping` subcommands. Short
+      addresses now work directly and `serve` needs no `--relay`, so nothing
+      else has to be installed alongside the binary. `tailcat-c resolve`
+      produces a byte-identical result to `tailcat resolve`.
+
+Beyond here, see [PLAN.md](PLAN.md). The next structural piece is the
+connection demultiplexer, which most of the remaining commands wait on.
 
 ## Licence
 
