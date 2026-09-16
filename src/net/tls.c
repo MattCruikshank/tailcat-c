@@ -44,6 +44,15 @@ bool tc_stream_has_pending(tc_stream *s)
 	return s != NULL && s->has_pending != NULL && s->has_pending(s);
 }
 
+int tc_stream_set_write_timeout(tc_stream *s, int ms)
+{
+	if (s == NULL)
+		return TC_ERR_INVAL;
+	if (s->set_write_timeout == NULL)
+		return TC_ERR_UNSUPPORTED;
+	return s->set_write_timeout(s, ms);
+}
+
 int tc_stream_set_read_timeout(tc_stream *s, int ms)
 {
 	if (s == NULL)
@@ -147,6 +156,12 @@ static int tcp_write_all(tc_stream *s, const uint8_t *buf, size_t len)
 		}
 		if (n < 0 && errno == EINTR)
 			continue;
+		/* SO_SNDTIMEO expiring. Unlike a read timeout this is not
+		 * recoverable: part of the message may already be on the wire, so
+		 * the framing is broken and the caller has to rebuild the
+		 * connection rather than retry. */
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return TC_ERR_TIMEOUT;
 		return TC_ERR_INVAL;
 	}
 	return TC_OK;
@@ -159,6 +174,18 @@ static int tcp_set_read_timeout(tc_stream *s, int ms)
 	tv.tv_sec = ms / 1000;
 	tv.tv_usec = (ms % 1000) * 1000;
 	if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const void *)&tv,
+	               sizeof tv) != 0)
+		return TC_ERR_INVAL;
+	return TC_OK;
+}
+
+static int tcp_set_write_timeout(tc_stream *s, int ms)
+{
+	tcp_ctx *c = (tcp_ctx *)s->ctx;
+	struct timeval tv;
+	tv.tv_sec = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	if (setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&tv,
 	               sizeof tv) != 0)
 		return TC_ERR_INVAL;
 	return TC_OK;
@@ -269,6 +296,7 @@ int tc_net_tcp_connect(tc_stream *out, const char *host, uint16_t port,
 	out->read_some = tcp_read_some;
 	out->write_all = tcp_write_all;
 	out->set_read_timeout = tcp_set_read_timeout;
+	out->set_write_timeout = tcp_set_write_timeout;
 	out->get_fd = tcp_fd;
 	out->has_pending = NULL;
 	out->close = tcp_close;
@@ -374,6 +402,14 @@ static int tls_set_read_timeout(tc_stream *s, int ms)
 {
 	tls_ctx *t = (tls_ctx *)s->ctx;
 	return tc_stream_set_read_timeout(&t->tcp, ms);
+}
+
+/* The TLS layer has no timeout of its own: it is a record codec over the TCP
+ * stream, so both timeouts belong to the socket underneath. */
+static int tls_set_write_timeout(tc_stream *s, int ms)
+{
+	tls_ctx *t = (tls_ctx *)s->ctx;
+	return tc_stream_set_write_timeout(&t->tcp, ms);
 }
 
 static int tls_fd(tc_stream *s)
@@ -511,6 +547,7 @@ int tc_tls_client(tc_stream *out, tc_stream *tcp, const tc_tls_config *cfg)
 	out->read_some = tls_read_some;
 	out->write_all = tls_write_all;
 	out->set_read_timeout = tls_set_read_timeout;
+	out->set_write_timeout = tls_set_write_timeout;
 	out->get_fd = tls_fd;
 	out->has_pending = tls_has_pending;
 	out->close = tls_close;

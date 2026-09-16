@@ -333,6 +333,10 @@ typedef struct {
 	tc_derp_client *derp;
 	tc_wg_peer *peer;
 	uint8_t server_key[32];
+	/* Set when a relay write timed out, which leaves a frame half-written
+	 * and the stream unusable. The event loop acts on it; the callback
+	 * cannot, since it has no way to report upwards. */
+	bool relay_stalled;
 } pump;
 
 /* wg_out is how the WireGuard layer reaches the wire: everything it emits --
@@ -342,8 +346,12 @@ static int wg_out(void *vctx, const uint8_t *pkt, size_t len)
 {
 	pump *p = (pump *)vctx;
 	/* A failed relay write is packet loss, which both WireGuard and TCP above
-	 * already handle by retrying. */
-	(void)tc_derp_send(p->derp, p->server_key, pkt, len);
+	 * already handle by retrying. A write that *times out* is different: the
+	 * frame is half-sent and the stream is no longer parseable, so the loop
+	 * is told to rebuild the connection rather than carry on writing into
+	 * it. */
+	if (tc_derp_send(p->derp, p->server_key, pkt, len) == TC_ERR_TIMEOUT)
+		p->relay_stalled = true;
 	return TC_OK;
 }
 
@@ -356,6 +364,92 @@ static int tcp_out(void *vctx, const uint8_t *ip_pkt, size_t len)
 	 * as success and the segment is simply dropped. */
 	(void)tc_wg_peer_send(p->peer, ip_pkt, len, now_ms());
 	return TC_OK;
+}
+
+/* ---- staying connected to the relay ------------------------------------ */
+
+/* relay_recover rebuilds a dead or restarting relay connection, with backoff.
+ *
+ * Nothing above DERP is disturbed: the WireGuard session is keyed to the two
+ * peers rather than to the path, so a tunnel resumes across a reconnection
+ * rather than needing a new handshake. What the relay does forget is the
+ * introduction, which is why a caller that meowed has to meow again --
+ * `reintroduce` is that, and it is NULL for the server, which is introduced
+ * to rather than introducing.
+ *
+ * Returns TC_OK if the relay is usable again, or the last error if the
+ * deadline passed first. */
+static int relay_recover(tc_derp_client *derp, const uint8_t peer_key[32],
+                         const uint8_t *reintroduce, size_t reintroduce_len,
+                         uint64_t deadline)
+{
+	unsigned attempt = 0;
+	int rc = TC_ERR_CLOSED;
+
+	while (now_ms() < deadline) {
+		/* Exponential backoff, capped: a relay that is restarting comes back
+		 * in seconds, and hammering it while it does helps nobody. */
+		uint64_t wait = 250ull << (attempt < 5 ? attempt : 5);
+		if (wait > 8000)
+			wait = 8000;
+		if (attempt > 0) {
+			uint64_t until = now_ms() + wait;
+			if (until > deadline)
+				until = deadline;
+			while (now_ms() < until)
+				poll(NULL, 0, 50);
+		}
+		attempt++;
+
+		vlogf("reconnecting to the relay (attempt %u)", attempt);
+		rc = tc_derp_reconnect(derp);
+		if (rc != TC_OK) {
+			vlogf("reconnect failed: %s", tc_derp_error_string());
+			continue;
+		}
+		tc_derp_set_read_timeout(derp, 200);
+		tc_derp_set_write_timeout(derp, 15000);
+
+		if (reintroduce == NULL || reintroduce_len == 0) {
+			vlogf("relay reconnected");
+			return TC_OK;
+		}
+
+		/* Re-meow. The server answers every ping, so one that is already a
+		 * peer simply acknowledges again. */
+		uint64_t give_up = now_ms() + 5000;
+		if (give_up > deadline)
+			give_up = deadline;
+		uint64_t next = 0;
+		while (now_ms() < give_up) {
+			if (now_ms() >= next) {
+				if (tc_derp_send(derp, peer_key, reintroduce,
+				                 reintroduce_len) != TC_OK)
+					break;
+				next = now_ms() + 500;
+			}
+			uint8_t src[32];
+			static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+			size_t len = 0;
+			int r = tc_derp_recv(derp, src, buf, sizeof buf, &len);
+			if (r == TC_ERR_TIMEOUT)
+				continue;
+			if (r != TC_OK)
+				break;
+			if (memcmp(src, peer_key, 32) != 0)
+				continue;
+			if (tc_meow_is_meowed(buf, len)) {
+				vlogf("relay reconnected and re-introduced");
+				return TC_OK;
+			}
+			/* Anything else that arrives proves the path works too. */
+			vlogf("relay reconnected");
+			return TC_OK;
+		}
+		vlogf("reconnected but the peer did not answer; trying again");
+		rc = TC_ERR_TIMEOUT;
+	}
+	return rc;
 }
 
 /* write_all writes the whole buffer to fd, retrying short writes. */
@@ -389,7 +483,8 @@ static bool write_all(int fd, const uint8_t *p, size_t n)
  * live run, rather than only by its own tests. */
 static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
                     tc_tcp_mux *mux, tc_tcp_conn *tcp,
-                    const uint8_t peer_key[32], uint64_t deadline)
+                    const uint8_t peer_key[32], const uint8_t *reintroduce,
+                    size_t reintroduce_len, bool *stall, uint64_t deadline)
 {
 	/* Non-blocking stdin, so the loop never stalls on a slow writer while
 	 * the tunnel has work to do. */
@@ -405,6 +500,17 @@ static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
 		bool progress = false;
+
+		if (stall != NULL && *stall) {
+			*stall = false;
+			vlogf("a relay write stalled; rebuilding the connection");
+			if (relay_recover(derp, peer_key, reintroduce, reintroduce_len,
+			                  deadline) != TC_OK) {
+				fprintf(stderr, "tailcat-c: lost the relay\n");
+				return connected ? 0 : 1;
+			}
+		}
+
 		/* The WireGuard timers run first: a session that has reached its
 		 * rekey age must start renewing before TCP tries to send under it. */
 		tc_wg_peer_tick(peer, t);
@@ -513,8 +619,36 @@ static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
 		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 		size_t len = 0;
 		rc = tc_derp_recv(derp, src, buf, sizeof buf, &len);
-		if (rc == TC_ERR_TIMEOUT)
+		if (rc == TC_ERR_TIMEOUT) {
+			/* A relay that has sent nothing at all, not even a keep-alive,
+			 * is gone whether or not the socket has noticed. Without this a
+			 * dead relay looks identical to a quiet one and the pipe hangs
+			 * until the overall timeout. */
+			if (tc_derp_idle_ms(derp) > TC_DERP_DEAD_AFTER_MS) {
+				vlogf("no keep-alive for %llus; the relay is gone",
+				      (unsigned long long)(tc_derp_idle_ms(derp) / 1000));
+				if (relay_recover(derp, peer_key, reintroduce,
+				                  reintroduce_len, deadline) != TC_OK) {
+					fprintf(stderr, "tailcat-c: lost the relay\n");
+					return connected ? 0 : 1;
+				}
+			}
 			continue;
+		}
+		if (rc == TC_ERR_CLOSED) {
+			/* The relay announced a restart or hung up. The tunnel itself is
+			 * unaffected -- WireGuard is keyed to the peers, not the path --
+			 * so rebuilding the relay resumes it. */
+			if (half_closed)
+				return 0;
+			if (relay_recover(derp, peer_key, reintroduce, reintroduce_len,
+			                  deadline) != TC_OK) {
+				fprintf(stderr, "tailcat-c: relay: %s\n",
+				        tc_derp_error_string());
+				return connected ? 0 : 1;
+			}
+			continue;
+		}
 		if (rc != TC_OK) {
 			if (!half_closed)
 				fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
@@ -710,7 +844,9 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	vlogf("connecting to port %u from %u", (unsigned)port,
 	      (unsigned)tc_tcp_local_port(tcp));
 
-	status = run_pipe(&derp, &peer, mux, tcp, ci.server_public, deadline);
+	tc_derp_set_write_timeout(&derp, 15000);
+	status = run_pipe(&derp, &peer, mux, tcp, ci.server_public, ping, ping_len,
+	                  &ctx.relay_stalled, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
@@ -896,7 +1032,11 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 	vlogf("listening on port %u inside the tunnel", (unsigned)port);
 
 	/* The connection is accepted inside the loop, so NULL here. */
-	status = run_pipe(&derp, &peer, mux, NULL, client_key, deadline);
+	tc_derp_set_write_timeout(&derp, 15000);
+	/* The server is introduced to rather than introducing, so it has nothing
+	 * to re-send after a reconnection: the client re-meows and we answer. */
+	status = run_pipe(&derp, &peer, mux, NULL, client_key, NULL, 0,
+	                  &ctx.relay_stalled, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);

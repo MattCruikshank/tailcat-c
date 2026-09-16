@@ -154,12 +154,36 @@ int tc_derp_parse_recv_packet(uint8_t src_key[TC_DERP_KEY_LEN],
 
 #include "tc/tls.h"
 
+/* A relay that has heard nothing for this long is treated as dead. The server
+ * sends a keep-alive every TC_DERP_KEEPALIVE_SECONDS, so missing two and a
+ * half of them is a clear signal rather than a slow link. */
+#define TC_DERP_DEAD_AFTER_MS (TC_DERP_KEEPALIVE_SECONDS * 2500u)
+
 typedef struct {
 	tc_stream stream;
 	uint8_t server_key[TC_DERP_KEY_LEN];
 	uint8_t our_public[TC_DERP_KEY_LEN];
 	uint8_t our_private[TC_DERP_KEY_LEN];
 	bool connected;
+
+	/* Enough of the dial to repeat it. The strings are copied rather than
+	 * borrowed: a reconnection may happen long after the caller's own
+	 * buffers have gone. */
+	char redial_host[256];
+	char redial_addr[64];
+	bool has_redial_addr;
+	uint16_t redial_port;
+	bool redial_insecure;
+	int redial_timeout_ms;
+
+	/* When the last frame of any kind arrived, on a monotonic clock, for
+	 * noticing a relay that has stopped talking. */
+	uint64_t last_recv_ms;
+
+	/* The relay told us it is going away. */
+	bool restarting;
+
+	unsigned reconnects;
 } tc_derp_client;
 
 typedef struct {
@@ -203,7 +227,10 @@ int tc_derp_send(tc_derp_client *c, const uint8_t dst_key[TC_DERP_KEY_LEN],
  * Frames that are not packets -- keep-alives, health notices, peer
  * presence -- are handled internally and do not return to the caller, so this
  * blocks until a real packet arrives or the connection fails. A server ping
- * is answered with a pong automatically. */
+ * is answered with a pong automatically.
+ *
+ * Returns TC_ERR_CLOSED when the relay announced a restart or hung up, which
+ * tells the caller to reconnect rather than to give up. */
 int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
                  uint8_t *buf, size_t cap, size_t *pkt_len);
 
@@ -216,11 +243,37 @@ int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
  * for the acknowledgment. */
 int tc_derp_set_read_timeout(tc_derp_client *c, int ms);
 
+/* tc_derp_set_write_timeout bounds how long a send blocks. A timeout here is
+ * not recoverable -- see tc_stream_set_write_timeout -- so tc_derp_send
+ * reports TC_ERR_CLOSED and the client must be reconnected. */
+int tc_derp_set_write_timeout(tc_derp_client *c, int ms);
+
 /* tc_derp_fd returns a descriptor an event loop can poll, or -1.
  * tc_derp_has_pending must be checked first: a whole frame may already be
  * buffered inside the TLS layer with nothing left on the socket. */
 int tc_derp_fd(tc_derp_client *c);
 bool tc_derp_has_pending(tc_derp_client *c);
+
+/* tc_derp_reconnect rebuilds the connection using the same relay, identity
+ * and options as the original tc_derp_connect.
+ *
+ * Everything above DERP survives this: the WireGuard session is keyed to the
+ * peers, not to the path, so a reconnected relay resumes an existing tunnel
+ * rather than needing a new handshake. What does not survive is the relay's
+ * knowledge of who we are talking to, which is why a caller that meowed has
+ * to meow again. */
+int tc_derp_reconnect(tc_derp_client *c);
+
+/* tc_derp_idle_ms is how long since any frame arrived, keep-alives included.
+ * Past TC_DERP_DEAD_AFTER_MS the relay has stopped talking to us. */
+uint64_t tc_derp_idle_ms(const tc_derp_client *c);
+
+/* tc_derp_is_restarting reports that the relay sent FRAME_RESTARTING: it is
+ * going away and expects to be redialled. */
+bool tc_derp_is_restarting(const tc_derp_client *c);
+
+/* tc_derp_reconnect_count is how many times this client has been rebuilt. */
+unsigned tc_derp_reconnect_count(const tc_derp_client *c);
 
 /* tc_derp_close tears down the connection. Safe on a zeroed or already
  * closed client. */

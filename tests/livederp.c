@@ -128,10 +128,46 @@ int main(int argc, char **argv)
 	}
 	printf("     round trip complete\n");
 
+	printf("\n[5] reconnecting A and relaying again\n");
+	/* A reconnection has to come back under the same identity: DERP addresses
+	 * peers by public key, so a new one would make A a different node and B
+	 * would be sending to someone who no longer exists. This is the only
+	 * check that exercises the redial against a real relay -- the unit tests
+	 * can drive the frame loop but cannot dial anything. */
+	if (tc_derp_reconnect(&a) != TC_OK) {
+		fprintf(stderr, "FAIL: reconnect: %s\n", tc_derp_error_string());
+		goto fail;
+	}
+	printf("     A reconnected (count=%u)\n", tc_derp_reconnect_count(&a));
+
+	static const char kAfter[] = "after the reconnection";
+	if (tc_derp_send(&a, b_pk, kAfter, sizeof kAfter - 1) != TC_OK) {
+		fprintf(stderr, "FAIL: post-reconnect send: %s\n",
+		        tc_derp_error_string());
+		goto fail;
+	}
+	if (tc_derp_recv(&b, src, buf, sizeof buf, &got) != TC_OK) {
+		fprintf(stderr, "FAIL: post-reconnect recv: %s\n",
+		        tc_derp_error_string());
+		goto fail;
+	}
+	if (got != sizeof kAfter - 1 || memcmp(buf, kAfter, got) != 0) {
+		fprintf(stderr, "FAIL: post-reconnect payload differs\n");
+		goto fail;
+	}
+	if (memcmp(src, a_pk, 32) != 0) {
+		fprintf(stderr, "FAIL: A came back under a different key\n");
+		hexdump("  got:  ", src, 32);
+		hexdump("  want: ", a_pk, 32);
+		goto fail;
+	}
+	printf("     B still sees the same A, and the payload matches\n");
+
 	tc_derp_close(&a);
 	tc_derp_close(&b);
-	printf("\nok   livederp                 relayed both directions via %s\n",
+	printf("\nok   livederp                 relayed both directions via %s,\n",
 	       host);
+	printf("                              and again after a reconnection\n");
 	return 0;
 
 fail:

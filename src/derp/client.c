@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static _Thread_local char g_err[256];
 
@@ -229,6 +230,17 @@ static int derp_handshake(tc_derp_client *c)
 	return TC_OK;
 }
 
+/* derp_now_ms is a monotonic millisecond clock. Unlike the layers above, this
+ * one already does blocking I/O against real timeouts, so it has no reason to
+ * take a clock from its caller. */
+static uint64_t derp_now_ms(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
 int tc_derp_connect(tc_derp_client *c, const tc_derp_dial_opts *opts,
                     const uint8_t our_private[TC_DERP_KEY_LEN],
                     const uint8_t our_public[TC_DERP_KEY_LEN])
@@ -246,6 +258,19 @@ int tc_derp_connect(tc_derp_client *c, const tc_derp_dial_opts *opts,
 	                       ? opts->dial_addr
 	                       : opts->hostname;
 	uint16_t port = (opts->port != 0) ? opts->port : 443;
+
+	/* Keep enough to repeat this dial. The strings are copied because a
+	 * reconnection may come minutes later, long after the caller's own
+	 * buffers have been reused. */
+	(void)snprintf(c->redial_host, sizeof c->redial_host, "%s", opts->hostname);
+	if (opts->dial_addr != NULL && opts->dial_addr[0] != 0) {
+		(void)snprintf(c->redial_addr, sizeof c->redial_addr, "%s",
+		               opts->dial_addr);
+		c->has_redial_addr = true;
+	}
+	c->redial_port = port;
+	c->redial_insecure = opts->insecure_skip_verify;
+	c->redial_timeout_ms = opts->timeout_ms;
 
 	tc_stream tcp;
 	memset(&tcp, 0, sizeof tcp);
@@ -276,6 +301,7 @@ int tc_derp_connect(tc_derp_client *c, const tc_derp_dial_opts *opts,
 		goto fail;
 
 	c->connected = true;
+	c->last_recv_ms = derp_now_ms();
 	return TC_OK;
 
 fail:
@@ -289,6 +315,8 @@ int tc_derp_send(tc_derp_client *c, const uint8_t dst_key[TC_DERP_KEY_LEN],
 {
 	if (c == NULL || !c->connected || dst_key == NULL)
 		return TC_ERR_INVAL;
+	if (c->restarting)
+		return TC_ERR_CLOSED;
 
 	static _Thread_local uint8_t payload[TC_DERP_KEY_LEN +
 	                                     TC_DERP_MAX_PACKET_SIZE];
@@ -308,6 +336,15 @@ int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
 	if (c == NULL || !c->connected || src_key == NULL || buf == NULL)
 		return TC_ERR_INVAL;
 
+	/* Once the relay has said it is going away, this connection is finished.
+	 * There may be a frame or two still buffered behind the announcement,
+	 * but delivering them would let a caller ignore the signal and keep
+	 * using a socket that is about to vanish -- and losing a packet is
+	 * something every layer above already handles, where a silently dying
+	 * relay is not. */
+	if (c->restarting)
+		return TC_ERR_CLOSED;
+
 	static _Thread_local uint8_t frame[TC_DERP_KEY_LEN +
 	                                   TC_DERP_MAX_PACKET_SIZE];
 
@@ -315,8 +352,14 @@ int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
 		uint8_t type = 0;
 		size_t len = 0;
 		int rc = read_frame(&c->stream, &type, frame, sizeof frame, &len);
+		if (rc == TC_ERR_TRUNC)
+			return TC_ERR_CLOSED; /* the relay hung up */
 		if (rc != TC_OK)
 			return rc;
+
+		/* Any frame proves the relay is alive, keep-alives included -- that
+		 * is what they are for. */
+		c->last_recv_ms = derp_now_ms();
 
 		switch (type) {
 		case TC_DERP_FRAME_RECV_PACKET: {
@@ -349,14 +392,26 @@ int tc_derp_recv(tc_derp_client *c, uint8_t src_key[TC_DERP_KEY_LEN],
 				return rc;
 			break;
 
+		case TC_DERP_FRAME_RESTARTING:
+			/* The relay is going away and expects to be redialled. Acting on
+			 * this rather than waiting for the socket to die turns a
+			 * multi-second stall into an immediate reconnection -- the relay
+			 * is telling us, before it happens, exactly what is about to go
+			 * wrong. The body carries suggested timings that we ignore; our
+			 * own backoff is no more eager than they ask for. */
+			c->restarting = true;
+			FAILF("the relay is restarting");
+			return TC_ERR_CLOSED;
+
 		case TC_DERP_FRAME_KEEP_ALIVE:
 		case TC_DERP_FRAME_PEER_GONE:
 		case TC_DERP_FRAME_PEER_PRESENT:
 		case TC_DERP_FRAME_HEALTH:
-		case TC_DERP_FRAME_RESTARTING:
 		case TC_DERP_FRAME_SERVER_INFO:
-			/* Informational. tailcat learns liveness from the WireGuard layer
-			 * rather than from DERP's view of who is connected. */
+			/* Informational. tailcat learns who its peer is from the meow
+			 * exchange rather than from DERP's view of who is connected;
+			 * what these are useful for here is liveness, which is recorded
+			 * for every frame above. */
 			break;
 
 		default:
@@ -372,6 +427,69 @@ int tc_derp_set_read_timeout(tc_derp_client *c, int ms)
 	if (c == NULL || !c->connected)
 		return TC_ERR_INVAL;
 	return tc_stream_set_read_timeout(&c->stream, ms);
+}
+
+int tc_derp_set_write_timeout(tc_derp_client *c, int ms)
+{
+	if (c == NULL || !c->connected)
+		return TC_ERR_INVAL;
+	int rc = tc_stream_set_write_timeout(&c->stream, ms);
+	/* A transport with no way to bound a write is not an error: the harness
+	 * streams in the tests are like that, and they never block. */
+	return rc == TC_ERR_UNSUPPORTED ? TC_OK : rc;
+}
+
+uint64_t tc_derp_idle_ms(const tc_derp_client *c)
+{
+	if (c == NULL || !c->connected || c->last_recv_ms == 0)
+		return 0;
+	uint64_t now = derp_now_ms();
+	return now > c->last_recv_ms ? now - c->last_recv_ms : 0;
+}
+
+bool tc_derp_is_restarting(const tc_derp_client *c)
+{
+	return c != NULL && c->restarting;
+}
+
+unsigned tc_derp_reconnect_count(const tc_derp_client *c)
+{
+	return c == NULL ? 0u : c->reconnects;
+}
+
+int tc_derp_reconnect(tc_derp_client *c)
+{
+	if (c == NULL || c->redial_host[0] == '\0')
+		return TC_ERR_INVAL;
+
+	/* The identity has to outlive the connection: DERP addresses peers by
+	 * public key, so coming back under a new one would make us a different
+	 * node and the peer would never find us again. */
+	uint8_t priv[TC_DERP_KEY_LEN], pub[TC_DERP_KEY_LEN];
+	memcpy(priv, c->our_private, sizeof priv);
+	memcpy(pub, c->our_public, sizeof pub);
+
+	char host[sizeof c->redial_host];
+	char addr[sizeof c->redial_addr];
+	memcpy(host, c->redial_host, sizeof host);
+	memcpy(addr, c->redial_addr, sizeof addr);
+	bool has_addr = c->has_redial_addr;
+	unsigned n = c->reconnects;
+
+	tc_derp_dial_opts opts;
+	memset(&opts, 0, sizeof opts);
+	opts.hostname = host;
+	opts.dial_addr = has_addr ? addr : NULL;
+	opts.port = c->redial_port;
+	opts.insecure_skip_verify = c->redial_insecure;
+	opts.timeout_ms = c->redial_timeout_ms;
+
+	tc_derp_close(c);
+	int rc = tc_derp_connect(c, &opts, priv, pub);
+	tc_memzero_explicit(priv, sizeof priv);
+	if (rc == TC_OK)
+		c->reconnects = n + 1;
+	return rc;
 }
 
 int tc_derp_fd(tc_derp_client *c)

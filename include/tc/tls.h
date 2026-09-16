@@ -32,6 +32,9 @@ struct tc_stream {
 	 * TC_ERR_TIMEOUT. 0 means wait indefinitely. May be NULL on transports
 	 * that cannot do it. */
 	int (*set_read_timeout)(tc_stream *s, int ms);
+	/* set_write_timeout bounds how long a write blocks before returning
+	 * TC_ERR_TIMEOUT. 0 means wait indefinitely. May be NULL. */
+	int (*set_write_timeout)(tc_stream *s, int ms);
 	/* get_fd returns a descriptor usable with poll(), or -1. */
 	int (*get_fd)(tc_stream *s);
 	/* has_pending reports data already buffered above the socket. May be
@@ -49,6 +52,16 @@ struct tc_stream {
  * which is exactly what the meow exchange needs -- DERP delivery is best
  * effort, so the ping has to be resent while waiting for the ack. */
 int tc_stream_set_read_timeout(tc_stream *s, int ms);
+
+/* tc_stream_set_write_timeout bounds subsequent writes on s.
+ *
+ * Unlike a timed-out read, a timed-out write is NOT recoverable: some of the
+ * bytes may already have gone, so the stream is left mid-message and the only
+ * safe move is to close it. It exists because a relay that stops reading
+ * would otherwise block us in send() indefinitely, with every timer in the
+ * process stopped behind it -- a stall with no upper bound is worse than a
+ * connection we know to rebuild. */
+int tc_stream_set_write_timeout(tc_stream *s, int ms);
 
 /* tc_stream_read_full reads exactly len bytes, looping over short reads.
  * Returns TC_ERR_TRUNC if the stream ends first. */

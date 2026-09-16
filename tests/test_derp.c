@@ -255,6 +255,158 @@ static void test_packet_frames(void)
 	           TC_ERR_NOSPACE);
 }
 
+/* ---- the receive loop, over a scripted stream --------------------------- */
+
+/* Everything above tests the codec. The frame loop -- what is answered, what
+ * is skipped, and what ends the connection -- had no test at all, which is
+ * where the liveness and restart handling had to go. A tc_stream backed by a
+ * byte buffer is enough to drive it with no network. */
+
+typedef struct {
+	const uint8_t *in;
+	size_t in_len;
+	size_t in_off;
+	uint8_t out[4096];
+	size_t out_len;
+	bool eof_is_timeout; /* run dry as a timeout rather than a close */
+} scripted;
+
+static int scripted_read(tc_stream *st, uint8_t *buf, size_t len,
+                         size_t *nread)
+{
+	scripted *sc = (scripted *)st->ctx;
+	if (sc->in_off >= sc->in_len)
+		return sc->eof_is_timeout ? TC_ERR_TIMEOUT : TC_ERR_TRUNC;
+	size_t n = sc->in_len - sc->in_off;
+	if (n > len)
+		n = len;
+	memcpy(buf, sc->in + sc->in_off, n);
+	sc->in_off += n;
+	*nread = n;
+	return TC_OK;
+}
+
+static int scripted_write(tc_stream *st, const uint8_t *buf, size_t len)
+{
+	scripted *sc = (scripted *)st->ctx;
+	if (sc->out_len + len > sizeof sc->out)
+		return TC_ERR_NOSPACE;
+	memcpy(sc->out + sc->out_len, buf, len);
+	sc->out_len += len;
+	return TC_OK;
+}
+
+static void scripted_close(tc_stream *st) { (void)st; }
+
+static void scripted_client(tc_derp_client *c, scripted *sc,
+                            const uint8_t *script, size_t len)
+{
+	memset(c, 0, sizeof *c);
+	memset(sc, 0, sizeof *sc);
+	sc->in = script;
+	sc->in_len = len;
+	c->stream.read_some = scripted_read;
+	c->stream.write_all = scripted_write;
+	c->stream.close = scripted_close;
+	c->stream.ctx = sc;
+	c->connected = true;
+}
+
+/* frame appends one DERP frame to a buffer. */
+static size_t frame(uint8_t *out, size_t off, uint8_t type, const void *body,
+                    size_t body_len)
+{
+	tc_derp_frame_header_encode(out + off, type, (uint32_t)body_len);
+	off += TC_DERP_FRAME_HEADER_LEN;
+	if (body_len != 0)
+		memcpy(out + off, body, body_len);
+	return off + body_len;
+}
+
+static void test_recv_loop(void)
+{
+	static uint8_t script[1024];
+	static uint8_t body[TC_DERP_KEY_LEN + 8];
+	uint8_t src[TC_DERP_KEY_LEN];
+	static uint8_t buf[512];
+	size_t got = 0;
+	tc_derp_client c;
+	scripted sc;
+
+	TCT_CASE("a keep-alive is skipped and the packet behind it is delivered");
+	memset(body, 0xAB, sizeof body);
+	size_t n = 0;
+	n = frame(script, n, TC_DERP_FRAME_KEEP_ALIVE, NULL, 0);
+	n = frame(script, n, TC_DERP_FRAME_HEALTH, "ok", 2);
+	n = frame(script, n, TC_DERP_FRAME_RECV_PACKET, body,
+	          TC_DERP_KEY_LEN + 5);
+	scripted_client(&c, &sc, script, n);
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_OK);
+	TCT_EQ_INT((int)got, 5);
+
+	TCT_CASE("a ping is answered with a pong carrying the same payload");
+	static const uint8_t kPing[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	n = frame(script, 0, TC_DERP_FRAME_PING, kPing, sizeof kPing);
+	n = frame(script, n, TC_DERP_FRAME_RECV_PACKET, body,
+	          TC_DERP_KEY_LEN + 1);
+	scripted_client(&c, &sc, script, n);
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_OK);
+	TCT_EQ_INT((int)sc.out_len, TC_DERP_FRAME_HEADER_LEN + 8);
+	TCT_EQ_INT(sc.out[0], TC_DERP_FRAME_PONG);
+	TCT_EQ_MEM(sc.out + TC_DERP_FRAME_HEADER_LEN, kPing, 8);
+
+	TCT_CASE("FRAME_RESTARTING ends the connection rather than being ignored");
+	/* The relay is telling us, before it happens, exactly what is about to
+	 * go wrong. Treating it as informational would mean waiting for the
+	 * socket to die instead of reconnecting at once. */
+	static const uint8_t kRestart[8] = { 0 };
+	n = frame(script, 0, TC_DERP_FRAME_RESTARTING, kRestart, sizeof kRestart);
+	n = frame(script, n, TC_DERP_FRAME_RECV_PACKET, body,
+	          TC_DERP_KEY_LEN + 1);
+	scripted_client(&c, &sc, script, n);
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_ERR_CLOSED);
+	TCT_TRUE(tc_derp_is_restarting(&c));
+	/* And the packet behind it is not delivered: the caller must rebuild
+	 * the connection first. */
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_ERR_CLOSED);
+
+	TCT_CASE("a relay that hangs up reports a closed connection");
+	/* Distinguishing this from a protocol error is what lets the caller
+	 * reconnect instead of giving up. */
+	n = frame(script, 0, TC_DERP_FRAME_KEEP_ALIVE, NULL, 0);
+	scripted_client(&c, &sc, script, n);
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_ERR_CLOSED);
+	TCT_TRUE(!tc_derp_is_restarting(&c));
+
+	TCT_CASE("an unknown frame type is skipped, not fatal");
+	/* The protocol is versioned and relays may add types. */
+	n = frame(script, 0, 0x7e, "whatever", 8);
+	n = frame(script, n, TC_DERP_FRAME_RECV_PACKET, body,
+	          TC_DERP_KEY_LEN + 3);
+	scripted_client(&c, &sc, script, n);
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_OK);
+	TCT_EQ_INT((int)got, 3);
+
+	TCT_CASE("a packet larger than the caller's buffer is refused");
+	n = frame(script, 0, TC_DERP_FRAME_RECV_PACKET, body, sizeof body);
+	scripted_client(&c, &sc, script, n);
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, 2, &got), TC_ERR_NOSPACE);
+
+	TCT_CASE("a timeout leaves the connection usable");
+	n = 0;
+	scripted_client(&c, &sc, script, n);
+	sc.eof_is_timeout = true;
+	TCT_EQ_INT(tc_derp_recv(&c, src, buf, sizeof buf, &got), TC_ERR_TIMEOUT);
+	TCT_TRUE(!tc_derp_is_restarting(&c));
+
+	TCT_CASE("reconnecting a client that was never dialled is refused");
+	memset(&c, 0, sizeof c);
+	TCT_EQ_INT(tc_derp_reconnect(&c), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_derp_reconnect(NULL), TC_ERR_INVAL);
+	TCT_EQ_INT((int)tc_derp_reconnect_count(NULL), 0);
+	TCT_EQ_INT((int)tc_derp_idle_ms(NULL), 0);
+}
+
 int main(void)
 {
 	test_frame_header();
@@ -262,5 +414,6 @@ int main(void)
 	test_client_info();
 	test_server_info();
 	test_packet_frames();
+	test_recv_loop();
 	return tct_report("derp");
 }

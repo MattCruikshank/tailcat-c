@@ -180,13 +180,21 @@ $(CLI): src/cli/main.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) src/cli/main.c $(LIB_OBJS) $(LDFLAGS) -o $@
 
+# Header dependency tracking. Without it, editing a header rebuilds nothing,
+# and an object compiled against an older definition of a struct is linked
+# against one compiled against the newer -- which is not a link error, just a
+# program where two files disagree about where the fields are. Adding one
+# member to tc_stream produced exactly that, and it surfaced as a stack
+# overflow three call frames away from the change.
+DEPFLAGS = -MMD -MP
+
 $(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(MBEDTLS_CFLAGS) -c $< -o $@
+	$(CC) $(MBEDTLS_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/test_%: tests/test_%.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -289,6 +297,10 @@ live-rekey: $(CLI)
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
+
+# -include, not include: the files do not exist on a first build, and make
+# must not treat that as an error.
+-include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
 
 clean:
 	rm -rf build
