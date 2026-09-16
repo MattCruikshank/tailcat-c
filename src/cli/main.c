@@ -748,7 +748,7 @@ static int dial_localhost(uint16_t port)
 {
 	struct sockaddr_in v4;
 	memset(&v4, 0, sizeof v4);
-	v4.sin_family = AF_INET;
+	v4.sin_family = (uint16_t)AF_INET;
 	v4.sin_port = htons(port);
 	v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
@@ -761,7 +761,7 @@ static int dial_localhost(uint16_t port)
 
 	struct sockaddr_in6 v6;
 	memset(&v6, 0, sizeof v6);
-	v6.sin6_family = AF_INET6;
+	v6.sin6_family = (uint16_t)AF_INET6;
 	v6.sin6_port = htons(port);
 	v6.sin6_addr = in6addr_loopback;
 
@@ -1415,7 +1415,7 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 	/* 0600 from the moment it exists, rather than created and then chmod'd:
 	 * the whole file is secret, including the pre-shared key that lives
 	 * under the misleading name "Public". */
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	int fd = open(path, (int)(O_WRONLY | O_CREAT | O_TRUNC), 0600);
 	if (fd < 0) {
 		fprintf(stderr, "tailcat-c: cannot write %s: %s\n", path,
 		        strerror(errno));
@@ -1695,7 +1695,7 @@ static int bind_local(const char *bind_addr, uint16_t port, uint16_t *bound)
 {
 	struct sockaddr_in a;
 	memset(&a, 0, sizeof a);
-	a.sin_family = AF_INET;
+	a.sin_family = (uint16_t)AF_INET;
 	a.sin_port = htons(port);
 	if (inet_pton(AF_INET, bind_addr, &a.sin_addr) != 1) {
 		fprintf(stderr, "tailcat-c: \"%s\" is not an IPv4 address\n",

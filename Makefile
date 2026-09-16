@@ -146,6 +146,7 @@ LIB_SRCS := \
 	src/tc.c \
 	src/base64url.c \
 	src/cbor.c \
+	src/endpoint.c \
 	src/portset.c \
 	src/fwdspec.c \
 	src/shquote.c \
@@ -165,6 +166,7 @@ LIB_SRCS := \
 	src/derp/client.c \
 	src/derp/derpmap.c \
 	src/net/stun.c \
+	src/net/udp.c \
 	src/net/tcp.c \
 	src/net/tcpmux.c \
 	src/net/proxy.c \

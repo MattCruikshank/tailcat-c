@@ -16,6 +16,7 @@
 
 #include "tc/derpmap.h"
 #include "tc/stun.h"
+#include "tc/udp.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -84,9 +85,33 @@ int main(void)
 		return 1;
 	}
 
-	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	/* The same socket that would carry a direct path, so the port STUN
+	 * reports is the port a peer would actually be told to use. Asking from a
+	 * throwaway socket would report a mapping for a port nothing listens on,
+	 * which is the kind of answer that looks right and is useless. */
+	tc_udp u;
+	if (tc_udp_open(&u, 0) != TC_OK) {
+		fprintf(stderr, "FAIL: could not open a UDP socket\n");
+		return 1;
+	}
+	printf("     bound to UDP port %u\n", (unsigned)u.port);
+
+	tc_endpoint local[TC_UDP_MAX_LOCAL];
+	size_t nlocal = tc_udp_local_endpoints(&u, local, TC_UDP_MAX_LOCAL);
+	printf("\n[2] local addresses worth offering a peer: %zu\n", nlocal);
+	for (size_t i = 0; i < nlocal; i++) {
+		char s[64];
+		tc_endpoint_format(s, sizeof s, &local[i]);
+		printf("     %s\n", s);
+	}
+	if (nlocal == 0)
+		printf("     (none routable: ordinary behind NAT, and STUN below\n"
+		       "      supplies the outside view)\n");
+
+	int fd = u.fd4;
 	if (fd < 0) {
-		fprintf(stderr, "FAIL: no UDP socket: %s\n", strerror(errno));
+		fprintf(stderr, "FAIL: no IPv4 socket to ask STUN with\n");
+		tc_udp_close(&u);
 		return 1;
 	}
 
@@ -103,7 +128,7 @@ int main(void)
 			continue;
 		uint16_t sp = (n->stun_port > 0) ? (uint16_t)n->stun_port : 3478;
 
-		printf("[%zu] asking %s (%s) on UDP %u\n", got + 2, n->hostname,
+		printf("[%zu] asking %s (%s) on UDP %u\n", got + 3, n->hostname,
 		       r->region_code, (unsigned)sp);
 		if (stun_once(fd, n->ipv4, sp, &seen[got], 3000) != 0) {
 			printf("     no answer; trying another region\n");
@@ -115,7 +140,7 @@ int main(void)
 		where[got] = r->region_code;
 		got++;
 	}
-	(void)close(fd);
+	tc_udp_close(&u);
 
 	if (got == 0) {
 		fprintf(stderr, "FAIL: no STUN server answered. Either every region "
@@ -132,7 +157,7 @@ int main(void)
 		char a[64], b[64];
 		tc_endpoint_format(a, sizeof a, &seen[0]);
 		tc_endpoint_format(b, sizeof b, &seen[1]);
-		printf("\n[4] two regions, two answers\n");
+		printf("\n[5] two regions, two answers\n");
 		printf("     %-4s %s\n", where[0], a);
 		printf("     %-4s %s\n", where[1], b);
 		if (tc_endpoint_equal(&seen[0], &seen[1]))

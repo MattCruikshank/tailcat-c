@@ -19,20 +19,13 @@
 #ifndef TC_STUN_H_
 #define TC_STUN_H_
 
-#include "tc/tc.h"
+#include "tc/endpoint.h"
 
 #define TC_STUN_TXID_LEN 12
 #define TC_STUN_HEADER_LEN 20
 
 /* Request: 20 header + 12 SOFTWARE + 8 FINGERPRINT. */
 #define TC_STUN_REQUEST_LEN 40
-
-/* An address as seen from outside: four or sixteen bytes, and a port. */
-typedef struct {
-	uint8_t ip[16];
-	uint8_t ip_len; /* 4 or 16; 0 means unset */
-	uint16_t port;
-} tc_endpoint;
 
 /* tc_stun_build_request writes a binding request and fills txid with fresh
  * random bytes.
@@ -80,10 +73,5 @@ int tc_stun_parse_response(const uint8_t *msg, size_t len,
 int tc_stun_build_response(uint8_t *out, size_t cap, size_t *out_len,
                            const uint8_t txid[TC_STUN_TXID_LEN],
                            const tc_endpoint *ep);
-
-/* tc_endpoint_format writes "1.2.3.4:567" or "[2001:db8::1]:567". */
-int tc_endpoint_format(char *out, size_t cap, const tc_endpoint *ep);
-
-bool tc_endpoint_equal(const tc_endpoint *a, const tc_endpoint *b);
 
 #endif /* TC_STUN_H_ */
