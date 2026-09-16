@@ -6,9 +6,9 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: the agreed scope works.** `tailcat-c` pipes stdin to a **real
-tailcat server** and its replies back, over a WireGuard tunnel relayed through
-a production DERP node:
+**Status: the agreed scope works, on two operating systems.** `tailcat-c`
+both serves and connects, interoperates with the real Go tailcat in both
+roles, and the *same fat binary* does it on Linux and on Windows:
 
 ```console
 $ echo 'the quick brown fox' | tailcat-c -v tcpGFwWCDMihnYWAeovm...
@@ -18,8 +18,23 @@ $ echo 'the quick brown fox' | tailcat-c -v tcpGFwWCDMihnYWAeovm...
 # connected
 ```
 
-and the Go server prints `the quick brown fox` on its own stdout. `make
-live-cli` does exactly that, start to finish.
+and the Go server prints `the quick brown fox` on its own stdout.
+
+It works the other way round too: `tailcat-c serve` mints an address that the
+**real Go client** accepts, answers its WireGuard handshake as the responder,
+and writes what it receives to stdout.
+
+`scripts/live-cross.sh` runs one binary against itself across both operating
+systems, in both directions, through a real relay:
+
+```
+one binary, 1759283 bytes, run by both operating systems
+
+== A: Windows transmits -> Linux receives ==
+  the Linux server received: hello from Windows
+== B: Linux transmits -> Windows receives ==
+  the Windows server received: hello from Linux
+```
 
 Everything is a single fat Actually Portable Executable with no dependencies
 beyond a vendored Mbed TLS. See [Limitations](#limitations) for what this
@@ -79,11 +94,19 @@ make live-tailcat  # full tunnel with a real tailcat server (needs network)
 make live-cli      # drive the CLI end to end against a real server
 ```
 
+And, from Git Bash on Windows rather than from inside WSL, since it drives
+both sides:
+
+```sh
+sh scripts/live-cross.sh   # one binary, two operating systems, both ways
+```
+
 Then:
 
 ```console
-$ tailcat-c parse <tc-address>          # describe an address
-$ echo hello | tailcat-c <tc-address>   # pipe to a tailcat server
+$ tailcat-c serve --relay tc301a.ipn.dev   # listen; prints an address
+$ echo hello | tailcat-c <tc-address>      # pipe to a server
+$ tailcat-c parse <tc-address>             # describe an address
 ```
 
 The address must be self-contained; run `tailcat resolve` on a short one,
@@ -319,10 +342,10 @@ Current, and deliberate unless noted.
   through a relay; it cannot yet talk to a real `tailcat` peer.
 - **No SSH, SFTP, SOCKS, port forwarding, or WASM build.**
 - **No DERP map fetching**, so a short address cannot be used directly: run
-  `tailcat resolve` on it first. There is no latency-based region selection
-  either, which also means **tailcat-c cannot serve** -- minting an address
-  requires picking a relay.
-- **The CLI is client-only**, and opens one connection at a time.
+  `tailcat resolve` on it first, and `serve` needs `--relay <hostname>`
+  because it cannot choose a region by latency.
+- **`serve` handles one client and one connection**, then exits. There is no
+  accept loop and no demultiplexer.
 
 ### TLS
 
@@ -420,8 +443,6 @@ Roughly in the order they should be picked up.
       running until the counter limit.
 - [ ] **Initiation replay protection**: remember the last TAI64N timestamp
       per peer and reject anything not strictly newer.
-- [ ] **TCP passive open is implemented but unused**: nothing in tailcat-c
-      listens yet, so only the client path has live coverage.
 - [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
 - [ ] **Write timeouts** on the DERP stream. Reads are now bounded by
       `tc_derp_set_read_timeout`; writes still are not.
@@ -431,8 +452,8 @@ Roughly in the order they should be picked up.
       region selection. The `Addr` codec already parses embedded regions, and
       `Resolve` semantics are understood but unimplemented.
 - [ ] **CI**, building both toolchains and running tests, interop and fuzzing.
-- [ ] **Test the fat binary on a non-Linux host.** It is built for six
-      operating systems and has been run on one.
+- [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
+      covered; the other four targets and the entire aarch64 half are not.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
       that callers must serialise it.
 - [ ] Revisit **TLS 1.3** once the PSA dependency is worth paying for.

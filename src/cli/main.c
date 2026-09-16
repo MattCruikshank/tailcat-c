@@ -3,8 +3,9 @@
  * The tailcat-c command: netcat over a WireGuard tunnel, relayed through
  * DERP, speaking to a real tailcat server.
  *
- *     tailcat-c <tc-address> [port]   pipe stdin/stdout to the server
- *     tailcat-c parse <tc-address>    show what an address contains
+ *     tailcat-c <tc-address> [port]      connect and pipe stdin/stdout
+ *     tailcat-c serve --relay HOST       listen, printing an address
+ *     tailcat-c parse <tc-address>       show what an address contains
  *     tailcat-c version
  *
  * The pipe mode is a single-threaded event loop over two descriptors: the
@@ -13,9 +14,11 @@
  * and no shared state, which matters because tc_derp_client is not safe for
  * concurrent use.
  *
- * Only the client side exists. Serving would need a DERP map fetcher and
- * latency-based region selection to mint an address, neither of which is
- * implemented; see the README.
+ * Both roles are here. Serving mints a self-contained address with the relay
+ * embedded, which is why it needs --relay: choosing a region by latency would
+ * need the DERP map, which is not implemented. The server is the WireGuard
+ * responder and the TCP passive opener, and the real Go client interoperates
+ * with it.
  */
 
 #include "tc/addr.h"
@@ -68,12 +71,15 @@ static void usage(FILE *f)
 	        "usage:\n"
 	        "  tailcat-c [flags] <tc-address> [port]   pipe stdin/stdout to a "
 	        "tailcat server\n"
+	        "  tailcat-c serve --relay HOST [port]     listen and print an "
+	        "address\n"
 	        "  tailcat-c parse <tc-address>            describe an address\n"
 	        "  tailcat-c version\n"
 	        "\n"
 	        "flags:\n"
 	        "  -v, --verbose      report progress on stderr\n"
 	        "      --insecure     skip TLS verification of the relay\n"
+	        "      --relay HOST   relay to serve through (serve mode)\n"
 	        "      --timeout SEC  give up after SEC seconds (default 60)\n"
 	        "\n"
 	        "The port defaults to 1, which is what a bare `tailcat` server "
@@ -174,6 +180,148 @@ static bool write_all(int fd, const uint8_t *p, size_t n)
 		return false;
 	}
 	return true;
+}
+
+/* run_pipe is the event loop both roles share: stdin into the tunnel, the
+ * tunnel out to stdout, and the relay socket feeding the TCP stack.
+ *
+ * It is single-threaded on purpose. tc_derp_client is not safe for
+ * concurrent use, and a loop over two descriptors needs no locks at all.
+ * The caller has already opened or accepted the connection. */
+static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
+                    tc_tcp_conn *tcp, const uint8_t peer_key[32],
+                    uint64_t deadline)
+{
+	/* Non-blocking stdin, so the loop never stalls on a slow writer while
+	 * the tunnel has work to do. */
+	int in_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+	if (in_flags >= 0)
+		(void)fcntl(STDIN_FILENO, F_SETFL,
+		            (int)((unsigned)in_flags | (unsigned)O_NONBLOCK));
+
+	bool stdin_eof = false, half_closed = false, connected = false;
+	int rc;
+	tc_derp_set_read_timeout(derp, 20);
+
+	while (now_ms() < deadline) {
+		uint64_t t = now_ms();
+		tc_tcp_tick(tcp, t);
+
+		if (!connected && tc_tcp_is_established(tcp)) {
+			connected = true;
+			vlogf("connected");
+		}
+
+		/* stdin -> tunnel */
+		if (connected && !stdin_eof) {
+			size_t room = tc_tcp_writable(tcp);
+			if (room > 0) {
+				uint8_t buf[16384];
+				if (room > sizeof buf)
+					room = sizeof buf;
+				ssize_t n = read(STDIN_FILENO, buf, room);
+				if (n > 0) {
+					size_t w = 0;
+					tc_tcp_write(tcp, buf, (size_t)n, &w, t);
+				} else if (n == 0) {
+					stdin_eof = true;
+				} else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+				           errno != EINTR) {
+					stdin_eof = true;
+				}
+			}
+		}
+
+		/* Half close once everything we read has been acknowledged, which is
+		 * what tells the server its input has ended. */
+		if (stdin_eof && !half_closed && tc_tcp_send_unacked(tcp) == 0) {
+			tc_tcp_shutdown_write(tcp, t);
+			half_closed = true;
+			vlogf("sent everything; closed our write side");
+		}
+
+		/* tunnel -> stdout */
+		bool progress = false;
+		for (;;) {
+			uint8_t buf[16384];
+			size_t n = 0;
+			if (tc_tcp_read(tcp, buf, sizeof buf, &n) != TC_OK || n == 0)
+				break;
+			if (!write_all(STDOUT_FILENO, buf, n)) {
+				fprintf(stderr, "tailcat-c: write to stdout failed\n");
+				return 1;
+			}
+			progress = true;
+		}
+
+		if (half_closed && tc_tcp_read_closed(tcp)) {
+			return 0;
+		}
+		if (tc_tcp_get_state(tcp) == TC_TCP_CLOSED) {
+			return connected ? 0 : 1;
+		}
+
+		/* Wait for whichever comes first: something from the relay, more
+		 * stdin, or a TCP timer. Checking has_pending first matters -- a
+		 * whole frame may already be decrypted inside the TLS layer with
+		 * nothing left on the socket for poll() to see. */
+		if (!progress && !tc_derp_has_pending(derp)) {
+			struct pollfd pfds[2];
+			int nfds = 0;
+			int dfd = tc_derp_fd(derp);
+			if (dfd >= 0) {
+				pfds[nfds].fd = dfd;
+				pfds[nfds].events = POLLIN;
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+			if (connected && !stdin_eof && tc_tcp_writable(tcp) > 0) {
+				pfds[nfds].fd = STDIN_FILENO;
+				pfds[nfds].events = POLLIN;
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+
+			int wait_ms = 20;
+			uint64_t dl = tc_tcp_next_deadline(tcp);
+			if (dl != UINT64_MAX) {
+				uint64_t nowv = now_ms();
+				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
+				if (wait_ms > 200)
+					wait_ms = 200;
+			}
+			if (nfds > 0)
+				(void)poll(pfds, (nfds_t)nfds, wait_ms);
+		}
+
+		/* relay -> tunnel */
+		uint8_t src[32];
+		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+		size_t len = 0;
+		rc = tc_derp_recv(derp, src, buf, sizeof buf, &len);
+		if (rc == TC_ERR_TIMEOUT)
+			continue;
+		if (rc != TC_OK) {
+			if (!half_closed)
+				fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
+			return connected ? 0 : 1;
+		}
+		if (memcmp(src, peer_key, 32) != 0 || len == 0)
+			continue;
+		if (buf[0] != TC_WG_MSG_TRANSPORT)
+			continue;
+
+		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
+		size_t inner_len = 0;
+		if (tc_wg_decrypt(inner, sizeof inner, &inner_len, sess, buf, len) !=
+		    TC_OK)
+			continue; /* forged, replayed, or a rekey we do not implement */
+		if (inner_len == 0)
+			continue; /* keepalive */
+		tc_tcp_input(tcp, inner, inner_len, now_ms());
+	}
+
+	return 1;
 }
 
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
@@ -345,135 +493,181 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	}
 	vlogf("connecting to port %u", (unsigned)port);
 
-	/* Non-blocking stdin, so the loop never stalls on a slow writer while
-	 * the tunnel has work to do. */
-	int in_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-	if (in_flags >= 0)
-		(void)fcntl(STDIN_FILENO, F_SETFL,
-		            (int)((unsigned)in_flags | (unsigned)O_NONBLOCK));
+	status = run_pipe(&derp, &sess, tcp, ci.server_public, deadline);
 
-	bool stdin_eof = false, half_closed = false, connected = false;
-	tc_derp_set_read_timeout(&derp, 20);
+	if (status != 0 && now_ms() >= deadline)
+		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
 
-	while (now_ms() < deadline) {
-		uint64_t t = now_ms();
-		tc_tcp_tick(tcp, t);
+out:
+	if (tcp != NULL)
+		tc_tcp_free(tcp);
+	tc_wg_session_clear(&sess);
+	tc_derp_close(&derp);
+	return status;
+}
 
-		if (!connected && tc_tcp_is_established(tcp)) {
-			connected = true;
-			vlogf("connected");
-		}
+/* ---- serve mode ------------------------------------------------------- */
 
-		/* stdin -> tunnel */
-		if (connected && !stdin_eof) {
-			size_t room = tc_tcp_writable(tcp);
-			if (room > 0) {
-				uint8_t buf[16384];
-				if (room > sizeof buf)
-					room = sizeof buf;
-				ssize_t n = read(STDIN_FILENO, buf, room);
-				if (n > 0) {
-					size_t w = 0;
-					tc_tcp_write(tcp, buf, (size_t)n, &w, t);
-				} else if (n == 0) {
-					stdin_eof = true;
-				} else if (errno != EAGAIN && errno != EWOULDBLOCK &&
-				           errno != EINTR) {
-					stdin_eof = true;
-				}
-			}
-		}
+static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
+                     unsigned timeout_s)
+{
+	/* A fresh identity per run, like upstream's default. The pre-shared key
+	 * is what stops a relay operator who has watched both public keys go past
+	 * from joining the tunnel, so it is always generated. */
+	tc_wg_identity me;
+	uint8_t disco_pub[32];
+	if (tc_wg_identity_generate(&me) != TC_OK ||
+	    tc_disco_key_for_node(NULL, disco_pub, me.private_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not generate keys\n");
+		return 1;
+	}
 
-		/* Half close once everything we read has been acknowledged, which is
-		 * what tells the server its input has ended. */
-		if (stdin_eof && !half_closed && tc_tcp_send_unacked(tcp) == 0) {
-			tc_tcp_shutdown_write(tcp, t);
-			half_closed = true;
-			vlogf("sent everything; closed our write side");
-		}
+	static tc_conn_info ci;
+	memset(&ci, 0, sizeof ci);
+	memcpy(ci.server_public, me.public_key, 32);
+	memcpy(ci.server_disco_public, disco_pub, 32);
+	ci.has_disco_public = true;
+	if (tc_random_bytes(ci.preshared_key, sizeof ci.preshared_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not generate a pre-shared key\n");
+		return 1;
+	}
+	ci.has_preshared_key = true;
 
-		/* tunnel -> stdout */
-		bool progress = false;
-		for (;;) {
-			uint8_t buf[16384];
-			size_t n = 0;
-			if (tc_tcp_read(tcp, buf, sizeof buf, &n) != TC_OK || n == 0)
-				break;
-			if (!write_all(STDOUT_FILENO, buf, n)) {
-				fprintf(stderr, "tailcat-c: write to stdout failed\n");
-				goto out;
-			}
-			progress = true;
-		}
+	/* Embed the relay rather than naming a region by number, so the address
+	 * is self-contained and the other side needs no DERP map either. */
+	ci.num_regions = 1;
+	ci.regions[0].num_nodes = 1;
+	if (snprintf(ci.regions[0].nodes[0].hostname, TC_DNS_NAME_MAX, "%s",
+	             relay_host) >= TC_DNS_NAME_MAX) {
+		fprintf(stderr, "tailcat-c: relay hostname is too long\n");
+		return 1;
+	}
 
-		if (half_closed && tc_tcp_read_closed(tcp)) {
-			status = 0;
-			break;
-		}
-		if (tc_tcp_get_state(tcp) == TC_TCP_CLOSED) {
-			status = connected ? 0 : 1;
-			break;
-		}
+	char addr[TC_ADDR_STR_MAX];
+	if (tc_addr_encode(addr, sizeof addr, &ci, NULL) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not build an address\n");
+		return 1;
+	}
 
-		/* Wait for whichever comes first: something from the relay, more
-		 * stdin, or a TCP timer. Checking has_pending first matters -- a
-		 * whole frame may already be decrypted inside the TLS layer with
-		 * nothing left on the socket for poll() to see. */
-		if (!progress && !tc_derp_has_pending(&derp)) {
-			struct pollfd pfds[2];
-			int nfds = 0;
-			int dfd = tc_derp_fd(&derp);
-			if (dfd >= 0) {
-				pfds[nfds].fd = dfd;
-				pfds[nfds].events = POLLIN;
-				pfds[nfds].revents = 0;
-				nfds++;
-			}
-			if (connected && !stdin_eof && tc_tcp_writable(tcp) > 0) {
-				pfds[nfds].fd = STDIN_FILENO;
-				pfds[nfds].events = POLLIN;
-				pfds[nfds].revents = 0;
-				nfds++;
-			}
+	tc_derp_dial_opts opts;
+	memset(&opts, 0, sizeof opts);
+	opts.hostname = relay_host;
+	opts.insecure_skip_verify = insecure;
+	opts.timeout_ms = 15000;
 
-			int wait_ms = 20;
-			uint64_t dl = tc_tcp_next_deadline(tcp);
-			if (dl != UINT64_MAX) {
-				uint64_t nowv = now_ms();
-				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
-				if (wait_ms > 200)
-					wait_ms = 200;
-			}
-			if (nfds > 0)
-				(void)poll(pfds, (nfds_t)nfds, wait_ms);
-		}
+	tc_derp_client derp;
+	if (tc_derp_connect(&derp, &opts, me.private_key, me.public_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: relay: %s\n", tc_derp_error_string());
+		return 1;
+	}
+	tc_derp_set_read_timeout(&derp, 200);
 
-		/* relay -> tunnel */
+	/* The address goes to stderr: stdout is the data pipe. */
+	fprintf(stderr, "# relay %s\n", relay_host);
+	fprintf(stderr, "# listening with new address: %s\n", addr);
+	fflush(stderr);
+
+	int status = 1;
+	tc_tcp_conn *tcp = NULL;
+	tc_wg_session sess;
+	memset(&sess, 0, sizeof sess);
+
+	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
+	uint8_t client_key[32];
+	bool have_client = false;
+	tc_wg_handshake hs;
+	bool up = false;
+
+	/* Wait for a client to introduce itself, then answer its handshake. Both
+	 * arrive on the same relay connection, and the client resends each until
+	 * acknowledged, so a single loop over both is enough. */
+	while (!up && now_ms() < deadline) {
 		uint8_t src[32];
 		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 		size_t len = 0;
-		rc = tc_derp_recv(&derp, src, buf, sizeof buf, &len);
+		int rc = tc_derp_recv(&derp, src, buf, sizeof buf, &len);
 		if (rc == TC_ERR_TIMEOUT)
 			continue;
 		if (rc != TC_OK) {
-			if (!half_closed)
-				fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
-			break;
+			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
+			goto out;
 		}
-		if (memcmp(src, ci.server_public, 32) != 0 || len == 0)
+
+		if (tc_meow_is_packet(buf, len)) {
+			uint8_t node[32], disco[32];
+			if (tc_meow_parse_ping(buf, len, node, disco) != TC_OK)
+				continue;
+			if (memcmp(node, src, 32) != 0)
+				continue; /* the relay's idea of the sender must agree */
+			if (!have_client) {
+				memcpy(client_key, node, 32);
+				have_client = true;
+				vlogf("client introduced itself");
+			} else if (memcmp(client_key, node, 32) != 0) {
+				continue; /* already serving someone else */
+			}
+			/* Acknowledge every ping: the client resends until it hears
+			 * back, and duplicates are harmless. */
+			uint8_t ack[TC_MEOW_MEOWED_LEN];
+			size_t ack_len = 0;
+			tc_meow_encode_meowed(ack, sizeof ack, &ack_len);
+			(void)tc_derp_send(&derp, client_key, ack, ack_len);
 			continue;
-		if (buf[0] != TC_WG_MSG_TRANSPORT)
+		}
+
+		if (!have_client || memcmp(src, client_key, 32) != 0)
+			continue;
+		if (len != TC_WG_INITIATION_SIZE || buf[0] != TC_WG_MSG_INITIATION)
 			continue;
 
-		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
-		size_t inner_len = 0;
-		if (tc_wg_decrypt(inner, sizeof inner, &inner_len, &sess, buf, len) !=
+		if (tc_wg_handshake_init(&hs, &me, client_key, ci.preshared_key) !=
 		    TC_OK)
-			continue; /* forged, replayed, or a rekey we do not implement */
-		if (inner_len == 0)
-			continue; /* keepalive */
-		tc_tcp_input(tcp, inner, inner_len, now_ms());
+			continue;
+		if (tc_wg_consume_initiation(&hs, &me, buf, NULL, NULL) != TC_OK) {
+			vlogf("rejected a handshake initiation");
+			continue;
+		}
+		uint8_t resp[TC_WG_RESPONSE_SIZE];
+		if (tc_wg_create_response(resp, &hs, &me, 0) != TC_OK)
+			continue;
+		if (tc_derp_send(&derp, client_key, resp, sizeof resp) != TC_OK) {
+			fprintf(stderr, "tailcat-c: relay send failed\n");
+			goto out;
+		}
+		if (tc_wg_begin_session(&sess, &hs) != TC_OK) {
+			fprintf(stderr, "tailcat-c: could not derive session keys\n");
+			goto out;
+		}
+		up = true;
 	}
+
+	if (!up) {
+		fprintf(stderr, "tailcat-c: no client connected\n");
+		goto out;
+	}
+	vlogf("tunnel up (we are the responder)");
+
+	uint8_t our_ip[TC_TUNNEL_ADDR_LEN], their_ip[TC_TUNNEL_ADDR_LEN];
+	tc_tunnel_addr_for_key(our_ip, me.public_key);
+	tc_tunnel_addr_for_key(their_ip, client_key);
+
+	pump ctx;
+	ctx.derp = &derp;
+	ctx.sess = &sess;
+	memcpy(ctx.server_key, client_key, 32);
+
+	tcp = tc_tcp_new(our_ip, their_ip, tcp_out, &ctx);
+	if (tcp == NULL) {
+		fprintf(stderr, "tailcat-c: out of memory\n");
+		goto out;
+	}
+	if (tc_tcp_listen(tcp, port) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not listen\n");
+		goto out;
+	}
+	vlogf("listening on port %u inside the tunnel", (unsigned)port);
+
+	status = run_pipe(&derp, &sess, tcp, client_key, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
@@ -492,6 +686,7 @@ int main(int argc, char **argv)
 {
 	bool insecure = false;
 	unsigned timeout_s = 60;
+	const char *relay = NULL;
 	const char *args[3] = { NULL, NULL, NULL };
 	size_t nargs = 0;
 
@@ -501,6 +696,8 @@ int main(int argc, char **argv)
 			g_verbose = true;
 		} else if (strcmp(a, "--insecure") == 0) {
 			insecure = true;
+		} else if (strcmp(a, "--relay") == 0 && i + 1 < argc) {
+			relay = argv[++i];
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
 			timeout_s = (unsigned)strtoul(argv[++i], NULL, 10);
 			if (timeout_s == 0)
@@ -527,6 +724,29 @@ int main(int argc, char **argv)
 	if (strcmp(args[0], "version") == 0) {
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);
 		return 0;
+	}
+	if (strcmp(args[0], "serve") == 0) {
+		if (relay == NULL) {
+			fprintf(stderr,
+			        "tailcat-c: serve needs --relay <hostname>\n"
+			        "           Choosing one automatically needs the DERP "
+			        "map, which is\n"
+			        "           not implemented. Any relay from\n"
+			        "           https://tailcat.dev/derpmap.json works, for "
+			        "example\n"
+			        "           --relay tc301a.ipn.dev\n");
+			return 2;
+		}
+		uint16_t sport = 1;
+		if (nargs >= 2) {
+			unsigned long p2 = strtoul(args[1], NULL, 10);
+			if (p2 == 0 || p2 > 65535) {
+				fprintf(stderr, "tailcat-c: bad port %s\n", args[1]);
+				return 2;
+			}
+			sport = (uint16_t)p2;
+		}
+		return cmd_serve(relay, sport, insecure, timeout_s);
 	}
 	if (strcmp(args[0], "parse") == 0) {
 		if (nargs < 2) {
