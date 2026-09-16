@@ -58,6 +58,7 @@ MBEDTLS_DIR := third_party/mbedtls
 MBEDTLS_SRCS := \
 	$(MBEDTLS_DIR)/library/platform.c \
 	$(MBEDTLS_DIR)/library/platform_util.c \
+	$(MBEDTLS_DIR)/library/error.c \
 	$(MBEDTLS_DIR)/library/constant_time.c \
 	$(MBEDTLS_DIR)/library/chacha20.c \
 	$(MBEDTLS_DIR)/library/poly1305.c \
@@ -72,19 +73,51 @@ MBEDTLS_SRCS := \
 	$(MBEDTLS_DIR)/library/bignum_core.c \
 	$(MBEDTLS_DIR)/library/ecp.c \
 	$(MBEDTLS_DIR)/library/ecp_curves.c \
-	$(MBEDTLS_DIR)/library/ecdh.c
+	$(MBEDTLS_DIR)/library/ecdh.c \
+	$(MBEDTLS_DIR)/library/ecdsa.c \
+	$(MBEDTLS_DIR)/library/sha512.c \
+	$(MBEDTLS_DIR)/library/gcm.c \
+	$(MBEDTLS_DIR)/library/cipher.c \
+	$(MBEDTLS_DIR)/library/cipher_wrap.c \
+	$(MBEDTLS_DIR)/library/base64.c \
+	$(MBEDTLS_DIR)/library/pem.c \
+	$(MBEDTLS_DIR)/library/asn1parse.c \
+	$(MBEDTLS_DIR)/library/asn1write.c \
+	$(MBEDTLS_DIR)/library/oid.c \
+	$(MBEDTLS_DIR)/library/rsa.c \
+	$(MBEDTLS_DIR)/library/rsa_alt_helpers.c \
+	$(MBEDTLS_DIR)/library/pk.c \
+	$(MBEDTLS_DIR)/library/pk_wrap.c \
+	$(MBEDTLS_DIR)/library/pk_ecc.c \
+	$(MBEDTLS_DIR)/library/pkparse.c \
+	$(MBEDTLS_DIR)/library/x509.c \
+	$(MBEDTLS_DIR)/library/x509_crt.c \
+	$(MBEDTLS_DIR)/library/ssl_ciphersuites.c \
+	$(MBEDTLS_DIR)/library/ssl_client.c \
+	$(MBEDTLS_DIR)/library/ssl_msg.c \
+	$(MBEDTLS_DIR)/library/ssl_tls.c \
+	$(MBEDTLS_DIR)/library/ssl_tls12_client.c
 
 MBEDTLS_OBJS := $(MBEDTLS_SRCS:%.c=$(BUILD)/%.o)
 
-MBEDTLS_INC := -I$(MBEDTLS_DIR)/include -Ithird_party
+# -isystem, not -I: Mbed TLS's public headers do not compile warning-free
+# under our warning set (redundant redeclarations, undefined macros in #if).
+# Treating them as system headers suppresses that without weakening the
+# warnings that apply to our own code. third_party keeps -I because
+# mbedtls_config.h there is ours.
+MBEDTLS_INC := -isystem $(MBEDTLS_DIR)/include -Ithird_party
 MBEDTLS_DEF := -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>'
 
-CFLAGS ?= -std=c11 -O2 -g
+# gnu11 rather than c11: strict ISO mode makes glibc hide the POSIX
+# networking declarations (struct addrinfo, getaddrinfo), which the DERP
+# transport needs. -Wpedantic stays on, so our own code is still held to ISO
+# C -- this only exposes the platform headers we are entitled to.
+CFLAGS ?= -std=gnu11 -O2 -g
 CFLAGS += $(WARNINGS) $(HARDENING) -Iinclude $(MBEDTLS_INC) $(MBEDTLS_DEF)
 
 # Third-party code is not held to our warning set; -w here keeps a real
 # warning in our own code from being lost in Mbed TLS's output.
-MBEDTLS_CFLAGS := -std=c11 -O2 -g -w $(HARDENING) $(MBEDTLS_INC) $(MBEDTLS_DEF)
+MBEDTLS_CFLAGS := -std=gnu11 -O2 -g -w $(HARDENING) $(MBEDTLS_INC) $(MBEDTLS_DEF)
 
 ifeq ($(SANITIZE),1)
 CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -102,14 +135,18 @@ LIB_SRCS := \
 	src/crypto/x25519.c \
 	src/crypto/aead.c \
 	src/crypto/salsa20.c \
-	src/crypto/random.c
+	src/crypto/random.c \
+	src/derp/frame.c \
+	src/derp/client.c \
+	src/net/tls.c \
+	src/net/ca_bundle.c
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop
+.PHONY: all test clean check-fat fuzz interop live
 all: $(LIB_OBJS)
 
 $(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c
@@ -142,7 +179,7 @@ endif
 FUZZ_ITERS ?= 200000
 FUZZ_SAN := -fsanitize=address,undefined -fno-omit-frame-pointer \
 	-fno-sanitize-recover=all
-FUZZ_CC := gcc -std=c11 -O1 -g
+FUZZ_CC := gcc -std=gnu11 -O1 -g
 
 # Mbed TLS is compiled separately so it can be built with -w: it is not held
 # to our warning set, and a real warning in our code must not be lost in it.
@@ -179,6 +216,17 @@ $(BUILD)/crosscheck: tests/crosscheck.c $(LIB_OBJS)
 interop: $(BUILD)/crosscheck
 	cd tools/genaddrs && GOFLAGS=-mod=mod go run . -count $(INTEROP_COUNT) \
 		| ../../$(BUILD)/crosscheck
+
+# Live interoperability check against a real DERP relay. Kept out of `make
+# test` on purpose: that has to pass offline and must not depend on someone
+# else's server being up.
+LIVE_HOST ?=
+$(BUILD)/livederp: tests/livederp.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) tests/livederp.c $(LIB_OBJS) $(LDFLAGS) -o $@
+
+live: $(BUILD)/livederp
+	./$(BUILD)/livederp $(LIVE_HOST)
 
 clean:
 	rm -rf $(BUILD)

@@ -24,6 +24,11 @@
 
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_HAVE_TIME
+
+/* mbedtls_strerror. A TLS handshake fails for many distinguishable reasons
+ * and "TC_ERR_INVAL" is useless when diagnosing a relay that will not talk to
+ * us, so the few KB of message tables earn their place. */
+#define MBEDTLS_ERROR_C
 /* No MBEDTLS_FS_IO: we never read keys or certificates off disk, and it is
  * one less thing reachable from parsed input. */
 
@@ -33,15 +38,20 @@
 #define MBEDTLS_POLY1305_C
 #define MBEDTLS_CHACHAPOLY_C
 
-/* AES and GCM are needed by CTR_DRBG and, later, by the TLS cipher suites
- * every real server offers. */
+/* AES and GCM are needed by CTR_DRBG and by the TLS cipher suites every real
+ * server offers. */
 #define MBEDTLS_AES_C
+#define MBEDTLS_GCM_C
+#define MBEDTLS_CIPHER_C
 
 /* ---- hashing --------------------------------------------------------- */
 
 #define MBEDTLS_MD_C
 #define MBEDTLS_SHA256_C
 #define MBEDTLS_SHA224_C
+/* SHA-384 suites and SHA-384 certificate signatures are both common. */
+#define MBEDTLS_SHA512_C
+#define MBEDTLS_SHA384_C
 
 /* ---- randomness ------------------------------------------------------ */
 
@@ -57,18 +67,51 @@
 #define MBEDTLS_ECP_DP_CURVE25519_ENABLED
 /* Curves real DERP servers' certificates and key exchanges use. */
 #define MBEDTLS_ECP_DP_SECP256R1_ENABLED
+#define MBEDTLS_ECP_DP_SECP384R1_ENABLED
 
 #define MBEDTLS_ECP_NIST_OPTIM
 
 /* ---- TLS client ------------------------------------------------------
  *
- * Deliberately not enabled yet. DERP speaks HTTPS, so M3 turns on
- * MBEDTLS_SSL_CLI_C / MBEDTLS_SSL_TLS_C / MBEDTLS_X509_CRT_PARSE_C and the
- * ECDHE key exchanges. Note that TLS 1.3 in Mbed TLS 3.6 additionally
- * requires the PSA crypto layer (MBEDTLS_PSA_CRYPTO_C and its HKDF), which
- * pulls in a substantial amount of code; enabling TLS 1.3 without it fails
- * check_config.h's prerequisite test. Left for M3 so that M2 builds the
- * smallest thing that can be verified against RFC vectors.
+ * DERP speaks HTTPS, so the relay transport needs a TLS client.
+ *
+ * TLS 1.2 only. TLS 1.3 in Mbed TLS 3.6 additionally requires the PSA crypto
+ * layer (MBEDTLS_PSA_CRYPTO_C and its HKDF), which is a large amount of extra
+ * code; check_config.h rejects TLS 1.3 without it. Tailscale's DERP servers
+ * accept TLS 1.2, so this is sufficient, and 1.2 with ECDHE and AEAD suites
+ * is not a security compromise. Revisit if a relay ever requires 1.3.
+ *
+ * Note the consequence for upstream's "fast start" optimisation: it reads the
+ * server's DERP public key out of a meta certificate, but only when the
+ * connection negotiated TLS 1.3. On 1.2 that path is unavailable, so we
+ * always do the ordinary HTTP upgrade and read FRAME_SERVER_KEY, which works
+ * against every server.
  */
+#define MBEDTLS_SSL_CLI_C
+#define MBEDTLS_SSL_TLS_C
+#define MBEDTLS_SSL_PROTO_TLS1_2
+#define MBEDTLS_SSL_SERVER_NAME_INDICATION
+#define MBEDTLS_SSL_ENCRYPT_THEN_MAC
+#define MBEDTLS_SSL_EXTENDED_MASTER_SECRET
+#define MBEDTLS_SSL_KEEP_PEER_CERTIFICATE
+
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
+
+/* Certificate handling, and the public-key algorithms real certificate
+ * chains are signed with. */
+#define MBEDTLS_X509_USE_C
+#define MBEDTLS_X509_CRT_PARSE_C
+#define MBEDTLS_PK_C
+#define MBEDTLS_PK_PARSE_C
+#define MBEDTLS_RSA_C
+#define MBEDTLS_PKCS1_V15
+#define MBEDTLS_PKCS1_V21
+#define MBEDTLS_ECDSA_C
+#define MBEDTLS_ASN1_PARSE_C
+#define MBEDTLS_ASN1_WRITE_C
+#define MBEDTLS_OID_C
+#define MBEDTLS_BASE64_C
+#define MBEDTLS_PEM_PARSE_C
 
 #endif /* TC_MBEDTLS_CONFIG_H_ */

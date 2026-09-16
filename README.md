@@ -6,9 +6,10 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: in progress.** The address layer and the cryptography are done
-and verified against the real Go implementations. The network layers are not
-written yet. See [Roadmap](#roadmap).
+**Status: in progress.** The address layer, the cryptography and the DERP
+relay client are done. tailcat-c connects to production Tailscale DERP relays
+and relays packets between peers today; the WireGuard tunnel that will run
+inside that is next. See [Roadmap](#roadmap).
 
 ## Why this is a big job
 
@@ -57,6 +58,7 @@ make            # build
 make test       # unit tests; also asserts every binary is a fat APE
 make fuzz       # fuzz/property tests under ASan + UBSan (host gcc)
 make interop    # cross-check against the real Go tailcat library
+make live       # connect to a real DERP relay and relay a packet (needs network)
 ```
 
 Mbed TLS is a pinned submodule, so `--recurse-submodules` matters; an
@@ -148,6 +150,29 @@ tailcat emits. Both deviations are documented at the declaration.
   HTTPS, so a TLS library has to be vendored. See below.
 - **Never use `-moptlinux` or `-mtinylinux`** — both produce Linux-only
   binaries.
+- **`-std=gnu11`, not `-std=c11`.** Strict ISO mode makes glibc hide the POSIX
+  networking declarations the DERP transport needs. `-Wpedantic` stays on, so
+  our own code is still held to ISO C. Cosmopolitan is more permissive than
+  glibc here, which is exactly why the project also builds with host gcc: that
+  build caught `src/net/tls.c` using `calloc` with no `<stdlib.h>`, which
+  cosmo's headers had been supplying transitively.
+
+### On trusting DERP
+
+A DERP relay is untrusted by design. It only ever sees WireGuard-encrypted
+packets, so tailcat's confidentiality does not rest on the relay behaving, and
+tailcat needs no account with whoever runs it.
+
+That is not a reason to verify its certificate loosely, though — a relay that
+can be impersonated can still deny service or fingerprint who is talking to
+whom — so TLS verification is required by default and `insecure_skip_verify`
+has to be asked for explicitly. Because an Actually Portable Executable cannot
+rely on the host having a trust store at a known path, Mozilla's roots are
+compiled in; regenerate them with `scripts/gen-ca-bundle.py`.
+
+Opening the server's `FRAME_SERVER_INFO` box is also a real check rather than
+a formality: it proves the relay holds the private key matching the public key
+it greeted us with.
 
 ## Roadmap
 
@@ -158,8 +183,10 @@ tailcat emits. Both deviations are documented at the declaration.
       implemented here, because Mbed TLS has no BLAKE2s and Noise needs it.
       Vectors are generated from the same Go libraries WireGuard uses, with
       RFC 7693 and RFC 7748 values as external anchors.
-- [ ] **M3 — DERP client.** HTTP upgrade, the frame protocol, the key
-      exchange, send/recv paths.
+- [x] **M3 — DERP client.** TCP, TLS 1.2 with certificate verification
+      against 121 compiled-in roots, the HTTP upgrade, the frame codec, the
+      NaCl-box key exchange and the send/receive loop. Verified end to end
+      against a production Tailscale relay by `make live`.
 - [ ] **M4 — WireGuard.** Noise IK handshake with the pre-shared key mixed
       in, transport encryption, the replay window, rekeying.
 - [ ] **M5 — meow bootstrap.** The 4-byte-magic ping/pong tailcat uses over
