@@ -146,6 +146,7 @@ LIB_SRCS := \
 	src/tc.c \
 	src/base64url.c \
 	src/cbor.c \
+	src/portset.c \
 	src/json.c \
 	src/addr.c \
 	src/crypto/blake2s.c \
@@ -162,6 +163,7 @@ LIB_SRCS := \
 	src/derp/derpmap.c \
 	src/net/tcp.c \
 	src/net/tcpmux.c \
+	src/net/proxy.c \
 	src/net/http.c \
 	src/net/tls.c \
 	src/net/ca_bundle.c
@@ -173,7 +175,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -294,6 +296,10 @@ live-serve: $(CLI)
 # server. Nothing faster can prove that rekeying interoperates.
 live-rekey: $(CLI)
 	CLI=$(CLI) sh scripts/live-rekey.sh
+
+# `serve <ports>` proxying a real local service to the real Go client.
+live-serve-ports: $(CLI)
+	CLI=$(CLI) sh scripts/live-serve-ports.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh

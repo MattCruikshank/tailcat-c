@@ -30,6 +30,10 @@ struct tc_tcp_mux {
 	uint16_t listeners[TC_TCP_MAX_LISTENERS];
 	size_t num_listeners;
 
+	/* Consulted in addition to the listener array; see the header. */
+	tc_tcp_accept_fn accept_filter;
+	void *accept_ctx;
+
 	/* Accepted but not yet collected, oldest first. These are also in
 	 * conns[]: the queue holds borrowed pointers, not ownership. */
 	tc_tcp_conn *backlog[TC_TCP_BACKLOG];
@@ -130,14 +134,28 @@ void tc_tcp_mux_free(tc_tcp_mux *m)
 
 /* ---- listeners ------------------------------------------------------- */
 
-bool tc_tcp_mux_is_listening(const tc_tcp_mux *m, uint16_t port)
+void tc_tcp_mux_set_accept_filter(tc_tcp_mux *m, tc_tcp_accept_fn fn,
+                                  void *ctx)
 {
 	if (m == NULL)
+		return;
+	m->accept_filter = fn;
+	m->accept_ctx = ctx;
+}
+
+bool tc_tcp_mux_is_listening(const tc_tcp_mux *m, uint16_t port)
+{
+	if (m == NULL || port == 0)
 		return false;
 	for (size_t i = 0; i < m->num_listeners; i++) {
 		if (m->listeners[i] == port)
 			return true;
 	}
+	/* The explicit list wins first, so a filter can only ever widen what is
+	 * accepted. A filter that narrows would be a way to close a port the
+	 * caller believes it is listening on. */
+	if (m->accept_filter != NULL)
+		return m->accept_filter(m->accept_ctx, port);
 	return false;
 }
 

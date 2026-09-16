@@ -30,16 +30,21 @@
 #include "tc/derpmap.h"
 #include "tc/wgpeer.h"
 #include "tc/tailcat.h"
+#include "tc/portset.h"
+#include "tc/proxy.h"
 #include "tc/tcpmux.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define TAILCAT_C_VERSION "0.1.0"
@@ -75,8 +80,10 @@ static void usage(FILE *f)
 	        "usage:\n"
 	        "  tailcat-c [flags] <tc-address> [port]   pipe stdin/stdout to a "
 	        "tailcat server\n"
-	        "  tailcat-c serve [port]                  listen and print an "
-	        "address\n"
+	        "  tailcat-c serve                         accept one connection, "
+	        "pipe it to stdout\n"
+	        "  tailcat-c serve <ports>                 serve local ports, e.g. "
+	        "22,80,8000-8999 or all\n"
 	        "  tailcat-c ping <tc-address>             time the round trip to "
 	        "a server\n"
 	        "  tailcat-c resolve <tc-address>          embed the relay, for "
@@ -90,10 +97,13 @@ static void usage(FILE *f)
 	        "      --relay HOST      serve through this relay instead of "
 	        "choosing one\n"
 	        "      --derpmap-url URL where to fetch the relay list\n"
-	        "      --timeout SEC     give up after SEC seconds (default 60)\n"
+	        "      --timeout SEC     give up after SEC seconds (default 60; "
+	        "0 = never, for serve <ports>)\n"
 	        "\n"
-	        "The port defaults to 1, which is what a bare `tailcat` server "
+	        "The client port defaults to 1, which is what a bare server "
 	        "pipes.\n"
+	        "`serve <ports>` proxies each port to the same port on localhost "
+	        "and stays up.\n"
 	        "Short addresses work: the relay list is fetched as needed.\n");
 }
 
@@ -694,6 +704,201 @@ static void log_wg_summary(const tc_wg_peer *peer)
 	      (unsigned long long)st.recv_on_previous);
 }
 
+/* ---- serving ports ----------------------------------------------------- */
+
+/* dial_localhost connects to a local service, trying IPv4 then IPv6 loopback.
+ *
+ * The literal addresses are used rather than resolving "localhost", which
+ * upstream also refuses to trust the OS resolver for: on a misconfigured
+ * machine that name can point somewhere else entirely, and a proxy that
+ * forwards a tunnelled connection to the wrong host is a hole rather than a
+ * bug. There is no name here to get wrong.
+ *
+ * The connect is blocking, which is safe only because loopback either
+ * succeeds or is refused immediately -- there is no network in between to
+ * time out on. */
+static int dial_localhost(uint16_t port)
+{
+	struct sockaddr_in v4;
+	memset(&v4, 0, sizeof v4);
+	v4.sin_family = AF_INET;
+	v4.sin_port = htons(port);
+	v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd >= 0) {
+		if (connect(fd, (struct sockaddr *)&v4, sizeof v4) == 0)
+			return fd;
+		(void)close(fd);
+	}
+
+	struct sockaddr_in6 v6;
+	memset(&v6, 0, sizeof v6);
+	v6.sin6_family = AF_INET6;
+	v6.sin6_port = htons(port);
+	v6.sin6_addr = in6addr_loopback;
+
+	fd = socket(AF_INET6, SOCK_STREAM, 0);
+	if (fd >= 0) {
+		if (connect(fd, (struct sockaddr *)&v6, sizeof v6) == 0)
+			return fd;
+		(void)close(fd);
+	}
+	return -1;
+}
+
+static bool port_is_served(void *ctx, uint16_t port)
+{
+	return tc_portset_has((const tc_portset *)ctx, port);
+}
+
+/* The one-shot pipe answers on whatever port the client dialled, which is
+ * what upstream's argument-free server does. */
+static bool accept_any_port(void *ctx, uint16_t port)
+{
+	(void)ctx;
+	(void)port;
+	return true;
+}
+
+/* run_serve_ports is the event loop for `serve <ports>`: accept inside the
+ * tunnel, dial the matching local port, and splice.
+ *
+ * The ordering in the loop is load-bearing. tc_tcp_mux_reap frees connections
+ * the proxy may still hold pointers to, so it runs only after the proxy has
+ * had a chance to notice they closed and let go. Reaping the mux first -- the
+ * obvious place, at the top -- would be a use-after-free that only appears
+ * when a peer hangs up at the wrong moment. */
+static int run_serve_ports(tc_derp_client *derp, tc_wg_peer *peer,
+                           tc_tcp_mux *mux, tc_proxy *proxy,
+                           const uint8_t peer_key[32], bool *stall,
+                           uint64_t deadline)
+{
+	tc_derp_set_read_timeout(derp, 20);
+
+	while (now_ms() < deadline) {
+		uint64_t t = now_ms();
+
+		if (stall != NULL && *stall) {
+			*stall = false;
+			vlogf("a relay write stalled; rebuilding the connection");
+			if (relay_recover(derp, peer_key, NULL, 0, deadline) != TC_OK) {
+				fprintf(stderr, "tailcat-c: lost the relay\n");
+				return 1;
+			}
+		}
+
+		tc_wg_peer_tick(peer, t);
+		tc_tcp_mux_tick(mux, t);
+
+		/* Accept whatever arrived and give each one a local socket. */
+		tc_tcp_conn *c;
+		while ((c = tc_tcp_mux_accept(mux)) != NULL) {
+			uint16_t port = tc_tcp_local_port(c);
+			int fd = dial_localhost(port);
+			if (fd < 0) {
+				/* Nothing is listening locally. Resetting says so at once
+				 * rather than leaving the client to time out. */
+				vlogf("no local service on port %u; refusing", (unsigned)port);
+				tc_tcp_mux_close(mux, c, t);
+				continue;
+			}
+			if (tc_proxy_add(proxy, c, fd) != TC_OK) {
+				vlogf("too many connections; refusing port %u",
+				      (unsigned)port);
+				(void)close(fd);
+				tc_tcp_mux_close(mux, c, t);
+				continue;
+			}
+			vlogf("accepted a connection to port %u", (unsigned)port);
+		}
+
+		bool progress = tc_proxy_pump(proxy, t) > 0;
+		tc_proxy_reap(proxy, t);
+		/* Only now, once the proxy has dropped anything that finished. */
+		tc_tcp_mux_reap(mux);
+
+		if (!progress && !tc_derp_has_pending(derp)) {
+			struct pollfd pfds[2 + TC_TCP_MAX_CONNS];
+			nfds_t nfds = 0;
+			int dfd = tc_derp_fd(derp);
+			if (dfd >= 0) {
+				pfds[nfds].fd = dfd;
+				pfds[nfds].events = POLLIN;
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+			for (size_t i = 0; i < TC_TCP_MAX_CONNS && nfds < 1 + TC_TCP_MAX_CONNS;
+			     i++) {
+				int pfd = -1;
+				bool rd = false, wr = false;
+				if (!tc_proxy_interest(proxy, i, &pfd, &rd, &wr))
+					continue;
+				if (!rd && !wr)
+					continue;
+				pfds[nfds].fd = pfd;
+				pfds[nfds].events = (short)((rd ? POLLIN : 0) |
+				                            (wr ? POLLOUT : 0));
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+
+			int wait_ms = 20;
+			uint64_t dl = tc_tcp_mux_next_deadline(mux);
+			uint64_t wdl = tc_wg_peer_next_deadline(peer);
+			if (wdl < dl)
+				dl = wdl;
+			if (dl != UINT64_MAX) {
+				uint64_t nowv = now_ms();
+				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
+				if (wait_ms > 200)
+					wait_ms = 200;
+			}
+			if (nfds > 0)
+				(void)poll(pfds, nfds, wait_ms);
+		}
+
+		uint8_t src[32];
+		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+		size_t len = 0;
+		int rc = tc_derp_recv(derp, src, buf, sizeof buf, &len);
+		if (rc == TC_ERR_TIMEOUT) {
+			if (tc_derp_idle_ms(derp) > TC_DERP_DEAD_AFTER_MS) {
+				vlogf("no keep-alive; the relay is gone");
+				if (relay_recover(derp, peer_key, NULL, 0, deadline) != TC_OK) {
+					fprintf(stderr, "tailcat-c: lost the relay\n");
+					return 1;
+				}
+			}
+			continue;
+		}
+		if (rc == TC_ERR_CLOSED) {
+			if (relay_recover(derp, peer_key, NULL, 0, deadline) != TC_OK) {
+				fprintf(stderr, "tailcat-c: relay: %s\n",
+				        tc_derp_error_string());
+				return 1;
+			}
+			continue;
+		}
+		if (rc != TC_OK) {
+			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
+			return 1;
+		}
+		if (memcmp(src, peer_key, 32) != 0 || len == 0)
+			continue;
+
+		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
+		size_t inner_len = 0;
+		if (tc_wg_peer_input(peer, buf, len, inner, sizeof inner, &inner_len,
+		                     now_ms()) != TC_OK)
+			continue;
+		if (inner_len == 0)
+			continue;
+		tc_tcp_mux_input(mux, inner, inner_len, now_ms());
+	}
+	return 0;
+}
+
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
                     unsigned timeout_s, const char *derpmap_url)
 {
@@ -862,8 +1067,19 @@ out:
 
 /* ---- serve mode ------------------------------------------------------- */
 
-static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
-                     unsigned timeout_s, const char *derpmap_url)
+/* cmd_serve runs a server.
+ *
+ * With `ports` NULL it is the one-shot pipe: accept a single connection on
+ * ANY port, write it to stdout, and exit -- which is what upstream's
+ * argument-free `tailcat` does. Accepting on any port rather than on one
+ * chosen number matters for compatibility: a client that dials port 80 of a
+ * bare server gets through, as it does upstream.
+ *
+ * With `ports` set it proxies each of those ports to the same port on
+ * localhost and stays up. */
+static int cmd_serve(const char *relay_host, const tc_portset *ports,
+                     bool insecure, unsigned timeout_s,
+                     const char *derpmap_url)
 {
 	/* A fresh identity per run, like upstream's default. The pre-shared key
 	 * is what stops a relay operator who has watched both public keys go past
@@ -934,12 +1150,19 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 
 	int status = 1;
 	tc_tcp_mux *mux = NULL;
+	tc_proxy *proxy = NULL;
 	tc_wg_peer peer;
 	memset(&peer, 0, sizeof peer);
 	pump ctx;
 	memset(&ctx, 0, sizeof ctx);
 
-	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
+	/* Zero means no deadline at all. Expressed as a time that never arrives
+	 * rather than as 0, which is a moment that has already passed -- and
+	 * which made the meow loop give up before the first client could
+	 * answer. */
+	uint64_t deadline = (timeout_s == 0)
+	                        ? UINT64_MAX
+	                        : now_ms() + (uint64_t)timeout_s * 1000u;
 	uint8_t client_key[32];
 	bool have_client = false;
 	bool up = false;
@@ -1025,24 +1248,45 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 		fprintf(stderr, "tailcat-c: out of memory\n");
 		goto out;
 	}
-	if (tc_tcp_mux_listen(mux, port) != TC_OK) {
-		fprintf(stderr, "tailcat-c: could not listen\n");
-		goto out;
-	}
-	vlogf("listening on port %u inside the tunnel", (unsigned)port);
+	/* An accept filter rather than a listener list: `all` is 65,535 ports,
+	 * and the one-shot mode accepts on any port at all. Neither fits an
+	 * array of sixteen. */
+	tc_tcp_mux_set_accept_filter(mux, ports != NULL ? port_is_served
+	                                                : accept_any_port,
+	                             (void *)(uintptr_t)ports);
 
-	/* The connection is accepted inside the loop, so NULL here. */
 	tc_derp_set_write_timeout(&derp, 15000);
-	/* The server is introduced to rather than introducing, so it has nothing
-	 * to re-send after a reconnection: the client re-meows and we answer. */
-	status = run_pipe(&derp, &peer, mux, NULL, client_key, NULL, 0,
-	                  &ctx.relay_stalled, deadline);
 
-	if (status != 0 && now_ms() >= deadline)
-		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
+	if (ports != NULL) {
+		char what[128];
+		(void)tc_portset_describe(ports, what, sizeof what);
+		fprintf(stderr, "# serving %s to localhost\n", what);
+
+		proxy = tc_proxy_new(TC_TCP_MAX_CONNS);
+		if (proxy == NULL) {
+			fprintf(stderr, "tailcat-c: out of memory\n");
+			goto out;
+		}
+		/* A port server is meant to stay up, so --timeout only applies if
+		 * the user asked for one. */
+		status = run_serve_ports(&derp, &peer, mux, proxy, client_key,
+		                         &ctx.relay_stalled, deadline);
+	} else {
+		vlogf("listening on any port inside the tunnel");
+		/* The connection is accepted inside the loop, so NULL here. The
+		 * server is introduced to rather than introducing, so it has nothing
+		 * to re-send after a reconnection: the client re-meows and we
+		 * answer. */
+		status = run_pipe(&derp, &peer, mux, NULL, client_key, NULL, 0,
+		                  &ctx.relay_stalled, deadline);
+		if (status != 0 && now_ms() >= deadline)
+			fprintf(stderr, "tailcat-c: timed out after %u seconds\n",
+			        timeout_s);
+	}
 
 out:
-	/* The mux owns every connection it handed out. */
+	/* Order matters: the proxy refers to connections the mux owns. */
+	tc_proxy_free(proxy);
 	tc_tcp_mux_free(mux);
 	log_wg_summary(&peer);
 	tc_wg_peer_clear(&peer);
@@ -1056,12 +1300,19 @@ int main(int argc, char **argv)
 {
 	bool insecure = false;
 	unsigned timeout_s = 60;
+	/* A port server is meant to stay up, so it ignores the default deadline
+	 * and honours only a --timeout the user actually asked for. Coercing 0
+	 * back to 60 would make "run until I stop it" impossible to express. */
+	bool timeout_given = false;
 	const char *relay = NULL;
 	/* NULL means the built-in default; --derpmap-url overrides, matching
 	 * upstream's flag of the same name. */
 	const char *derpmap_url = NULL;
-	const char *args[3] = { NULL, NULL, NULL };
+	/* Room for a subcommand plus several port specs: upstream allows the
+	 * list to be spread over arguments, as in `serve 80,443 8000-8999`. */
+	const char *args[16];
 	size_t nargs = 0;
+	memset(args, 0, sizeof args);
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -1075,8 +1326,7 @@ int main(int argc, char **argv)
 			derpmap_url = argv[++i];
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
 			timeout_s = (unsigned)strtoul(argv[++i], NULL, 10);
-			if (timeout_s == 0)
-				timeout_s = 60;
+			timeout_given = true;
 		} else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
 			usage(stdout);
 			return 0;
@@ -1084,7 +1334,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: unknown flag %s\n", a);
 			usage(stderr);
 			return 2;
-		} else if (nargs < 3) {
+		} else if (nargs < sizeof args / sizeof args[0]) {
 			args[nargs++] = a;
 		} else {
 			fprintf(stderr, "tailcat-c: too many arguments\n");
@@ -1096,6 +1346,10 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 2;
 	}
+	/* Outside the port server, a deadline of zero would mean "give up at
+	 * once", which nobody asks for by typing --timeout 0. */
+	if (timeout_s == 0 && strcmp(args[0], "serve") != 0)
+		timeout_s = 60;
 	if (strcmp(args[0], "version") == 0) {
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);
 		return 0;
@@ -1115,16 +1369,34 @@ int main(int argc, char **argv)
 		return cmd_ping(args[1], insecure, timeout_s, derpmap_url);
 	}
 	if (strcmp(args[0], "serve") == 0) {
-		uint16_t sport = 1;
-		if (nargs >= 2) {
-			unsigned long p2 = strtoul(args[1], NULL, 10);
-			if (p2 == 0 || p2 > 65535) {
-				fprintf(stderr, "tailcat-c: bad port %s\n", args[1]);
+		if (nargs == 1) {
+			if (timeout_s == 0)
+				timeout_s = 60; /* the one-shot pipe needs a deadline */
+			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url);
+		}
+
+		static tc_portset ports;
+		tc_portset_clear(&ports);
+		for (size_t i = 1; i < nargs; i++) {
+			tc_portset_service svc = TC_PORTSET_SVC_NONE;
+			int rc = tc_portset_parse(&ports, args[i], &svc);
+			if (rc == TC_ERR_UNSUPPORTED) {
+				/* Naming the service beats "bad port list": it is a real
+				 * upstream feature, just not one we have. */
+				fprintf(stderr,
+				        "tailcat-c: the \"%s\" service is not implemented "
+				        "here; see the feature table in README.md\n",
+				        tc_portset_service_name(svc));
 				return 2;
 			}
-			sport = (uint16_t)p2;
+			if (rc != TC_OK) {
+				fprintf(stderr, "tailcat-c: %s\n",
+				        tc_portset_error_string());
+				return 2;
+			}
 		}
-		return cmd_serve(relay, sport, insecure, timeout_s, derpmap_url);
+		return cmd_serve(relay, &ports, insecure,
+		                 timeout_given ? timeout_s : 0, derpmap_url);
 	}
 	if (strcmp(args[0], "parse") == 0) {
 		if (nargs < 2) {

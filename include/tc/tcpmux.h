@@ -79,6 +79,22 @@ int tc_tcp_mux_unlisten(tc_tcp_mux *m, uint16_t port);
 
 bool tc_tcp_mux_is_listening(const tc_tcp_mux *m, uint16_t port);
 
+/* tc_tcp_accept_fn decides whether a port should be accepted on, for callers
+ * whose answer does not fit a list.
+ *
+ * `serve all` is 65,535 ports, which no listener array wants to hold; a
+ * predicate expresses it in one line and lets the caller keep the set in
+ * whatever shape suits it. The filter is consulted in addition to the
+ * explicit listeners, never instead of them, so adding one cannot silently
+ * close a port something already listens on.
+ *
+ * It is called from tc_tcp_mux_input, once per inbound SYN that matches no
+ * existing connection, and must not touch the mux. */
+typedef bool (*tc_tcp_accept_fn)(void *ctx, uint16_t port);
+
+void tc_tcp_mux_set_accept_filter(tc_tcp_mux *m, tc_tcp_accept_fn fn,
+                                  void *ctx);
+
 /* tc_tcp_mux_connect starts an active open to remote_port from a free
  * ephemeral port, storing the new connection in *out. It is owned by the
  * mux; do not free it.

@@ -760,6 +760,74 @@ static void test_same_port_pair_is_refused(void)
 	tc_tcp_mux_free(m);
 }
 
+/* ---- the accept filter -------------------------------------------------- */
+
+static bool only_even(void *ctx, uint16_t port)
+{
+	(void)ctx;
+	return (port % 2u) == 0u;
+}
+
+static bool accept_everything(void *ctx, uint16_t port)
+{
+	(void)ctx;
+	(void)port;
+	return true;
+}
+
+static void test_accept_filter(void)
+{
+	TCT_CASE("a filter can accept ports no listener array could hold");
+	/* `serve all` is 65,535 ports. The point of the filter is that the
+	 * caller keeps the set in whatever shape suits it. */
+	link_t l;
+	link_init(&l, 41);
+	tc_tcp_mux_set_accept_filter(l.b, accept_everything, NULL);
+
+	tc_tcp_conn *c1 = NULL, *c2 = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect(l.a, 8080, l.now, &c1), TC_OK);
+	TCT_EQ_INT(tc_tcp_mux_connect(l.a, 65535, l.now, &c2), TC_OK);
+	for (int i = 0; i < 300 && tc_tcp_mux_pending(l.b) < 2; i++)
+		link_step(&l);
+	TCT_EQ_INT((int)tc_tcp_mux_pending(l.b), 2);
+
+	link_done(&l);
+
+	TCT_CASE("a filter that refuses a port draws a reset, as before");
+	link_init(&l, 43);
+	tc_tcp_mux_set_accept_filter(l.b, only_even, NULL);
+
+	tc_tcp_conn *odd = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect(l.a, 81, l.now, &odd), TC_OK);
+	for (int i = 0; i < 300; i++) {
+		if (tc_tcp_get_state(odd) == TC_TCP_CLOSED)
+			break;
+		link_step(&l);
+	}
+	TCT_EQ_INT(tc_tcp_get_state(odd), TC_TCP_CLOSED);
+	TCT_EQ_INT((int)tc_tcp_mux_pending(l.b), 0);
+
+	tc_tcp_mux_stats st;
+	tc_tcp_mux_get_stats(l.b, &st);
+	TCT_EQ_INT((int)st.rejected_port, 1);
+
+	TCT_CASE("an explicit listener still works alongside a filter");
+	/* The filter widens; it must never be able to close a port the caller
+	 * believes it is listening on. */
+	TCT_EQ_INT(tc_tcp_mux_listen(l.b, 81), TC_OK);
+	TCT_TRUE(tc_tcp_mux_is_listening(l.b, 81));
+	tc_tcp_conn *odd2 = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect(l.a, 81, l.now, &odd2), TC_OK);
+	for (int i = 0; i < 300 && tc_tcp_mux_pending(l.b) == 0; i++)
+		link_step(&l);
+	TCT_EQ_INT((int)tc_tcp_mux_pending(l.b), 1);
+
+	TCT_CASE("port 0 is never accepted, whatever the filter says");
+	TCT_TRUE(!tc_tcp_mux_is_listening(l.b, 0));
+
+	link_done(&l);
+}
+
 int main(void)
 {
 	test_concurrent_streams(0, 0, 1, "many streams at once on a clean link");
@@ -774,5 +842,6 @@ int main(void)
 	test_time_wait_port_reuse();
 	test_ignores_foreign_packets();
 	test_same_port_pair_is_refused();
+	test_accept_filter();
 	return tct_report("tcpmux");
 }
