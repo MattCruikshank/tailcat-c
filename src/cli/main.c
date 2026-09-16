@@ -761,65 +761,251 @@ static bool accept_any_port(void *ctx, uint16_t port)
 	return true;
 }
 
-/* run_serve_ports is the event loop for `serve <ports>`: accept inside the
- * tunnel, dial the matching local port, and splice.
- *
- * The ordering in the loop is load-bearing. tc_tcp_mux_reap frees connections
- * the proxy may still hold pointers to, so it runs only after the proxy has
- * had a chance to notice they closed and let go. Reaping the mux first -- the
- * obvious place, at the top -- would be a use-after-free that only appears
- * when a peer hangs up at the wrong moment. */
-static int run_serve_ports(tc_derp_client *derp, tc_wg_peer *peer,
-                           tc_tcp_mux *mux, tc_proxy *proxy,
-                           const uint8_t peer_key[32], bool *stall,
-                           uint64_t deadline)
+/* ---- serving many clients at once -------------------------------------- */
+
+/* Each client is a separate WireGuard peer with its own session keys, its own
+ * tunnel address and its own demultiplexer. Nothing is shared between them
+ * except the relay connection and the proxy's pool of local sockets, which is
+ * the point: one client cannot see another's traffic, because there is no
+ * object through which it could.
+ */
+#ifndef TC_SERVE_MAX_CLIENTS
+#define TC_SERVE_MAX_CLIENTS 8
+#endif
+
+/* A client that holds no session and no connections and has said nothing for
+ * this long is dropped, so a peer that went away does not hold a slot for
+ * ever. Longer than REJECT_AFTER_TIME, so a live-but-quiet client whose
+ * session is mid-rekey is never mistaken for a dead one. */
+#define TC_SERVE_CLIENT_IDLE_MS (5u * 60u * 1000u)
+
+typedef struct {
+	bool used;
+	uint8_t key[TC_NODE_KEY_LEN];
+	tc_wg_peer peer;
+	tc_tcp_mux *mux;
+	pump ctx; /* per client: wg_out has to address this peer's node key */
+	uint64_t last_seen_ms;
+} serve_client;
+
+typedef struct {
+	serve_client c[TC_SERVE_MAX_CLIENTS];
+	tc_derp_client *derp;
+	tc_wg_identity me;
+	uint8_t psk[TC_PSK_LEN];
+	const tc_portset *ports;
+	tc_proxy *proxy;
+	uint64_t refused;
+	uint64_t served;
+} serve_state;
+
+static size_t client_count(const serve_state *st)
 {
+	size_t n = 0;
+	for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++)
+		if (st->c[i].used)
+			n++;
+	return n;
+}
+
+static serve_client *find_client(serve_state *st, const uint8_t key[32])
+{
+	for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+		if (st->c[i].used && memcmp(st->c[i].key, key, 32) == 0)
+			return &st->c[i];
+	}
+	return NULL;
+}
+
+/* drop_client releases everything one client owns.
+ *
+ * The proxy points at connections this mux owns, so it has to let go before
+ * the mux frees them -- the same ordering rule as the main loop, and the same
+ * use-after-free if it is got wrong. */
+static void drop_client(serve_state *st, serve_client *sc)
+{
+	if (st->proxy != NULL && sc->mux != NULL) {
+		for (size_t i = tc_tcp_mux_count(sc->mux); i-- > 0;)
+			tc_proxy_forget(st->proxy, tc_tcp_mux_at(sc->mux, i));
+	}
+	tc_tcp_mux_free(sc->mux);
+	tc_wg_peer_clear(&sc->peer);
+	memset(sc, 0, sizeof *sc);
+}
+
+static serve_client *add_client(serve_state *st, const uint8_t key[32],
+                                uint64_t now)
+{
+	serve_client *sc = NULL;
+	for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+		if (!st->c[i].used) {
+			sc = &st->c[i];
+			break;
+		}
+	}
+	if (sc == NULL) {
+		/* Full. The meow goes unanswered, so the client retries and then
+		 * gives up -- which is the honest answer, and better than evicting
+		 * someone who is mid-transfer to make room. */
+		st->refused++;
+		return NULL;
+	}
+
+	memset(sc, 0, sizeof *sc);
+	memcpy(sc->key, key, 32);
+	sc->ctx.derp = st->derp;
+	memcpy(sc->ctx.server_key, key, 32);
+	if (tc_wg_peer_init(&sc->peer, &st->me, key, st->psk, wg_out, &sc->ctx) !=
+	    TC_OK)
+		return NULL;
+	sc->ctx.peer = &sc->peer;
+
+	uint8_t our_ip[TC_TUNNEL_ADDR_LEN], their_ip[TC_TUNNEL_ADDR_LEN];
+	tc_tunnel_addr_for_key(our_ip, st->me.public_key);
+	tc_tunnel_addr_for_key(their_ip, key);
+
+	sc->mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &sc->ctx);
+	if (sc->mux == NULL) {
+		tc_wg_peer_clear(&sc->peer);
+		memset(sc, 0, sizeof *sc);
+		return NULL;
+	}
+	tc_tcp_mux_set_accept_filter(sc->mux, port_is_served,
+	                             (void *)(uintptr_t)st->ports);
+
+	sc->used = true;
+	sc->last_seen_ms = now;
+	st->served++;
+	return sc;
+}
+
+/* handle_meow answers an introduction, adding the client if it is new. */
+static void handle_meow(serve_state *st, const uint8_t src[32],
+                        const uint8_t *buf, size_t len, uint64_t now)
+{
+	uint8_t node[32], disco[32];
+	if (tc_meow_parse_ping(buf, len, node, disco) != TC_OK)
+		return;
+	/* The relay's idea of the sender must agree with the packet's claim, or
+	 * anyone could introduce anyone. */
+	if (memcmp(node, src, 32) != 0)
+		return;
+
+	serve_client *sc = find_client(st, node);
+	if (sc == NULL) {
+		sc = add_client(st, node, now);
+		if (sc == NULL) {
+			vlogf("refusing a new client: %d already connected",
+			      TC_SERVE_MAX_CLIENTS);
+			return;
+		}
+		vlogf("client %02x%02x%02x%02x introduced itself (%zu connected)",
+		      node[0], node[1], node[2], node[3], client_count(st));
+	}
+	sc->last_seen_ms = now;
+
+	/* Acknowledge every ping: the client resends until it hears back, and a
+	 * duplicate acknowledgement costs nothing. */
+	uint8_t ack[TC_MEOW_MEOWED_LEN];
+	size_t ack_len = 0;
+	tc_meow_encode_meowed(ack, sizeof ack, &ack_len);
+	(void)tc_derp_send(st->derp, node, ack, ack_len);
+}
+
+/* expire_idle drops clients that are gone: no keys, no connections, and
+ * silent for long enough that a rekey cannot explain it. */
+static void expire_idle(serve_state *st, uint64_t now)
+{
+	for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+		serve_client *sc = &st->c[i];
+		if (!sc->used)
+			continue;
+		if (tc_wg_peer_has_keys(&sc->peer, now) ||
+		    tc_tcp_mux_count(sc->mux) > 0) {
+			sc->last_seen_ms = now;
+			continue;
+		}
+		if (now - sc->last_seen_ms < TC_SERVE_CLIENT_IDLE_MS)
+			continue;
+		vlogf("dropping an idle client");
+		drop_client(st, sc);
+	}
+}
+
+/* run_serve_multi is the event loop for `serve <ports>`.
+ *
+ * The ordering inside it is load-bearing. tc_tcp_mux_reap frees connections
+ * the proxy may still hold pointers to, so it runs only after the proxy has
+ * had a chance to notice they closed and let go. Reaping the muxes first --
+ * the obvious place, at the top -- is a use-after-free that only appears when
+ * a peer hangs up at the wrong moment. */
+static int run_serve_multi(serve_state *st, uint64_t deadline)
+{
+	tc_derp_client *derp = st->derp;
 	tc_derp_set_read_timeout(derp, 20);
 
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
 
-		if (stall != NULL && *stall) {
-			*stall = false;
+		/* A relay write that timed out leaves a half-written frame, so the
+		 * connection has to be rebuilt before anything else uses it. Any
+		 * client's send could have been the one that hit it. */
+		bool stalled = false;
+		for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+			if (st->c[i].used && st->c[i].ctx.relay_stalled) {
+				st->c[i].ctx.relay_stalled = false;
+				stalled = true;
+			}
+		}
+		if (stalled) {
 			vlogf("a relay write stalled; rebuilding the connection");
-			if (relay_recover(derp, peer_key, NULL, 0, deadline) != TC_OK) {
+			if (relay_recover(derp, NULL, NULL, 0, deadline) != TC_OK) {
 				fprintf(stderr, "tailcat-c: lost the relay\n");
 				return 1;
 			}
 		}
 
-		tc_wg_peer_tick(peer, t);
-		tc_tcp_mux_tick(mux, t);
+		for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+			serve_client *sc = &st->c[i];
+			if (!sc->used)
+				continue;
+			tc_wg_peer_tick(&sc->peer, t);
+			tc_tcp_mux_tick(sc->mux, t);
 
-		/* Accept whatever arrived and give each one a local socket. */
-		tc_tcp_conn *c;
-		while ((c = tc_tcp_mux_accept(mux)) != NULL) {
-			uint16_t port = tc_tcp_local_port(c);
-			int fd = dial_localhost(port);
-			if (fd < 0) {
-				/* Nothing is listening locally. Resetting says so at once
-				 * rather than leaving the client to time out. */
-				vlogf("no local service on port %u; refusing", (unsigned)port);
-				tc_tcp_mux_close(mux, c, t);
-				continue;
+			tc_tcp_conn *c;
+			while ((c = tc_tcp_mux_accept(sc->mux)) != NULL) {
+				uint16_t port = tc_tcp_local_port(c);
+				int fd = dial_localhost(port);
+				if (fd < 0) {
+					/* Nothing is listening locally. Resetting says so at
+					 * once rather than leaving the client to time out. */
+					vlogf("no local service on port %u; refusing",
+					      (unsigned)port);
+					tc_tcp_mux_close(sc->mux, c, t);
+					continue;
+				}
+				if (tc_proxy_add(st->proxy, c, fd) != TC_OK) {
+					vlogf("too many connections; refusing port %u",
+					      (unsigned)port);
+					(void)close(fd);
+					tc_tcp_mux_close(sc->mux, c, t);
+					continue;
+				}
+				vlogf("accepted a connection to port %u", (unsigned)port);
 			}
-			if (tc_proxy_add(proxy, c, fd) != TC_OK) {
-				vlogf("too many connections; refusing port %u",
-				      (unsigned)port);
-				(void)close(fd);
-				tc_tcp_mux_close(mux, c, t);
-				continue;
-			}
-			vlogf("accepted a connection to port %u", (unsigned)port);
 		}
 
-		bool progress = tc_proxy_pump(proxy, t) > 0;
-		tc_proxy_reap(proxy, t);
+		bool progress = tc_proxy_pump(st->proxy, t) > 0;
+		tc_proxy_reap(st->proxy, t);
 		/* Only now, once the proxy has dropped anything that finished. */
-		tc_tcp_mux_reap(mux);
+		for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+			if (st->c[i].used)
+				tc_tcp_mux_reap(st->c[i].mux);
+		}
+		expire_idle(st, t);
 
 		if (!progress && !tc_derp_has_pending(derp)) {
-			struct pollfd pfds[2 + TC_TCP_MAX_CONNS];
+			struct pollfd pfds[1 + TC_TCP_MAX_CONNS];
 			nfds_t nfds = 0;
 			int dfd = tc_derp_fd(derp);
 			if (dfd >= 0) {
@@ -828,26 +1014,33 @@ static int run_serve_ports(tc_derp_client *derp, tc_wg_peer *peer,
 				pfds[nfds].revents = 0;
 				nfds++;
 			}
-			for (size_t i = 0; i < TC_TCP_MAX_CONNS && nfds < 1 + TC_TCP_MAX_CONNS;
-			     i++) {
+			for (size_t i = 0;
+			     i < TC_TCP_MAX_CONNS && nfds < 1 + TC_TCP_MAX_CONNS; i++) {
 				int pfd = -1;
 				bool rd = false, wr = false;
-				if (!tc_proxy_interest(proxy, i, &pfd, &rd, &wr))
+				if (!tc_proxy_interest(st->proxy, i, &pfd, &rd, &wr))
 					continue;
 				if (!rd && !wr)
 					continue;
 				pfds[nfds].fd = pfd;
-				pfds[nfds].events = (short)((rd ? POLLIN : 0) |
-				                            (wr ? POLLOUT : 0));
+				pfds[nfds].events =
+				    (short)((rd ? POLLIN : 0) | (wr ? POLLOUT : 0));
 				pfds[nfds].revents = 0;
 				nfds++;
 			}
 
 			int wait_ms = 20;
-			uint64_t dl = tc_tcp_mux_next_deadline(mux);
-			uint64_t wdl = tc_wg_peer_next_deadline(peer);
-			if (wdl < dl)
-				dl = wdl;
+			uint64_t dl = UINT64_MAX;
+			for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+				if (!st->c[i].used)
+					continue;
+				uint64_t a = tc_tcp_mux_next_deadline(st->c[i].mux);
+				uint64_t b = tc_wg_peer_next_deadline(&st->c[i].peer);
+				if (a < dl)
+					dl = a;
+				if (b < dl)
+					dl = b;
+			}
 			if (dl != UINT64_MAX) {
 				uint64_t nowv = now_ms();
 				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
@@ -865,7 +1058,7 @@ static int run_serve_ports(tc_derp_client *derp, tc_wg_peer *peer,
 		if (rc == TC_ERR_TIMEOUT) {
 			if (tc_derp_idle_ms(derp) > TC_DERP_DEAD_AFTER_MS) {
 				vlogf("no keep-alive; the relay is gone");
-				if (relay_recover(derp, peer_key, NULL, 0, deadline) != TC_OK) {
+				if (relay_recover(derp, NULL, NULL, 0, deadline) != TC_OK) {
 					fprintf(stderr, "tailcat-c: lost the relay\n");
 					return 1;
 				}
@@ -873,7 +1066,7 @@ static int run_serve_ports(tc_derp_client *derp, tc_wg_peer *peer,
 			continue;
 		}
 		if (rc == TC_ERR_CLOSED) {
-			if (relay_recover(derp, peer_key, NULL, 0, deadline) != TC_OK) {
+			if (relay_recover(derp, NULL, NULL, 0, deadline) != TC_OK) {
 				fprintf(stderr, "tailcat-c: relay: %s\n",
 				        tc_derp_error_string());
 				return 1;
@@ -884,17 +1077,32 @@ static int run_serve_ports(tc_derp_client *derp, tc_wg_peer *peer,
 			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
 			return 1;
 		}
-		if (memcmp(src, peer_key, 32) != 0 || len == 0)
+		if (len == 0)
 			continue;
+
+		if (tc_meow_is_packet(buf, len)) {
+			handle_meow(st, src, buf, len, now_ms());
+			continue;
+		}
+
+		/* Everything else is WireGuard, and belongs to whichever client the
+		 * relay says it came from. A packet from a node that has not
+		 * introduced itself is dropped: the meow is how a server learns who
+		 * a client is, and answering an unknown one would be inventing a
+		 * peer from a packet anybody could send. */
+		serve_client *sc = find_client(st, src);
+		if (sc == NULL)
+			continue;
+		sc->last_seen_ms = now_ms();
 
 		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
 		size_t inner_len = 0;
-		if (tc_wg_peer_input(peer, buf, len, inner, sizeof inner, &inner_len,
-		                     now_ms()) != TC_OK)
+		if (tc_wg_peer_input(&sc->peer, buf, len, inner, sizeof inner,
+		                     &inner_len, now_ms()) != TC_OK)
 			continue;
 		if (inner_len == 0)
 			continue;
-		tc_tcp_mux_input(mux, inner, inner_len, now_ms());
+		tc_tcp_mux_input(sc->mux, inner, inner_len, now_ms());
 	}
 	return 0;
 }
@@ -1163,6 +1371,41 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 	uint64_t deadline = (timeout_s == 0)
 	                        ? UINT64_MAX
 	                        : now_ms() + (uint64_t)timeout_s * 1000u;
+	/* `serve <ports>` takes as many clients as it can hold, each with its own
+	 * session and demultiplexer. The one-shot pipe below stays single-client
+	 * on purpose: it writes to one stdout and exits, so a second client would
+	 * have nowhere to go. */
+	if (ports != NULL) {
+		char what[128];
+		(void)tc_portset_describe(ports, what, sizeof what);
+		fprintf(stderr, "# serving %s to localhost, up to %d clients\n", what,
+		        TC_SERVE_MAX_CLIENTS);
+		fflush(stderr);
+
+		static serve_state st;
+		memset(&st, 0, sizeof st);
+		st.derp = &derp;
+		st.me = me;
+		memcpy(st.psk, ci.preshared_key, sizeof st.psk);
+		st.ports = ports;
+		st.proxy = tc_proxy_new(TC_TCP_MAX_CONNS);
+		if (st.proxy == NULL) {
+			fprintf(stderr, "tailcat-c: out of memory\n");
+			goto out;
+		}
+		tc_derp_set_write_timeout(&derp, 15000);
+
+		status = run_serve_multi(&st, deadline);
+
+		for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
+			if (st.c[i].used)
+				drop_client(&st, &st.c[i]);
+		}
+		tc_proxy_free(st.proxy);
+		tc_derp_close(&derp);
+		return status;
+	}
+
 	uint8_t client_key[32];
 	bool have_client = false;
 	bool up = false;
@@ -1251,38 +1494,18 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 	/* An accept filter rather than a listener list: `all` is 65,535 ports,
 	 * and the one-shot mode accepts on any port at all. Neither fits an
 	 * array of sixteen. */
-	tc_tcp_mux_set_accept_filter(mux, ports != NULL ? port_is_served
-	                                                : accept_any_port,
-	                             (void *)(uintptr_t)ports);
+	tc_tcp_mux_set_accept_filter(mux, accept_any_port, NULL);
 
 	tc_derp_set_write_timeout(&derp, 15000);
 
-	if (ports != NULL) {
-		char what[128];
-		(void)tc_portset_describe(ports, what, sizeof what);
-		fprintf(stderr, "# serving %s to localhost\n", what);
-
-		proxy = tc_proxy_new(TC_TCP_MAX_CONNS);
-		if (proxy == NULL) {
-			fprintf(stderr, "tailcat-c: out of memory\n");
-			goto out;
-		}
-		/* A port server is meant to stay up, so --timeout only applies if
-		 * the user asked for one. */
-		status = run_serve_ports(&derp, &peer, mux, proxy, client_key,
-		                         &ctx.relay_stalled, deadline);
-	} else {
-		vlogf("listening on any port inside the tunnel");
-		/* The connection is accepted inside the loop, so NULL here. The
-		 * server is introduced to rather than introducing, so it has nothing
-		 * to re-send after a reconnection: the client re-meows and we
-		 * answer. */
-		status = run_pipe(&derp, &peer, mux, NULL, client_key, NULL, 0,
-		                  &ctx.relay_stalled, deadline);
-		if (status != 0 && now_ms() >= deadline)
-			fprintf(stderr, "tailcat-c: timed out after %u seconds\n",
-			        timeout_s);
-	}
+	vlogf("listening on any port inside the tunnel");
+	/* The connection is accepted inside the loop, so NULL here. The server is
+	 * introduced to rather than introducing, so it has nothing to re-send
+	 * after a reconnection: the client re-meows and we answer. */
+	status = run_pipe(&derp, &peer, mux, NULL, client_key, NULL, 0,
+	                  &ctx.relay_stalled, deadline);
+	if (status != 0 && now_ms() >= deadline)
+		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
 
 out:
 	/* Order matters: the proxy refers to connections the mux owns. */

@@ -175,7 +175,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -300,6 +300,10 @@ live-rekey: $(CLI)
 # `serve <ports>` proxying a real local service to the real Go client.
 live-serve-ports: $(CLI)
 	CLI=$(CLI) sh scripts/live-serve-ports.sh
+
+# Several real Go clients through one server at the same time.
+live-multi: $(CLI)
+	CLI=$(CLI) sh scripts/live-multi.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh

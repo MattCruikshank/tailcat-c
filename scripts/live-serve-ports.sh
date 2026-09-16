@@ -33,7 +33,9 @@ trap cleanup EXIT
 
 REPLY_BODY="served from localhost:$PORT through the tunnel"
 
-# A local service that reads until EOF and then answers. Reading to EOF first
+# A local service that reads until EOF and then answers. Its stdout and
+# stdin are redirected, not just stderr: a background job holding the
+# inherited pipe keeps whoever ran this waiting after the test is done. Reading to EOF first
 # is deliberate: it only replies if the half close arrived.
 cat > "$SVC" <<SVCEOF
 import socket, sys
@@ -58,7 +60,7 @@ while True:
 SVCEOF
 
 echo "starting a local service on 127.0.0.1:$PORT (it answers only after EOF)"
-python3 "$SVC" 2>/dev/null &
+python3 "$SVC" >/dev/null 2>&1 </dev/null &
 SVC_PID=$!
 sleep 1
 
