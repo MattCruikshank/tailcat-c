@@ -135,7 +135,7 @@ nesting depth cannot exhaust the stack.
 Go's decoder does both — being stricter would mean refusing addresses real
 tailcat emits. Both deviations are documented at the declaration.
 
-### Cosmopolitan-specific findings
+### What the toolchain taught us
 
 - **Stack protection is unavailable in a fat build.** aarch64 has no
   `__stack_chk_guard` at all, so any `-fstack-protector-*` flag fails to link
@@ -156,6 +156,30 @@ tailcat emits. Both deviations are documented at the declaration.
   glibc here, which is exactly why the project also builds with host gcc: that
   build caught `src/net/tls.c` using `calloc` with no `<stdlib.h>`, which
   cosmo's headers had been supplying transitively.
+- **cosmocc keeps the aarch64 object in a sibling `.aarch64/` directory** next
+  to the x86_64 one, and resolves the pair automatically at link time. Worth
+  knowing before concluding a symbol is missing: `nm` on the obvious path only
+  shows you half the build.
+- **Mbed TLS's public headers do not survive our warning set** (redundant
+  redeclarations, `#if` on undefined macros), so they are included with
+  `-isystem`. That suppresses their warnings without weakening ours.
+- **ISO C only guarantees 4095-byte string literals**, which `-Wpedantic`
+  enforces, and the CA bundle is 181KB. The generated file suppresses
+  `-Woverlength-strings` locally rather than emitting a far larger and less
+  readable hex byte array.
+
+### Working with WSL
+
+Both are about WSL rather than Cosmopolitan, but both cost real time:
+
+- **A WSL instance is torn down as soon as its last process exits**, taking
+  `binfmt_misc` registrations and `/tmp` with it. Anything that must persist
+  across steps has to happen inside a single `wsl.exe` invocation, or live on
+  a mounted Windows path. `scripts/wslmake.sh` exists for exactly this.
+- **`WSLInterop` claims every file starting with `MZ`** and hands it to
+  Windows, which swallows Actually Portable Executables — including the APE
+  tools cosmocc runs during its own build, so it fails before producing
+  anything.
 
 ### On trusting DERP
 
@@ -173,6 +197,146 @@ compiled in; regenerate them with `scripts/gen-ca-bundle.py`.
 Opening the server's `FRAME_SERVER_INFO` box is also a real check rather than
 a formality: it proves the relay holds the private key matching the public key
 it greeted us with.
+
+## Bugs this verification has actually caught
+
+Kept as a record, because each one says something about where the risk in this
+project really is. All were found by tooling rather than by reading the code.
+
+**1. NaCl secretbox started the keystream in the wrong place.** *(M3, found by
+generated vectors.)* NaCl takes the one-time Poly1305 key from the first 32
+bytes of the keystream and then encrypts the message from byte **32** — the
+second half of block 0 — not from block 1. I had written it as a block
+counter, which silently skipped 32 bytes of keystream. The tell was that empty
+plaintexts passed (the tag only covers the key derivation) and every non-empty
+one failed. Nothing but a differential vector would have found this quickly.
+
+**2. X25519 did not clamp the scalar.** *(M2, found by RFC 7748 vectors.)*
+`decodeScalar25519` clamps as part of X25519, so the RFC's own test vectors
+supply *unclamped* scalars and expect the implementation to do it. Mbed TLS
+also rejects an unclamped scalar outright, so this failed loudly rather than
+quietly — but only because the vectors used the RFC's inputs verbatim.
+
+**3. `mbedtls_ecp_mul` rejects a NULL RNG.** *(M2.)* It returns
+`MBEDTLS_ERR_ECP_BAD_INPUT_DATA`; it wants the RNG to randomise projective
+coordinates as a side-channel countermeasure. I had written a comment
+confidently asserting NULL was fine. The comment was wrong, and the code
+matched the comment.
+
+**4. `tls.c` used `calloc`/`free` with no `<stdlib.h>`.** *(M3, found by the
+host gcc build.)* Cosmopolitan's headers supply it transitively, so cosmocc
+never complained. An implicitly declared `calloc` is genuine undefined
+behaviour.
+
+**5. `-std=c11` hides `struct addrinfo` under glibc.** *(M3, host gcc build.)*
+Strict ISO mode suppresses the POSIX networking declarations. Cosmopolitan is
+more permissive, so again only the second toolchain noticed.
+
+**6. The build silently used the wrong compiler.** *(M1.)* `CC` is a GNU make
+builtin with a default of `cc`, so `CC ?= $(COSMOCC)` is a no-op. The first
+"passing" build was host `cc`, not cosmocc — the entire point of the project,
+quietly not happening. Fixed with `ifeq ($(origin CC),default)`, and `make
+test` now asserts every binary is a fat APE so it cannot regress unnoticed.
+
+The pattern is hard to miss: **four of the six came from running the same code
+through a second, stricter environment**, and the two crypto bugs came from
+comparing against a reference implementation rather than against my own
+expectations. Neither unit tests nor code review would have found most of
+these.
+
+## Limitations
+
+Current, and deliberate unless noted.
+
+### Protocol scope
+
+- **Relay-only.** No direct peer-to-peer path, so no NAT traversal, no disco,
+  no STUN, no netcheck, no endpoint scoring. Every packet goes through DERP.
+  This is the agreed scope, and it is a strict subset of the full data plane,
+  but it means higher latency than real tailcat once that would have gone
+  direct.
+- **No tunnel yet.** M4–M7 are unwritten, so there is no WireGuard session, no
+  TCP, and no CLI. tailcat-c can move bytes between two of *its own* clients
+  through a relay; it cannot yet talk to a real `tailcat` peer.
+- **No SSH, SFTP, SOCKS, port forwarding, or WASM build.**
+- **No DERP map fetching.** Relay hostnames are supplied by the caller;
+  `make live` hardcodes one. There is no latency-based region selection.
+
+### TLS
+
+- **TLS 1.2 only.** TLS 1.3 in Mbed TLS 3.6 requires the PSA crypto layer,
+  which is a large amount of additional code. Tailscale's relays accept 1.2,
+  and ECDHE with AEAD suites is not a weak configuration — but it does mean
+  upstream's "fast start" optimisation is unavailable, since reading the
+  relay's key from a meta certificate requires 1.3.
+- **The CA bundle is a point-in-time snapshot** of Mozilla's roots, compiled
+  in and refreshed only by re-running `scripts/gen-ca-bundle.py`. A root
+  distrusted upstream stays trusted here until someone regenerates it.
+- **No revocation checking.** No OCSP, no CRLs. Mbed TLS supports neither well
+  in this configuration.
+- **The cipher suite list is trimmed** to what the config enables. A relay
+  demanding something we did not compile in will fail the handshake rather
+  than negotiate down.
+
+### Implementation
+
+- **Blocking I/O with no read/write timeout.** `tc_tcp_connect` bounds the
+  connect, but a relay that accepts a connection and then goes silent will
+  block `tc_derp_recv` indefinitely. This is the most likely thing to bite in
+  real use and is the first item on the TODO list.
+- **No reconnection.** `FRAME_RESTARTING` is parsed and ignored; a dropped
+  connection is simply an error to the caller.
+- **A `tc_derp_client` is not safe for concurrent use.** Send and receive both
+  touch the same stream with no lock, and both use thread-local scratch
+  buffers of about 64KB each.
+- **Address parser limits are compile-time**: at most
+  `TC_ADDR_MAX_REGIONS` (2) regions and `TC_ADDR_MAX_NODES` (8) nodes. Real
+  addresses carry one region with one or two nodes, so this is ample, but a
+  hand-built address with more is rejected rather than truncated.
+- **The CBOR reader is stricter than Go's** in two ways that could in
+  principle reject something upstream accepts: it refuses indefinite-length
+  items and tags. tailcat's encoder emits neither, so this has never fired,
+  but it is a deviation rather than a pure subset.
+- **`tc_conn_info` is several kilobytes.** Callers should heap-allocate it
+  rather than put it on a small thread stack.
+
+### Security posture
+
+- **No stack protection in the shipped binary.** See the Cosmopolitan notes
+  above; this is forced by the fat build, not chosen. The sanitizer and fuzz
+  builds do have it.
+- **Fuzzing is a homegrown mutation fuzzer**, not coverage-guided. It runs
+  under ASan and UBSan and checks real invariants, but it is not libFuzzer and
+  cosmocc ships no libFuzzer or ASan runtime to make it one.
+- **No constant-time audit has been done** beyond writing the primitives in a
+  data-independent style and using Mbed TLS for the hard parts. No timing
+  measurements have been taken.
+- **Key zeroization is best-effort.** Key material is wiped with an explicit
+  memset-through-a-volatile-pointer, but nothing prevents the compiler or the
+  OS from having copied it elsewhere first.
+- **No CI.** Everything here was run by hand on one machine, on Linux under
+  WSL. The binaries are fat and should run on macOS, Windows and the BSDs —
+  but that has not been tested on any of them.
+
+## Known TODOs
+
+Roughly in the order they should be picked up.
+
+- [ ] **Read/write timeouts** on the DERP stream. Currently the only bounded
+      operation is the initial connect.
+- [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
+      ignoring it, and tracking keep-alives to notice a dead relay.
+- [ ] **DERP map fetching** from `https://tailcat.dev/derpmap.json`, plus
+      region selection. The `Addr` codec already parses embedded regions, and
+      `Resolve` semantics are understood but unimplemented.
+- [ ] **CI**, building both toolchains and running tests, interop and fuzzing.
+- [ ] **Test the fat binary on a non-Linux host.** It is built for six
+      operating systems and has been run on one.
+- [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
+      that callers must serialise it.
+- [ ] Revisit **TLS 1.3** once the PSA dependency is worth paying for.
+- [ ] Refresh the **CA bundle** and decide on a cadence for it.
+- [ ] Consider making the address-parser limits runtime-configurable.
 
 ## Roadmap
 
