@@ -16,13 +16,13 @@ transcript and the TCP sequence arithmetic were both in that category.
 
 ---
 
-## Phase 1 — make the tool self-sufficient
+## Phase 1 — make the tool self-sufficient  ✅ DONE
 
 Right now a user needs the Go `tailcat` binary to resolve an address before
 ours can use it, and `serve` needs a relay hostname typed in by hand. This
 phase removes that.
 
-### 1.1 HTTP client · ~250 lines · low risk
+### 1.1 HTTP client ✅ · 330 lines
 
 A minimal HTTP/1.1 GET over the existing TLS transport: request, status line,
 headers, and a body delivered either by `Content-Length` or `chunked`
@@ -32,7 +32,7 @@ cookies, no keep-alive.
 The DERP client already does a hand-rolled HTTP upgrade, so some of this is
 consolidation rather than new work.
 
-### 1.2 JSON parser · ~400 lines · low risk
+### 1.2 JSON parser ✅ · 470 lines
 
 Strict, allocation-free, non-recursive, in the same shape as `src/cbor.c` —
 that file is a good template and the same bounds-checking discipline applies.
@@ -52,7 +52,7 @@ from the network.
 
 **Worth fuzzing** on arrival, like the address parser.
 
-### 1.3 DERP map fetch and cache · ~200 lines · low risk
+### 1.3 DERP map fetch and cache ✅ · 300 lines
 
 `GET https://tailcat.dev/derpmap.json` (overridable, as upstream's
 `--derpmap-url` is), parsed into the existing structs, cached in memory for
@@ -61,7 +61,7 @@ an hour the way upstream does. Unlocks:
 - short addresses (`RegionID` with no embedded region) working directly
 - `serve` without `--relay`
 
-### 1.4 Region selection · ~150 lines · medium risk
+### 1.4 Region selection ✅ · 60 lines
 
 Upstream picks a region with `netcheck`, which sends STUN probes and measures
 per-region RTT. That is a large dependency for one decision.
@@ -73,14 +73,24 @@ to the relay rather than UDP path quality, and it will pick differently in
 some networks. Worth doing the cheap version and saying so, then revisiting
 if Phase 4 brings STUN anyway.
 
-### 1.5 `resolve` and `ping` subcommands · ~120 lines · low risk
+### 1.5 `resolve` and `ping` subcommands ✅ · 170 lines
 
 Both fall out of the above. `resolve` is parse → fetch → embed → re-encode,
 and every piece exists. `ping` is the meow round trip we already do, with a
 timer around it and the result printed.
 
-**Phase 1 total: ~1,100 lines.** After it, tailcat-c needs nothing else
-installed.
+**Phase 1 done: ~1,330 lines**, against an estimate of ~1,100. tailcat-c now
+needs nothing else installed: short addresses work directly, and `serve`
+picks its own relay.
+
+Verified against the Go implementation: `tailcat-c resolve` on a short
+address produces a **byte-identical** result to `tailcat resolve`, which
+exercises the whole chain -- HTTPS, JSON, the DERP map, and address
+re-encoding -- in one comparison.
+
+Region selection came in far under estimate because it reuses the DERP client
+rather than implementing probing of its own. It remains the deliberate
+approximation described above.
 
 ---
 

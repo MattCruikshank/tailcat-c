@@ -60,7 +60,9 @@ static const char *tct_case;
 		}                                                                     \
 	} while (0)
 
-static void tct_hexdump(const char *label, const unsigned char *p, size_t n)
+/* Not every suite compares buffers, so this may legitimately go unused. */
+__attribute__((unused)) static void tct_hexdump(const char *label,
+                                              const unsigned char *p, size_t n)
 {
 	fprintf(stderr, "%s (%zu): ", label, n);
 	for (size_t i = 0; i < n; i++)

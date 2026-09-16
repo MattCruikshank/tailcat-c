@@ -24,6 +24,7 @@
 #include "tc/addr.h"
 #include "tc/crypto.h"
 #include "tc/derp.h"
+#include "tc/derpmap.h"
 #include "tc/noise.h"
 #include "tc/tailcat.h"
 #include "tc/tcp.h"
@@ -71,22 +72,26 @@ static void usage(FILE *f)
 	        "usage:\n"
 	        "  tailcat-c [flags] <tc-address> [port]   pipe stdin/stdout to a "
 	        "tailcat server\n"
-	        "  tailcat-c serve --relay HOST [port]     listen and print an "
+	        "  tailcat-c serve [port]                  listen and print an "
 	        "address\n"
+	        "  tailcat-c ping <tc-address>             time the round trip to "
+	        "a server\n"
+	        "  tailcat-c resolve <tc-address>          embed the relay, for "
+	        "offline use\n"
 	        "  tailcat-c parse <tc-address>            describe an address\n"
 	        "  tailcat-c version\n"
 	        "\n"
 	        "flags:\n"
-	        "  -v, --verbose      report progress on stderr\n"
-	        "      --insecure     skip TLS verification of the relay\n"
-	        "      --relay HOST   relay to serve through (serve mode)\n"
-	        "      --timeout SEC  give up after SEC seconds (default 60)\n"
+	        "  -v, --verbose         report progress on stderr\n"
+	        "      --insecure        skip TLS verification of the relay\n"
+	        "      --relay HOST      serve through this relay instead of "
+	        "choosing one\n"
+	        "      --derpmap-url URL where to fetch the relay list\n"
+	        "      --timeout SEC     give up after SEC seconds (default 60)\n"
 	        "\n"
 	        "The port defaults to 1, which is what a bare `tailcat` server "
 	        "pipes.\n"
-	        "The address must be self-contained: run `tailcat resolve` on a "
-	        "short one,\n"
-	        "since fetching the DERP map is not implemented yet.\n");
+	        "Short addresses work: the relay list is fetched as needed.\n");
 }
 
 /* ---- parse subcommand ------------------------------------------------- */
@@ -142,6 +147,181 @@ static int cmd_parse(const char *addr_str)
 		}
 	}
 	return 0;
+}
+
+/* ---- relay resolution ------------------------------------------------- */
+
+/* ensure_relay makes sure ci names a relay we can actually dial.
+ *
+ * A short address carries only a region number, which means fetching the
+ * DERP map to turn it into a hostname. RegionID -1 is upstream's "choose one
+ * for me", which we answer by probing. */
+static int ensure_relay(tc_conn_info *ci, const char *derpmap_url,
+                        bool insecure, int timeout_ms)
+{
+	if (ci->num_regions > 0 && ci->regions[0].num_nodes > 0)
+		return TC_OK; /* already self-contained */
+
+	tc_derp_map *m = (tc_derp_map *)malloc(sizeof *m);
+	if (m == NULL)
+		return TC_ERR_INVAL;
+
+	vlogf("fetching the DERP map");
+	int rc = tc_derpmap_fetch(m, derpmap_url, insecure, timeout_ms);
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_derpmap_error_string());
+		free(m);
+		return rc;
+	}
+
+	const tc_derp_region *reg = NULL;
+	if (ci->region_id > 0) {
+		reg = tc_derpmap_find(m, ci->region_id);
+		if (reg == NULL) {
+			fprintf(stderr,
+			        "tailcat-c: the DERP map has no region %lld\n",
+			        (long long)ci->region_id);
+			free(m);
+			return TC_ERR_INVAL;
+		}
+	} else {
+		/* Either -1 (choose for me) or absent. */
+		vlogf("probing relays to pick one");
+		reg = tc_derpmap_pick_fastest(m, 4, timeout_ms, insecure);
+		if (reg == NULL) {
+			fprintf(stderr, "tailcat-c: no usable relay\n");
+			free(m);
+			return TC_ERR_INVAL;
+		}
+	}
+
+	ci->regions[0] = *reg;
+	ci->num_regions = 1;
+	free(m);
+	vlogf("relay region %lld (%s)", (long long)ci->regions[0].region_id,
+	      ci->regions[0].region_code);
+	return TC_OK;
+}
+
+/* ---- resolve subcommand ----------------------------------------------- */
+
+static int cmd_resolve(const char *addr_str, const char *derpmap_url,
+                       bool insecure)
+{
+	static tc_conn_info ci;
+	int rc = tc_addr_parse(&ci, addr_str, strlen(addr_str));
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_strerror(rc));
+		return 1;
+	}
+	rc = ensure_relay(&ci, derpmap_url, insecure, 15000);
+	if (rc != TC_OK)
+		return 1;
+
+	/* Keep the result short: two relays are enough redundancy, and the
+	 * region number is redundant once the region itself is embedded. */
+	if (ci.regions[0].num_nodes > 2)
+		ci.regions[0].num_nodes = 2;
+	ci.region_id = 0;
+
+	char out[TC_ADDR_STR_MAX];
+	if (tc_addr_encode(out, sizeof out, &ci, NULL) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not re-encode the address\n");
+		return 1;
+	}
+	printf("%s\n", out);
+	return 0;
+}
+
+/* ---- ping subcommand --------------------------------------------------- */
+
+/* cmd_ping times the meow round trip: reach the relay, introduce ourselves,
+ * and wait to be acknowledged. That is the same exchange the pipe mode does
+ * first, so it measures exactly the path a real connection would take. */
+static int cmd_ping(const char *addr_str, bool insecure, unsigned timeout_s,
+                    const char *derpmap_url)
+{
+	static tc_conn_info ci;
+	int rc = tc_addr_parse(&ci, addr_str, strlen(addr_str));
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_strerror(rc));
+		return 1;
+	}
+	if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
+		return 1;
+	const tc_derp_node *node = &ci.regions[0].nodes[0];
+
+	tc_wg_identity me;
+	uint8_t disco_pub[32];
+	if (tc_wg_identity_generate(&me) != TC_OK ||
+	    tc_disco_key_for_node(NULL, disco_pub, me.private_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not generate keys\n");
+		return 1;
+	}
+
+	tc_derp_dial_opts opts;
+	memset(&opts, 0, sizeof opts);
+	opts.hostname = node->hostname;
+	opts.dial_addr = (node->ipv4[0] != '\0') ? node->ipv4 : NULL;
+	opts.port = (node->derp_port > 0) ? (uint16_t)node->derp_port : 0;
+	opts.insecure_skip_verify = insecure || node->insecure_for_tests;
+	opts.timeout_ms = 15000;
+
+	uint64_t t_connect = now_ms();
+	tc_derp_client derp;
+	if (tc_derp_connect(&derp, &opts, me.private_key, me.public_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: relay: %s\n", tc_derp_error_string());
+		return 1;
+	}
+	uint64_t connect_ms = now_ms() - t_connect;
+	printf("relay %s: connected in %llu ms\n", node->hostname,
+	       (unsigned long long)connect_ms);
+
+	tc_derp_set_read_timeout(&derp, 200);
+
+	uint8_t ping[TC_MEOW_PING_LEN];
+	size_t ping_len = 0;
+	tc_meow_encode_ping(ping, sizeof ping, &ping_len, me.public_key, disco_pub);
+
+	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
+	uint64_t next_send = 0, t0 = 0;
+	int sent = 0, status = 1;
+
+	while (now_ms() < deadline) {
+		if (now_ms() >= next_send) {
+			t0 = now_ms();
+			if (tc_derp_send(&derp, ci.server_public, ping, ping_len) !=
+			    TC_OK) {
+				fprintf(stderr, "tailcat-c: relay send failed\n");
+				break;
+			}
+			sent++;
+			next_send = now_ms() + 1000;
+		}
+		uint8_t src[32];
+		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+		size_t len = 0;
+		rc = tc_derp_recv(&derp, src, buf, sizeof buf, &len);
+		if (rc == TC_ERR_TIMEOUT)
+			continue;
+		if (rc != TC_OK) {
+			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
+			break;
+		}
+		if (memcmp(src, ci.server_public, 32) == 0 &&
+		    tc_meow_is_meowed(buf, len)) {
+			printf("meowed in %llu ms (%d ping%s) via %s\n",
+			       (unsigned long long)(now_ms() - t0), sent,
+			       sent == 1 ? "" : "s", node->hostname);
+			status = 0;
+			break;
+		}
+	}
+
+	if (status != 0)
+		fprintf(stderr, "tailcat-c: no answer from the server\n");
+	tc_derp_close(&derp);
+	return status;
 }
 
 /* ---- pipe mode -------------------------------------------------------- */
@@ -325,7 +505,7 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 }
 
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
-                    unsigned timeout_s)
+                    unsigned timeout_s, const char *derpmap_url)
 {
 	static tc_conn_info ci;
 	int rc = tc_addr_parse(&ci, addr_str, strlen(addr_str));
@@ -333,15 +513,10 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 		fprintf(stderr, "tailcat-c: bad address: %s\n", tc_strerror(rc));
 		return 1;
 	}
-	if (ci.num_regions == 0 || ci.regions[0].num_nodes == 0) {
-		fprintf(stderr,
-		        "tailcat-c: this address names a relay region by number but "
-		        "does not\n"
-		        "           embed it, and fetching the DERP map is not "
-		        "implemented.\n"
-		        "           Run `tailcat resolve <addr>` and pass the result.\n");
+	/* A short address names its relay by region number; this fetches the map
+	 * and turns that into something dialable. */
+	if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
 		return 1;
-	}
 	const tc_derp_node *node = &ci.regions[0].nodes[0];
 
 	tc_wg_identity me;
@@ -509,7 +684,7 @@ out:
 /* ---- serve mode ------------------------------------------------------- */
 
 static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
-                     unsigned timeout_s)
+                     unsigned timeout_s, const char *derpmap_url)
 {
 	/* A fresh identity per run, like upstream's default. The pre-shared key
 	 * is what stops a relay operator who has watched both public keys go past
@@ -535,12 +710,23 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 
 	/* Embed the relay rather than naming a region by number, so the address
 	 * is self-contained and the other side needs no DERP map either. */
-	ci.num_regions = 1;
-	ci.regions[0].num_nodes = 1;
-	if (snprintf(ci.regions[0].nodes[0].hostname, TC_DNS_NAME_MAX, "%s",
-	             relay_host) >= TC_DNS_NAME_MAX) {
-		fprintf(stderr, "tailcat-c: relay hostname is too long\n");
-		return 1;
+	if (relay_host != NULL) {
+		ci.num_regions = 1;
+		ci.regions[0].num_nodes = 1;
+		if (snprintf(ci.regions[0].nodes[0].hostname, TC_DNS_NAME_MAX, "%s",
+		             relay_host) >= TC_DNS_NAME_MAX) {
+			fprintf(stderr, "tailcat-c: relay hostname is too long\n");
+			return 1;
+		}
+	} else {
+		/* No relay named: fetch the map and probe for a quick one. */
+		ci.region_id = -1;
+		if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
+			return 1;
+		ci.region_id = 0;
+		if (ci.regions[0].num_nodes > 2)
+			ci.regions[0].num_nodes = 2;
+		relay_host = ci.regions[0].nodes[0].hostname;
 	}
 
 	char addr[TC_ADDR_STR_MAX];
@@ -687,6 +873,9 @@ int main(int argc, char **argv)
 	bool insecure = false;
 	unsigned timeout_s = 60;
 	const char *relay = NULL;
+	/* NULL means the built-in default; --derpmap-url overrides, matching
+	 * upstream's flag of the same name. */
+	const char *derpmap_url = NULL;
 	const char *args[3] = { NULL, NULL, NULL };
 	size_t nargs = 0;
 
@@ -698,6 +887,8 @@ int main(int argc, char **argv)
 			insecure = true;
 		} else if (strcmp(a, "--relay") == 0 && i + 1 < argc) {
 			relay = argv[++i];
+		} else if (strcmp(a, "--derpmap-url") == 0 && i + 1 < argc) {
+			derpmap_url = argv[++i];
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
 			timeout_s = (unsigned)strtoul(argv[++i], NULL, 10);
 			if (timeout_s == 0)
@@ -725,18 +916,21 @@ int main(int argc, char **argv)
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);
 		return 0;
 	}
-	if (strcmp(args[0], "serve") == 0) {
-		if (relay == NULL) {
-			fprintf(stderr,
-			        "tailcat-c: serve needs --relay <hostname>\n"
-			        "           Choosing one automatically needs the DERP "
-			        "map, which is\n"
-			        "           not implemented. Any relay from\n"
-			        "           https://tailcat.dev/derpmap.json works, for "
-			        "example\n"
-			        "           --relay tc301a.ipn.dev\n");
+	if (strcmp(args[0], "resolve") == 0) {
+		if (nargs < 2) {
+			fprintf(stderr, "tailcat-c: resolve needs an address\n");
 			return 2;
 		}
+		return cmd_resolve(args[1], derpmap_url, insecure);
+	}
+	if (strcmp(args[0], "ping") == 0) {
+		if (nargs < 2) {
+			fprintf(stderr, "tailcat-c: ping needs an address\n");
+			return 2;
+		}
+		return cmd_ping(args[1], insecure, timeout_s, derpmap_url);
+	}
+	if (strcmp(args[0], "serve") == 0) {
 		uint16_t sport = 1;
 		if (nargs >= 2) {
 			unsigned long p2 = strtoul(args[1], NULL, 10);
@@ -746,7 +940,7 @@ int main(int argc, char **argv)
 			}
 			sport = (uint16_t)p2;
 		}
-		return cmd_serve(relay, sport, insecure, timeout_s);
+		return cmd_serve(relay, sport, insecure, timeout_s, derpmap_url);
 	}
 	if (strcmp(args[0], "parse") == 0) {
 		if (nargs < 2) {
@@ -765,5 +959,5 @@ int main(int argc, char **argv)
 		}
 		port = (uint16_t)p;
 	}
-	return cmd_pipe(args[0], port, insecure, timeout_s);
+	return cmd_pipe(args[0], port, insecure, timeout_s, derpmap_url);
 }

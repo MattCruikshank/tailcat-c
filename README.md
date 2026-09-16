@@ -102,7 +102,8 @@ largest thing we add is the 181 KB CA bundle.
 | Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ❌ | ✅ |
 | Rekeying / session renewal | ❌ | ✅ |
 | Cookie reply (DoS mitigation) | ❌ | ✅ |
-| DERP map fetch + latency-based region choice | ❌ | ✅ |
+| DERP map fetch | ✅ | ✅ |
+| Region choice by latency | approximate | ✅ (netcheck) |
 | Multiple concurrent connections | ❌ | ✅ |
 | UDP forwarding | ❌ | ✅ |
 | IPv4 into the tunnel via NAT64 | ❌ | ✅ |
@@ -112,8 +113,8 @@ largest thing we add is the 181 KB CA bundle.
 | `serve` | one client, one connection | full |
 | `parse` | ✅ | ✅ (JSON) |
 | `version` | ✅ | ✅ |
-| `ping` | ❌ | ✅ |
-| `resolve` | ❌ | ✅ |
+| `ping` | ✅ | ✅ |
+| `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ❌ | ✅ |
 | `socks` (SOCKS5 proxy) | ❌ | ✅ |
 | `ssh` / `cp` / `ls` (SSH, SFTP, remote listing) | ❌ | ✅ |
@@ -164,8 +165,10 @@ sh scripts/live-cross.sh   # one binary, two operating systems, both ways
 Then:
 
 ```console
-$ tailcat-c serve --relay tc301a.ipn.dev   # listen; prints an address
+$ tailcat-c serve                          # listen; prints an address
 $ echo hello | tailcat-c <tc-address>      # pipe to a server
+$ tailcat-c ping <tc-address>              # time the round trip
+$ tailcat-c resolve <tc-address>           # embed the relay, for offline use
 $ tailcat-c parse <tc-address>             # describe an address
 ```
 
@@ -401,9 +404,10 @@ Current, and deliberate unless noted.
   TCP, and no CLI. tailcat-c can move bytes between two of *its own* clients
   through a relay; it cannot yet talk to a real `tailcat` peer.
 - **No SSH, SFTP, SOCKS, port forwarding, or WASM build.**
-- **No DERP map fetching**, so a short address cannot be used directly: run
-  `tailcat resolve` on it first, and `serve` needs `--relay <hostname>`
-  because it cannot choose a region by latency.
+- **Region selection is an approximation.** A relay is chosen by timing a
+  DERP connection (TCP, TLS and the key exchange), not by STUN probes as
+  upstream's netcheck does. It measures the path a relayed session actually
+  uses, but will choose differently where TCP and UDP diverge.
 - **`serve` handles one client and one connection**, then exits. There is no
   accept loop and no demultiplexer.
 

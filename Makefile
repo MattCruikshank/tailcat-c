@@ -141,6 +141,7 @@ LIB_SRCS := \
 	src/tc.c \
 	src/base64url.c \
 	src/cbor.c \
+	src/json.c \
 	src/addr.c \
 	src/crypto/blake2s.c \
 	src/crypto/kdf.c \
@@ -152,7 +153,9 @@ LIB_SRCS := \
 	src/tailcat/meow.c \
 	src/derp/frame.c \
 	src/derp/client.c \
+	src/derp/derpmap.c \
 	src/net/tcp.c \
+	src/net/http.c \
 	src/net/tls.c \
 	src/net/ca_bundle.c
 
