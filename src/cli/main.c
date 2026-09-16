@@ -4,7 +4,7 @@
  * DERP, speaking to a real tailcat server.
  *
  *     tailcat-c <tc-address> [port]      connect and pipe stdin/stdout
- *     tailcat-c serve --relay HOST       listen, printing an address
+ *     tailcat-c serve [port]             listen, printing an address
  *     tailcat-c parse <tc-address>       show what an address contains
  *     tailcat-c version
  *
@@ -15,10 +15,13 @@
  * concurrent use.
  *
  * Both roles are here. Serving mints a self-contained address with the relay
- * embedded, which is why it needs --relay: choosing a region by latency would
- * need the DERP map, which is not implemented. The server is the WireGuard
- * responder and the TCP passive opener, and the real Go client interoperates
- * with it.
+ * embedded, choosing a region by measured handshake time unless --relay names
+ * one. The server is the WireGuard responder and the TCP passive opener, and
+ * the real Go client interoperates with it.
+ *
+ * Packets reach TCP through the demultiplexer rather than a lone connection.
+ * A pipe only ever uses one, but routing it the same way means the dispatch
+ * path is exercised by every live run instead of only by its own tests.
  */
 
 #include "tc/addr.h"
@@ -27,7 +30,7 @@
 #include "tc/derpmap.h"
 #include "tc/noise.h"
 #include "tc/tailcat.h"
-#include "tc/tcp.h"
+#include "tc/tcpmux.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -367,10 +370,16 @@ static bool write_all(int fd, const uint8_t *p, size_t n)
  *
  * It is single-threaded on purpose. tc_derp_client is not safe for
  * concurrent use, and a loop over two descriptors needs no locks at all.
- * The caller has already opened or accepted the connection. */
+ *
+ * Packets go through the demultiplexer even though a pipe only ever uses one
+ * connection. Dialling gives the caller that connection up front and `tcp` is
+ * it; serving passes NULL and the loop takes the first connection the
+ * listener accepts. Routing a lone connection through the mux costs one array
+ * scan per packet and means the dispatch path is the one exercised by every
+ * live run, rather than only by its own tests. */
 static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
-                    tc_tcp_conn *tcp, const uint8_t peer_key[32],
-                    uint64_t deadline)
+                    tc_tcp_mux *mux, tc_tcp_conn *tcp,
+                    const uint8_t peer_key[32], uint64_t deadline)
 {
 	/* Non-blocking stdin, so the loop never stalls on a slow writer while
 	 * the tunnel has work to do. */
@@ -385,7 +394,15 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
-		tc_tcp_tick(tcp, t);
+		bool progress = false;
+		tc_tcp_mux_tick(mux, t);
+
+		/* Serving: the connection arrives rather than being dialled. Only
+		 * the first is taken -- a pipe has one stdin to give it. */
+		if (tcp == NULL)
+			tcp = tc_tcp_mux_accept(mux);
+		if (tcp == NULL)
+			goto wait;
 
 		if (!connected && tc_tcp_is_established(tcp)) {
 			connected = true;
@@ -421,7 +438,6 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 		}
 
 		/* tunnel -> stdout */
-		bool progress = false;
 		for (;;) {
 			uint8_t buf[16384];
 			size_t n = 0;
@@ -445,6 +461,7 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 		 * stdin, or a TCP timer. Checking has_pending first matters -- a
 		 * whole frame may already be decrypted inside the TLS layer with
 		 * nothing left on the socket for poll() to see. */
+	wait:
 		if (!progress && !tc_derp_has_pending(derp)) {
 			struct pollfd pfds[2];
 			int nfds = 0;
@@ -455,7 +472,8 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 				pfds[nfds].revents = 0;
 				nfds++;
 			}
-			if (connected && !stdin_eof && tc_tcp_writable(tcp) > 0) {
+			if (connected && !stdin_eof && tcp != NULL &&
+			    tc_tcp_writable(tcp) > 0) {
 				pfds[nfds].fd = STDIN_FILENO;
 				pfds[nfds].events = POLLIN;
 				pfds[nfds].revents = 0;
@@ -463,7 +481,7 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 			}
 
 			int wait_ms = 20;
-			uint64_t dl = tc_tcp_next_deadline(tcp);
+			uint64_t dl = tc_tcp_mux_next_deadline(mux);
 			if (dl != UINT64_MAX) {
 				uint64_t nowv = now_ms();
 				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
@@ -498,7 +516,7 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 			continue; /* forged, replayed, or a rekey we do not implement */
 		if (inner_len == 0)
 			continue; /* keepalive */
-		tc_tcp_input(tcp, inner, inner_len, now_ms());
+		tc_tcp_mux_input(mux, inner, inner_len, now_ms());
 	}
 
 	return 1;
@@ -545,6 +563,7 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 
 	int status = 1;
 	tc_tcp_conn *tcp = NULL;
+	tc_tcp_mux *mux = NULL;
 	tc_wg_session sess;
 	memset(&sess, 0, sizeof sess);
 
@@ -656,26 +675,26 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	ctx.sess = &sess;
 	memcpy(ctx.server_key, ci.server_public, 32);
 
-	tcp = tc_tcp_new(our_ip, their_ip, tcp_out, &ctx);
-	if (tcp == NULL) {
+	mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &ctx);
+	if (mux == NULL) {
 		fprintf(stderr, "tailcat-c: out of memory\n");
 		goto out;
 	}
-	/* An ephemeral source port; nothing demultiplexes on it here. */
-	if (tc_tcp_connect(tcp, 49152, port, now_ms()) != TC_OK) {
+	if (tc_tcp_mux_connect(mux, port, now_ms(), &tcp) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not start the connection\n");
 		goto out;
 	}
-	vlogf("connecting to port %u", (unsigned)port);
+	vlogf("connecting to port %u from %u", (unsigned)port,
+	      (unsigned)tc_tcp_local_port(tcp));
 
-	status = run_pipe(&derp, &sess, tcp, ci.server_public, deadline);
+	status = run_pipe(&derp, &sess, mux, tcp, ci.server_public, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
 
 out:
-	if (tcp != NULL)
-		tc_tcp_free(tcp);
+	/* The mux owns every connection it handed out. */
+	tc_tcp_mux_free(mux);
 	tc_wg_session_clear(&sess);
 	tc_derp_close(&derp);
 	return status;
@@ -754,7 +773,7 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 	fflush(stderr);
 
 	int status = 1;
-	tc_tcp_conn *tcp = NULL;
+	tc_tcp_mux *mux = NULL;
 	tc_wg_session sess;
 	memset(&sess, 0, sizeof sess);
 
@@ -842,25 +861,26 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 	ctx.sess = &sess;
 	memcpy(ctx.server_key, client_key, 32);
 
-	tcp = tc_tcp_new(our_ip, their_ip, tcp_out, &ctx);
-	if (tcp == NULL) {
+	mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &ctx);
+	if (mux == NULL) {
 		fprintf(stderr, "tailcat-c: out of memory\n");
 		goto out;
 	}
-	if (tc_tcp_listen(tcp, port) != TC_OK) {
+	if (tc_tcp_mux_listen(mux, port) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not listen\n");
 		goto out;
 	}
 	vlogf("listening on port %u inside the tunnel", (unsigned)port);
 
-	status = run_pipe(&derp, &sess, tcp, client_key, deadline);
+	/* The connection is accepted inside the loop, so NULL here. */
+	status = run_pipe(&derp, &sess, mux, NULL, client_key, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
 
 out:
-	if (tcp != NULL)
-		tc_tcp_free(tcp);
+	/* The mux owns every connection it handed out. */
+	tc_tcp_mux_free(mux);
 	tc_wg_session_clear(&sess);
 	tc_derp_close(&derp);
 	return status;

@@ -996,6 +996,86 @@ tc_tcp_state tc_tcp_get_state(const tc_tcp_conn *c)
 	return c == NULL ? TC_TCP_CLOSED : c->state;
 }
 
+uint16_t tc_tcp_local_port(const tc_tcp_conn *c)
+{
+	return c == NULL ? 0 : c->local_port;
+}
+
+uint16_t tc_tcp_remote_port(const tc_tcp_conn *c)
+{
+	return c == NULL ? 0 : c->remote_port;
+}
+
+int tc_tcp_reject(const uint8_t *ip_pkt, size_t len, tc_tcp_output_fn out,
+                  void *out_ctx)
+{
+	if (ip_pkt == NULL || out == NULL)
+		return TC_ERR_INVAL;
+	if (len < TC_IPV6_HEADER_LEN + TC_TCP_HEADER_LEN)
+		return TC_ERR_INVAL;
+	if ((ip_pkt[0] >> 4) != 6 || ip_pkt[6] != 6)
+		return TC_ERR_INVAL;
+
+	size_t payload_total = rd16(ip_pkt + 4);
+	if (payload_total < TC_TCP_HEADER_LEN ||
+	    TC_IPV6_HEADER_LEN + payload_total > len)
+		return TC_ERR_INVAL;
+
+	const uint8_t *th = ip_pkt + TC_IPV6_HEADER_LEN;
+	uint8_t in_flags = th[13];
+	if (in_flags & TH_RST)
+		return TC_ERR_INVAL; /* answering a RST with a RST loops forever */
+
+	size_t doff = (size_t)(th[12] >> 4) * 4;
+	if (doff < TC_TCP_HEADER_LEN || doff > payload_total)
+		return TC_ERR_INVAL;
+
+	/* RFC 793 3.4: if the offending segment carried an ACK, the reset takes
+	 * its sequence number from that ACK and carries none of its own;
+	 * otherwise it acknowledges everything the segment occupied, so the
+	 * sender can tell the reset is a genuine answer to it. */
+	uint32_t seq, ack;
+	uint8_t flags;
+	if (in_flags & TH_ACK) {
+		seq = rd32(th + 8);
+		ack = 0;
+		flags = TH_RST;
+	} else {
+		uint32_t seg_seq = rd32(th + 4);
+		uint32_t seg_len = (uint32_t)(payload_total - doff);
+		if (in_flags & TH_SYN)
+			seg_len++;
+		if (in_flags & TH_FIN)
+			seg_len++;
+		seq = 0;
+		ack = seg_seq + seg_len;
+		flags = TH_RST | TH_ACK;
+	}
+
+	uint8_t pkt[TC_IPV6_HEADER_LEN + TC_TCP_HEADER_LEN];
+	memset(pkt, 0, sizeof pkt);
+	pkt[0] = 0x60;
+	wr16(pkt + 4, TC_TCP_HEADER_LEN);
+	pkt[6] = 6;
+	pkt[7] = 64;
+	/* The reply goes back the way the segment came. */
+	memcpy(pkt + 8, ip_pkt + 24, TC_IPV6_ADDR_LEN);
+	memcpy(pkt + 24, ip_pkt + 8, TC_IPV6_ADDR_LEN);
+
+	uint8_t *oth = pkt + TC_IPV6_HEADER_LEN;
+	wr16(oth + 0, rd16(th + 2));
+	wr16(oth + 2, rd16(th + 0));
+	wr32(oth + 4, seq);
+	wr32(oth + 8, ack);
+	oth[12] = 5 << 4;
+	oth[13] = flags;
+	wr16(oth + 14, 0); /* a reset advertises no window */
+	wr16(oth + 16, 0);
+	wr16(oth + 16, tcp_checksum(pkt + 8, pkt + 24, oth, TC_TCP_HEADER_LEN));
+
+	return out(out_ctx, pkt, sizeof pkt);
+}
+
 size_t tc_tcp_readable(const tc_tcp_conn *c)
 {
 	return c == NULL ? 0 : c->rcv_len;

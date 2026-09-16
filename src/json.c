@@ -325,7 +325,15 @@ static int scan_number(tc_json_reader *r, tc_json_event *ev)
 		uint64_t limit = neg ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
 		if (!overflow && mag <= limit) {
 			ev->is_integer = true;
-			ev->num = neg ? -(int64_t)mag : (int64_t)mag;
+			/* INT64_MAX+1 is the one magnitude only the negative side can
+			 * hold, and it is exactly where the obvious -(int64_t)mag is
+			 * undefined: the cast overflows before the negation runs. */
+			if (!neg)
+				ev->num = (int64_t)mag;
+			else if (mag == (uint64_t)INT64_MAX + 1u)
+				ev->num = INT64_MIN;
+			else
+				ev->num = -(int64_t)mag;
 		}
 	}
 	return TC_OK;

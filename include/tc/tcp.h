@@ -134,6 +134,22 @@ void tc_tcp_abort(tc_tcp_conn *c, uint64_t now_ms);
 tc_tcp_state tc_tcp_get_state(const tc_tcp_conn *c);
 const char *tc_tcp_state_name(tc_tcp_state s);
 
+/* The port pair, which is what a demultiplexer keys a connection on. The
+ * remote port is only meaningful once a listening connection has accepted. */
+uint16_t tc_tcp_local_port(const tc_tcp_conn *c);
+uint16_t tc_tcp_remote_port(const tc_tcp_conn *c);
+
+/* tc_tcp_reject emits a RST in reply to a segment no connection wants, which
+ * is what a closed port owes the sender: without it the peer retransmits its
+ * SYN until it gives up, turning an immediate "connection refused" into a
+ * timeout. The reply is built from the segment alone, so no connection state
+ * is needed -- which is the point, since by definition there is none.
+ *
+ * A RST is never answered with a RST. Returns TC_OK if a reply went out, and
+ * TC_ERR_INVAL for a packet not worth answering. */
+int tc_tcp_reject(const uint8_t *ip_pkt, size_t len, tc_tcp_output_fn out,
+                  void *out_ctx);
+
 /* tc_tcp_readable returns how many bytes tc_tcp_read would return now. */
 size_t tc_tcp_readable(const tc_tcp_conn *c);
 

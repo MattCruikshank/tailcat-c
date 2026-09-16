@@ -15,6 +15,7 @@ const char *tc_strerror(int err)
 	case TC_ERR_UNSUPPORTED: return "unsupported encoding";
 	case TC_ERR_TOOMANY:     return "too many elements";
 	case TC_ERR_TIMEOUT:     return "timed out";
+	case TC_ERR_EXIST:       return "already exists";
 	default:                 return "unknown error";
 	}
 }

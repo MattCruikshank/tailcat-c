@@ -79,15 +79,15 @@ Both columns are release builds: upstream with its own `-s -w` and 75
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **1.67 MB** | 17.67 MB |
-| gzipped | **0.83 MB** | 6.77 MB |
+| binary | **1.72 MB** | 17.67 MB |
+| gzipped | **0.86 MB** | 6.77 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
 The ratio is about 10×, and **most of it is the feature gap below, not
 craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
-of the rest. The interesting number is not 1.67 MB, it is that one file covers
-every target: our own protocol code is only ~35 KB of it, and the single
+of the rest. The interesting number is not 1.72 MB, it is that one file covers
+every target: our own protocol code is only ~40 KB of it, and the single
 largest thing we add is the 181 KB CA bundle.
 
 ### Features

@@ -132,9 +132,14 @@ CFLAGS += $(WARNINGS) $(HARDENING) -Iinclude $(MBEDTLS_INC) $(MBEDTLS_DEF)
 MBEDTLS_CFLAGS := -std=gnu11 -O2 -g -w $(HARDENING) $(MBEDTLS_INC) $(MBEDTLS_DEF)
 
 ifeq ($(SANITIZE),1)
-CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
-MBEDTLS_CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
-LDFLAGS += -fsanitize=address,undefined
+# -fno-sanitize-recover matters: UndefinedBehaviorSanitizer otherwise prints a
+# diagnostic and carries on, so a finding scrolls past in a run that still
+# reports every suite as passing. It found exactly one that way.
+SAN := -fsanitize=address,undefined -fno-omit-frame-pointer \
+	-fno-sanitize-recover=all
+CFLAGS += $(SAN)
+MBEDTLS_CFLAGS += $(SAN)
+LDFLAGS += $(SAN)
 endif
 
 LIB_SRCS := \
@@ -155,6 +160,7 @@ LIB_SRCS := \
 	src/derp/client.c \
 	src/derp/derpmap.c \
 	src/net/tcp.c \
+	src/net/tcpmux.c \
 	src/net/http.c \
 	src/net/tls.c \
 	src/net/ca_bundle.c
@@ -166,7 +172,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -268,6 +274,11 @@ $(BUILD)/livetailcat: tests/livetailcat.c $(LIB_OBJS)
 
 live-cli: $(CLI)
 	CLI=$(CLI) sh scripts/live-cli.sh
+
+# The other direction: a real Go client dialling our server, which is the only
+# check that covers the passive open and the listener.
+live-serve: $(CLI)
+	CLI=$(CLI) sh scripts/live-serve.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
