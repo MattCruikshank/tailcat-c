@@ -101,6 +101,7 @@ LIB_SRCS := \
 	src/crypto/kdf.c \
 	src/crypto/x25519.c \
 	src/crypto/aead.c \
+	src/crypto/salsa20.c \
 	src/crypto/random.c
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)

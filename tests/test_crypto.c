@@ -397,6 +397,114 @@ static void test_random(void)
 	TCT_EQ_INT(tc_random_bytes(NULL, 8), TC_ERR_INVAL);
 }
 
+/* ---- NaCl box, as used by the DERP handshake ------------------------- */
+
+static void test_hsalsa20(void)
+{
+	for (size_t i = 0; i < sizeof kHSalsa20Vectors / sizeof kHSalsa20Vectors[0];
+	     i++) {
+		TCT_CASE(kHSalsa20Vectors[i].name);
+		uint8_t key[32], in[16], want[32], got[32];
+		TCT_EQ_INT(unhex(key, sizeof key, kHSalsa20Vectors[i].key), 32);
+		TCT_EQ_INT(unhex(in, sizeof in, kHSalsa20Vectors[i].in), 16);
+		TCT_EQ_INT(unhex(want, sizeof want, kHSalsa20Vectors[i].want), 32);
+		tc_hsalsa20(got, key, in);
+		TCT_EQ_MEM(got, want, 32);
+	}
+}
+
+static void test_secretbox(void)
+{
+	for (size_t i = 0;
+	     i < sizeof kSecretboxVectors / sizeof kSecretboxVectors[0]; i++) {
+		TCT_CASE(kSecretboxVectors[i].name);
+
+		uint8_t key[32], nonce[24];
+		TCT_EQ_INT(unhex(key, sizeof key, kSecretboxVectors[i].key), 32);
+		TCT_EQ_INT(unhex(nonce, sizeof nonce, kSecretboxVectors[i].nonce), 24);
+		size_t pt_len = unhex(b_msg, MAXBUF, kSecretboxVectors[i].pt);
+		size_t ct_len = unhex(b_want, MAXBUF, kSecretboxVectors[i].ct);
+		TCT_EQ_INT(ct_len, pt_len + TC_BOX_TAG_LEN);
+
+		TCT_EQ_INT(tc_secretbox_seal(b_out, key, nonce,
+		                             pt_len ? b_msg : NULL, pt_len),
+		           TC_OK);
+		TCT_EQ_MEM(b_out, b_want, ct_len);
+
+		TCT_EQ_INT(tc_secretbox_open(b_b, key, nonce, b_want, ct_len), TC_OK);
+		if (pt_len)
+			TCT_EQ_MEM(b_b, b_msg, pt_len);
+
+		/* Tamper with the tag. */
+		memcpy(b_c, b_want, ct_len);
+		b_c[0] ^= 1;
+		TCT_EQ_INT(tc_secretbox_open(b_b, key, nonce, b_c, ct_len),
+		           TC_ERR_INVAL);
+	}
+
+	TCT_CASE("secretbox rejects input shorter than the tag");
+	uint8_t key[32] = { 0 }, nonce[24] = { 0 }, tiny[8] = { 0 };
+	TCT_EQ_INT(tc_secretbox_open(b_b, key, nonce, tiny, sizeof tiny),
+	           TC_ERR_INVAL);
+}
+
+static void test_box(void)
+{
+	for (size_t i = 0; i < sizeof kBoxVectors / sizeof kBoxVectors[0]; i++) {
+		TCT_CASE(kBoxVectors[i].name);
+
+		uint8_t sk[32], peer_pk[32], nonce[24], shared[32];
+		TCT_EQ_INT(unhex(sk, sizeof sk, kBoxVectors[i].sk), 32);
+		TCT_EQ_INT(unhex(peer_pk, sizeof peer_pk, kBoxVectors[i].peer_pk), 32);
+		TCT_EQ_INT(unhex(nonce, sizeof nonce, kBoxVectors[i].nonce), 24);
+		TCT_EQ_INT(unhex(shared, sizeof shared, kBoxVectors[i].shared), 32);
+		size_t pt_len = unhex(b_msg, MAXBUF, kBoxVectors[i].pt);
+		size_t ct_len = unhex(b_want, MAXBUF, kBoxVectors[i].ct);
+
+		/* Go's box.Seal output here has no nonce prefix (we passed nil), so
+		 * it is exactly tag || ciphertext. */
+		TCT_EQ_INT(ct_len, pt_len + TC_BOX_TAG_LEN);
+
+		/* The precomputed shared key must match Go's box.Precompute. */
+		uint8_t got_shared[32];
+		TCT_EQ_INT(tc_box_beforenm(got_shared, sk, peer_pk), TC_OK);
+		TCT_EQ_MEM(got_shared, shared, 32);
+
+		TCT_EQ_INT(tc_box_seal(b_out, nonce, pt_len ? b_msg : NULL, pt_len,
+		                       peer_pk, sk),
+		           TC_OK);
+		TCT_EQ_MEM(b_out, b_want, ct_len);
+
+		TCT_EQ_INT(tc_box_open(b_b, nonce, b_want, ct_len, peer_pk, sk),
+		           TC_OK);
+		if (pt_len)
+			TCT_EQ_MEM(b_b, b_msg, pt_len);
+	}
+
+	TCT_CASE("box is symmetric between the two peers");
+	uint8_t ska[32], pka[32], skb[32], pkb[32], nonce[24];
+	TCT_EQ_INT(tc_x25519_keypair(ska, pka), TC_OK);
+	TCT_EQ_INT(tc_x25519_keypair(skb, pkb), TC_OK);
+	TCT_EQ_INT(tc_random_bytes(nonce, sizeof nonce), TC_OK);
+
+	const char *msg = "derp clientinfo";
+	size_t mlen = strlen(msg);
+	TCT_EQ_INT(tc_box_seal(b_out, nonce, msg, mlen, pkb, ska), TC_OK);
+	TCT_EQ_INT(tc_box_open(b_b, nonce, b_out, mlen + TC_BOX_TAG_LEN, pka, skb),
+	           TC_OK);
+	TCT_EQ_MEM(b_b, msg, mlen);
+
+	TCT_CASE("box rejects the wrong peer key");
+	uint8_t skc[32], pkc[32];
+	TCT_EQ_INT(tc_x25519_keypair(skc, pkc), TC_OK);
+	TCT_EQ_INT(tc_box_open(b_b, nonce, b_out, mlen + TC_BOX_TAG_LEN, pkc, skb),
+	           TC_ERR_INVAL);
+
+	TCT_CASE("box rejects a small-order peer key");
+	uint8_t zero[32] = { 0 };
+	TCT_EQ_INT(tc_box_seal(b_out, nonce, msg, mlen, zero, ska), TC_ERR_INVAL);
+}
+
 int main(void)
 {
 	test_blake2s();
@@ -405,6 +513,9 @@ int main(void)
 	test_x25519();
 	test_aead();
 	test_aead_counter();
+	test_hsalsa20();
+	test_secretbox();
+	test_box();
 	test_random();
 	return tct_report("crypto");
 }

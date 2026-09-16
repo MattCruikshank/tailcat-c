@@ -137,6 +137,69 @@ int tc_aead_open_nonce(uint8_t *out, const uint8_t key[TC_AEAD_KEY_LEN],
                        const uint8_t nonce[TC_AEAD_NONCE_LEN], const void *ad,
                        size_t ad_len, const void *ct, size_t ct_len);
 
+/* ---- NaCl box (X25519 + HSalsa20 + XSalsa20-Poly1305) ---------------- */
+
+/* DERP's handshake frames are NaCl boxes, not ChaCha20-Poly1305: the client
+ * sends "32B public key + 24B nonce + box(json)" and the server replies
+ * "24B nonce + box(json)". That is golang.org/x/crypto/nacl/box, so the
+ * Salsa20 family is required, and Mbed TLS provides none of it. Hence these.
+ *
+ * The same construction is used by Tailscale's disco protocol, so this is
+ * reused in M5. */
+
+#define TC_BOX_NONCE_LEN 24
+#define TC_BOX_TAG_LEN 16 /* Poly1305 */
+#define TC_BOX_KEY_LEN 32
+
+/* tc_hsalsa20 is the HSalsa20 key-derivation core: 20 Salsa20 rounds with no
+ * feed-forward addition, keeping words 0, 5, 10, 15, 6, 7, 8, 9. Exposed for
+ * testing. */
+void tc_hsalsa20(uint8_t out[32], const uint8_t key[32], const uint8_t in[16]);
+
+/* tc_xsalsa20_xor XORs n bytes of the XSalsa20 keystream into out, starting
+ * at `keystream_offset` bytes into the stream.
+ *
+ * The offset is in BYTES, not blocks, and that matters: NaCl's secretbox
+ * takes its one-time Poly1305 key from the first 32 bytes of the keystream
+ * and then encrypts the message from byte 32 -- the second half of block 0,
+ * not the start of block 1. (NaCl describes this as prefixing the plaintext
+ * with 32 zero bytes and discarding the corresponding output.) Treating it
+ * as a block counter silently skips 32 bytes of keystream and produces
+ * ciphertext that nothing else can decrypt. */
+void tc_xsalsa20_xor(uint8_t *out, const void *in, size_t n,
+                     const uint8_t nonce[TC_BOX_NONCE_LEN],
+                     const uint8_t key[32], uint64_t keystream_offset);
+
+/* tc_secretbox_seal writes TC_BOX_TAG_LEN + pt_len bytes: the Poly1305 tag
+ * followed by the ciphertext, which is NaCl's layout. */
+int tc_secretbox_seal(uint8_t *out, const uint8_t key[TC_BOX_KEY_LEN],
+                      const uint8_t nonce[TC_BOX_NONCE_LEN], const void *pt,
+                      size_t pt_len);
+
+/* tc_secretbox_open verifies and decrypts, writing ct_len - TC_BOX_TAG_LEN
+ * bytes. ct_len must be at least TC_BOX_TAG_LEN. */
+int tc_secretbox_open(uint8_t *out, const uint8_t key[TC_BOX_KEY_LEN],
+                      const uint8_t nonce[TC_BOX_NONCE_LEN], const void *ct,
+                      size_t ct_len);
+
+/* tc_box_beforenm derives the shared secretbox key for a peer pair, which is
+ * HSalsa20 of the X25519 shared secret under an all-zero nonce. Caching it
+ * avoids repeating the scalar multiplication per frame. */
+int tc_box_beforenm(uint8_t shared[TC_BOX_KEY_LEN],
+                    const uint8_t sk[TC_X25519_KEY_LEN],
+                    const uint8_t pk[TC_X25519_KEY_LEN]);
+
+/* tc_box_seal and tc_box_open are the one-shot forms. The nonce is NOT
+ * written to or read from out; DERP carries it separately in the frame. */
+int tc_box_seal(uint8_t *out, const uint8_t nonce[TC_BOX_NONCE_LEN],
+                const void *pt, size_t pt_len,
+                const uint8_t peer_pk[TC_X25519_KEY_LEN],
+                const uint8_t sk[TC_X25519_KEY_LEN]);
+int tc_box_open(uint8_t *out, const uint8_t nonce[TC_BOX_NONCE_LEN],
+                const void *ct, size_t ct_len,
+                const uint8_t peer_pk[TC_X25519_KEY_LEN],
+                const uint8_t sk[TC_X25519_KEY_LEN]);
+
 /* ---- CSPRNG ---------------------------------------------------------- */
 
 /* tc_random_init seeds the generator from the operating system. It is safe

@@ -165,6 +165,39 @@ static void prop_x25519(void)
 		fail("small-order public key accepted");
 }
 
+/* NaCl secretbox, which carries the DERP handshake. Same shape as the AEAD
+ * properties: round trip exactly, and reject any single-bit change. */
+static void prop_secretbox(void)
+{
+	uint8_t key[32], nonce[24], pt[MAXPT];
+	uint8_t ct[MAXPT + TC_BOX_TAG_LEN], out[MAXPT];
+	size_t pt_len = rng_below(MAXPT);
+
+	rng_fill(key, sizeof key);
+	rng_fill(nonce, sizeof nonce);
+	rng_fill(pt, pt_len);
+
+	if (tc_secretbox_seal(ct, key, nonce, pt_len ? pt : NULL, pt_len) != TC_OK)
+		fail("secretbox seal failed");
+
+	size_t ct_len = pt_len + TC_BOX_TAG_LEN;
+	if (tc_secretbox_open(out, key, nonce, ct, ct_len) != TC_OK)
+		fail("secretbox open of our own output failed");
+	if (pt_len && memcmp(out, pt, pt_len) != 0)
+		fail("secretbox round trip changed the plaintext");
+
+	size_t bit = rng_below(ct_len * 8);
+	ct[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+	if (tc_secretbox_open(out, key, nonce, ct, ct_len) == TC_OK)
+		fail("tampered secretbox authenticated");
+	ct[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+
+	/* A different nonce must not authenticate. */
+	nonce[rng_below(sizeof nonce)] ^= 1;
+	if (tc_secretbox_open(out, key, nonce, ct, ct_len) == TC_OK)
+		fail("secretbox opened under the wrong nonce");
+}
+
 int main(int argc, char **argv)
 {
 	unsigned long iters = 20000;
@@ -179,6 +212,7 @@ int main(int argc, char **argv)
 		prop_open_garbage();
 		prop_aead_roundtrip();
 		prop_blake2s_chunking();
+		prop_secretbox();
 		if (i % 200 == 0)
 			prop_x25519();
 	}

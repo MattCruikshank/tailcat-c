@@ -30,7 +30,17 @@ import (
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/nacl/box"
+	"golang.org/x/crypto/nacl/secretbox"
+	"golang.org/x/crypto/salsa20/salsa"
 )
+
+// salsaSigma is NaCl's "expand 32-byte k" constant, which salsa.HSalsa20
+// takes explicitly.
+var salsaSigma = [16]byte{
+	'e', 'x', 'p', 'a', 'n', 'd', ' ', '3',
+	'2', '-', 'b', 'y', 't', 'e', ' ', 'k',
+}
 
 var out = flag.String("out", "../../tests/crypto_vectors.h", "output header")
 
@@ -315,6 +325,69 @@ func main() {
 		ct := aead.Seal(nil, nonce[:], pt, ad)
 		b.line("\t{ %q, %q, %q, %q, %q, %dULL },",
 			fmt.Sprintf("counter-%d", ctr), h(key), h(ad), h(pt), h(ct), ctr)
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- HSalsa20 / secretbox / box -----------------------------------
+	//
+	// DERP's handshake frames are NaCl boxes, so these pin the Salsa20
+	// family against the same x/crypto code the DERP server talks to.
+
+	b.line("/* HSalsa20 key derivation. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *key, *in, *want;")
+	b.line("} kHSalsa20Vectors[] = {")
+	for i := 0; i < 6; i++ {
+		var key [32]byte
+		var in, outk [16]byte
+		copy(key[:], rb(32))
+		copy(in[:], rb(16))
+		_ = outk
+		var out [32]byte
+		salsa.HSalsa20(&out, &in, &key, &salsaSigma)
+		b.line("\t{ %q, %q, %q, %q },", fmt.Sprintf("hsalsa-%d", i),
+			h(key[:]), h(in[:]), h(out[:]))
+	}
+	b.line("};")
+	b.line("")
+
+	b.line("/* NaCl secretbox (XSalsa20-Poly1305). Output is tag || ciphertext. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *key, *nonce, *pt, *ct;")
+	b.line("} kSecretboxVectors[] = {")
+	for i, n := range []int{0, 1, 15, 16, 31, 32, 63, 64, 65, 200, 1000} {
+		var key [32]byte
+		var nonce [24]byte
+		copy(key[:], rb(32))
+		copy(nonce[:], rb(24))
+		pt := rb(n)
+		ct := secretbox.Seal(nil, pt, &nonce, &key)
+		b.line("\t{ %q, %q, %q, %q, %q },", fmt.Sprintf("secretbox-%d-%d", i, n),
+			h(key[:]), h(nonce[:]), h(pt), h(ct))
+	}
+	b.line("};")
+	b.line("")
+
+	b.line("/* NaCl box: the DERP handshake construction. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *sk, *peer_pk, *nonce, *pt, *ct, *shared;")
+	b.line("} kBoxVectors[] = {")
+	for i, n := range []int{0, 1, 32, 100, 500} {
+		var sk, pk, peerSk, peerPk [32]byte
+		var nonce [24]byte
+		copy(sk[:], rb(32))
+		copy(peerSk[:], rb(32))
+		copy(nonce[:], rb(24))
+		curve25519.ScalarBaseMult(&pk, &sk)
+		curve25519.ScalarBaseMult(&peerPk, &peerSk)
+		pt := rb(n)
+		ct := box.Seal(nil, pt, &nonce, &peerPk, &sk)
+		var shared [32]byte
+		box.Precompute(&shared, &peerPk, &sk)
+		b.line("\t{ %q, %q, %q, %q, %q, %q, %q },",
+			fmt.Sprintf("box-%d-%d", i, n), h(sk[:]), h(peerPk[:]),
+			h(nonce[:]), h(pt), h(ct), h(shared[:]))
 	}
 	b.line("};")
 	b.line("")
