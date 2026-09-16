@@ -136,6 +136,7 @@ LIB_SRCS := \
 	src/crypto/aead.c \
 	src/crypto/salsa20.c \
 	src/crypto/random.c \
+	src/wg/noise.c \
 	src/derp/frame.c \
 	src/derp/client.c \
 	src/net/tls.c \
@@ -146,7 +147,7 @@ LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live
+.PHONY: all test clean check-fat fuzz interop live live-wg
 all: $(LIB_OBJS)
 
 $(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c
@@ -227,6 +228,15 @@ $(BUILD)/livederp: tests/livederp.c $(LIB_OBJS)
 
 live: $(BUILD)/livederp
 	./$(BUILD)/livederp $(LIVE_HOST)
+
+# Interop against a real wireguard-go device. Like `live`, this is kept out of
+# `make test`: it spawns a Go process and binds a UDP port.
+$(BUILD)/livewg: tests/livewg.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) tests/livewg.c $(LIB_OBJS) $(LDFLAGS) -o $@
+
+live-wg: $(BUILD)/livewg
+	sh scripts/live-wg.sh
 
 clean:
 	rm -rf $(BUILD)

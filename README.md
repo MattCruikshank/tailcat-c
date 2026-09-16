@@ -6,10 +6,11 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: in progress.** The address layer, the cryptography and the DERP
-relay client are done. tailcat-c connects to production Tailscale DERP relays
-and relays packets between peers today; the WireGuard tunnel that will run
-inside that is next. See [Roadmap](#roadmap).
+**Status: in progress.** The address layer, the cryptography, the DERP relay
+client and the WireGuard tunnel are done. tailcat-c connects to production
+Tailscale DERP relays, and its Noise IKpsk2 implementation interoperates with
+real wireguard-go. What remains is joining the two: the meow bootstrap, a
+userspace TCP, and the CLI. See [Roadmap](#roadmap).
 
 ## Why this is a big job
 
@@ -59,6 +60,7 @@ make test       # unit tests; also asserts every binary is a fat APE
 make fuzz       # fuzz/property tests under ASan + UBSan (host gcc)
 make interop    # cross-check against the real Go tailcat library
 make live       # connect to a real DERP relay and relay a packet (needs network)
+make live-wg    # handshake against a real wireguard-go device
 ```
 
 Mbed TLS is a pinned submodule, so `--recurse-submodules` matters; an
@@ -238,11 +240,30 @@ builtin with a default of `cc`, so `CC ?= $(COSMOCC)` is a no-op. The first
 quietly not happening. Fixed with `ifeq ($(origin CC),default)`, and `make
 test` now asserts every binary is a fat APE so it cannot regress unnoticed.
 
-The pattern is hard to miss: **four of the six came from running the same code
-through a second, stricter environment**, and the two crypto bugs came from
-comparing against a reference implementation rather than against my own
-expectations. Neither unit tests nor code review would have found most of
-these.
+**7. The interop harness mis-parsed hex.** *(M4.)* `sscanf("%2x")` did not
+honour the field width reliably, turning `0f` into `f9` in one byte of a key.
+The protocol code was correct; the scaffolding feeding it was not. It
+surfaced as `Received packet with invalid mac1` from wireguard-go, which
+points at the protocol and not at the test. Localising it needed a probe with
+the known-good bytes hard-coded, to prove BLAKE2s was innocent before hunting
+for the real cause.
+
+**8. The interop harness watched the wrong channel.** *(M4.)* wireguard-go's
+test TUN names its channels from the device's point of view, so packets the
+device receives arrive on `Inbound`; the harness waited on `Outbound` and saw
+nothing. Again the implementation was right and the test was wrong.
+
+The pattern is hard to miss: **four of the first six came from running the
+same code through a second, stricter environment**, and the two crypto bugs
+came from comparing against a reference implementation rather than against my
+own expectations. Neither unit tests nor code review would have found most of
+them.
+
+Bugs 7 and 8 are worth separating out, because they are the opposite failure:
+**the implementation was correct and the test harness was broken**, in both
+cases with a symptom that pointed squarely at the implementation. When an
+interop test fails, the scaffolding deserves as much suspicion as the code
+under test.
 
 ## Limitations
 
@@ -277,6 +298,23 @@ Current, and deliberate unless noted.
 - **The cipher suite list is trimmed** to what the config enables. A relay
   demanding something we did not compile in will fail the handshake rather
   than negotiate down.
+
+### WireGuard
+
+- **No rekeying.** A session uses one pair of keys for its whole life.
+  WireGuard normally rehandshakes every two minutes and after a message
+  count; tailcat-c refuses to send past `REJECT_AFTER_MESSAGES` rather than
+  reuse a nonce, but it will not renew the session for you.
+- **No cookie / DoS mitigation.** mac2 is always written as zero and never
+  checked. A peer that is not rate-limiting accepts this, which is why the
+  interop test passes, but a relay or peer under load that demands a cookie
+  will reject us. `tests/test_noise.c` asserts the mac2 tolerance explicitly
+  so the gap stays visible rather than merely absent.
+- **No initiation replay protection.** `tc_wg_consume_initiation` reports the
+  TAI64N timestamp but does not remember it; comparing it against the last
+  one seen from that peer is left to the caller, and no caller does that yet.
+- **No index table.** Handshake indices are random 32-bit values with no
+  check for collision, which is fine for one peer and would not be for many.
 
 ### Implementation
 
@@ -322,6 +360,10 @@ Current, and deliberate unless noted.
 
 Roughly in the order they should be picked up.
 
+- [ ] **Rekeying**, so a long-lived session renews its keys rather than
+      running until the counter limit.
+- [ ] **Initiation replay protection**: remember the last TAI64N timestamp
+      per peer and reject anything not strictly newer.
 - [ ] **Read/write timeouts** on the DERP stream. Currently the only bounded
       operation is the initial connect.
 - [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
@@ -351,8 +393,12 @@ Roughly in the order they should be picked up.
       against 121 compiled-in roots, the HTTP upgrade, the frame codec, the
       NaCl-box key exchange and the send/receive loop. Verified end to end
       against a production Tailscale relay by `make live`.
-- [ ] **M4 — WireGuard.** Noise IK handshake with the pre-shared key mixed
-      in, transport encryption, the replay window, rekeying.
+- [x] **M4 — WireGuard.** The Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s
+      handshake, transport encryption and the 2048-bit sliding replay window.
+      Verified against real wireguard-go by `make live-wg`, which completes a
+      handshake and gets an encrypted IPv4 packet delivered to its TUN.
+      Rekeying and the cookie/DoS exchange are not implemented; see
+      Limitations.
 - [ ] **M5 — meow bootstrap.** The 4-byte-magic ping/pong tailcat uses over
       DERP to introduce the two peers (see upstream `disco.go`).
 - [ ] **M6 — Minimal TCP.** A two-peer userspace TCP: state machine, RTO,
