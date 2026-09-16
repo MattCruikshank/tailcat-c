@@ -124,7 +124,8 @@ largest thing we add is the 181 KB CA bundle.
 | SSH *server* (`serve ssh`) | ❌ | ✅ |
 | `recv` (file drop box, receiving) | ❌ (needs SSH+SFTP) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
-| `browse`, `genkey`, `printpub`, `readme` | ❌ | ✅ |
+| `genkey`, `printpub` (saved identities) | ✅ | ✅ |
+| `browse`, `readme` | ❌ (not worth writing) | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
@@ -209,6 +210,7 @@ $ echo hello | tailcat-c <tc-address>      # pipe to a server
 $ tailcat-c serve 22,80,8000-8999          # proxy local ports
 $ tailcat-c forward <tc-addr> 18080:80     # reach its port 80 on ours
 $ tailcat-c socks <tc-addr> 1080           # or via a SOCKS5 proxy
+$ tailcat-c genkey --key default --region 301  # a stable address
 $ tailcat-c ssh <tc-addr> uptime           # via the system ssh
 $ tailcat-c ping <tc-address>              # time the round trip
 $ tailcat-c resolve <tc-address>           # embed the relay, for offline use
@@ -771,13 +773,24 @@ Roughly in the order they should be picked up.
       here has been tested through, and only the middle of it is ours:
       `ssh -> tailcat-c -> DERP -> WireGuard -> the Go tailcat's sshd`.
 
-Beyond here, see [PLAN.md](PLAN.md). What is left in Phase 3 is a file drop
-key management (`genkey`). `recv` turned out not to belong there at all: it is
-`serve --files <dir>:wo files`, and the `files` service is SFTP over SSH, so
-the *server* half needs PLAN.md's 5.4 and 5.5 rather than the ~300 lines that
-entry estimated. The *client* half already works -- `make live-recv` delivers
-a file into a real `tailcat recv` drop box -- because `cp` execs the system
-scp, which speaks exactly that protocol.
+- [x] **Phase 3.6 — saved identities.** `genkey`, `printpub` and `--key`, in
+      upstream's own `*.private.json` format. Without one, a server's address
+      changed on every restart, which made it useless in a script.
+      `make live-genkey` runs a key through both implementations in both
+      directions and requires the addresses they derive to be identical
+      strings — which is how it caught `serve` advertising the embedded
+      address form where upstream names a region by number.
+
+**Phases 1, 2 and 3 are done.** `recv` turned out not to belong to Phase 3 at
+all: it is `serve --files <dir>:wo files`, and the `files` service is SFTP
+over SSH, so the *server* half needs PLAN.md's 5.4 and 5.5 rather than the
+~300 lines that entry estimated. The *client* half already works — `make
+live-recv` delivers a file into a real `tailcat recv` drop box — because `cp`
+execs the system scp, which speaks exactly that protocol.
+
+Beyond here, see [PLAN.md](PLAN.md): Phase 4 is direct peer-to-peer paths, and
+everything left of upstream's command set (`recv`, `ls`, `serve ssh`) needs an
+SSH server first.
 
 ## Licence
 

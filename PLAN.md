@@ -269,15 +269,32 @@ The security concern the original entry raised is real and still applies, but
 it applies to 5.5: it is the SFTP server that would write attacker-named
 files.
 
-### 3.6 `genkey`, `printpub`, `browse` · ~200 lines · low risk
+### 3.6 `genkey`, `printpub` ✅ · 520 lines
 
-Persistent keys on disk (with sane permissions), printing a public key, and
-opening a browser. Mostly plumbing.
+Saved identities, in upstream's own `*.private.json` format, read and written
+byte for byte compatibly. Plus `--key` on every command that needs one.
 
-**Phase 3: 3.1 through 3.4 done (1,450 lines). Remaining: 3.6 only, ~200
-lines.** 3.5 turned out to belong to Phase 5; see above. Phase 3 is therefore
-nearly finished, and what is left of upstream's command set past 3.6 is
-gated on SSH.
+Not "mostly plumbing": the format is an interop surface, so it was determined
+by generating real keys with `tailcat genkey` and reading the bytes, and the
+tests round-trip those exact files. The derived fields (public key, disco key)
+are recomputed and compared rather than trusted, since a file naming different
+ones would produce an address nobody can reach.
+
+**`browse` is deliberately not done.** It is `forward 0:80` plus opening a
+URL, which is the only part of upstream's command set that does nothing a user
+cannot do in one line.
+
+This is also where `serve` was found to be advertising the wrong address form
+-- embedding the relay where upstream names a region by number -- so the same
+saved key produced different addresses on the two sides. `--full-address` now
+opts into the embedded form.
+
+**Phase 3 done: ~1,970 lines**, against an estimate of ~1,400 that did not
+include multi-client serving. 3.5 moved to Phase 5 and `browse` was judged not
+worth writing; everything else is finished.
+
+What remains of upstream's command set -- `recv`, `ls`, `serve ssh`,
+`serve files` -- is gated entirely on having an SSH server.
 
 ---
 
@@ -395,7 +412,7 @@ These are already in the README's TODO list and do not depend on any feature.
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
 | 2 — robust | ~1,390 ✅ | done |
-| 3 — commands | ~200 left (1,450 done) | low |
+| 3 — commands | ~1,970 ✅ | done |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
 | 5 — SSH + SFTP (incl. `recv`) | ~5,500 | high |
@@ -411,8 +428,8 @@ dangerous work is where a plausible-looking implementation is subtly wrong,
 and the defence is differential testing against the Go implementation plus a
 second, stricter toolchain.
 
-**Phases 1 and 2 are done.** Everything that made the tunnel unreliable
-rather than merely incomplete is closed.
+**Phases 1, 2 and 3 are done.** Everything that made the tunnel unreliable is
+closed, and every command that moves bytes is implemented.
 
 The next thing is **Phase 3**, which is now unblocked and mostly mechanical:
 `serve` with ports, `forward`, `socks` and the `ssh`/`cp` wrappers all wanted
