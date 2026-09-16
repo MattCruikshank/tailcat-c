@@ -70,6 +70,66 @@ paths can be added later without redesign.
 Out of scope for now: direct P2P/NAT traversal, the SSH server, SFTP, the
 SOCKS proxy, and the browser/WASM build.
 
+## How it compares
+
+### Size
+
+Both columns are release builds: upstream with its own `-s -w` and 75
+`ts_omit_*` tags from `.goreleaser.yaml`, ours stripped by cosmocc.
+
+| | tailcat-c | tailcat (Go) |
+|---|---:|---:|
+| binary | **1.67 MB** | 17.67 MB |
+| gzipped | **0.83 MB** | 6.77 MB |
+| files needed for 6 OSes × 2 arches | **1** | 12 |
+
+The ratio is about 10×, and **most of it is the feature gap below, not
+craftsmanship**. A Go binary also carries a runtime, a garbage collector and
+reflection metadata that a C program does not, which accounts for a good part
+of the rest. The interesting number is not 1.67 MB, it is that one file covers
+every target: our own protocol code is only ~35 KB of it, and the single
+largest thing we add is the 181 KB CA bundle.
+
+### Features
+
+| | tailcat-c | tailcat |
+|---|:--:|:--:|
+| **Data plane** | | |
+| WireGuard tunnel (Noise IKpsk2) | ✅ | ✅ |
+| Pre-shared key layer | ✅ | ✅ |
+| DERP relay transport | ✅ | ✅ |
+| Bring your own relay | ✅ | ✅ |
+| Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ❌ | ✅ |
+| Rekeying / session renewal | ❌ | ✅ |
+| Cookie reply (DoS mitigation) | ❌ | ✅ |
+| DERP map fetch + latency-based region choice | ❌ | ✅ |
+| Multiple concurrent connections | ❌ | ✅ |
+| UDP forwarding | ❌ | ✅ |
+| IPv4 into the tunnel via NAT64 | ❌ | ✅ |
+| TLS to the relay | 1.2 | 1.2 + 1.3 |
+| **Commands** | | |
+| pipe stdin/stdout to a server | ✅ | ✅ |
+| `serve` | one client, one connection | full |
+| `parse` | ✅ | ✅ (JSON) |
+| `version` | ✅ | ✅ |
+| `ping` | ❌ | ✅ |
+| `resolve` | ❌ | ✅ |
+| `forward` (local TCP port forwarding) | ❌ | ✅ |
+| `socks` (SOCKS5 proxy) | ❌ | ✅ |
+| `ssh` / `cp` / `ls` (SSH, SFTP, remote listing) | ❌ | ✅ |
+| `recv` (file drop box) | ❌ | ✅ |
+| `browse`, `genkey`, `printpub`, `readme` | ❌ | ✅ |
+| **Platforms** | | |
+| Linux, Windows | ✅ tested | ✅ |
+| macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
+| aarch64 | built, never executed | ✅ |
+| Browser (WebAssembly) | ❌ | ✅ |
+| Persistent keys on disk | ❌ | ✅ |
+
+So: tailcat-c does the **core data path** — address, relay, tunnel, TCP — in
+both roles and interoperably. Everything built *on top* of that data path is
+upstream's, and that is most of what a user actually reaches for.
+
 ## Build
 
 Requires the [cosmocc](https://github.com/jart/cosmopolitan) toolchain:
