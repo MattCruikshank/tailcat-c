@@ -32,6 +32,7 @@
 #include "tc/tailcat.h"
 #include "tc/fwdspec.h"
 #include "tc/portset.h"
+#include "tc/shquote.h"
 #include "tc/proxy.h"
 #include "tc/tcpmux.h"
 
@@ -45,7 +46,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define TAILCAT_C_VERSION "0.1.0"
@@ -87,8 +90,14 @@ static void usage(FILE *f)
 	        "22,80,8000-8999 or all\n"
 	        "  tailcat-c forward <tc-addr> <maps>      forward local ports, "
 	        "e.g. 8080 or 18080:8080\n"
-	        "  tailcat-c socks <tc-addr> [port]        SOCKS5 proxy that "
-	        "dials the server\n"
+	        "  tailcat-c socks <tc-addr> [port] [-- cmd...]\n"
+	        "                                          SOCKS5 proxy; with a "
+	        "command, runs it with\n"
+	        "                                          all_proxy set and "
+	        "exits when it does\n"
+	        "  tailcat-c ssh [-p PORT] [user@]<tc-addr> [cmd...]\n"
+	        "  tailcat-c cp [-r] <src>... <dst>        copy via scp, paths as "
+	        "<tc-addr>:path\n"
 	        "  tailcat-c ping <tc-address>             time the round trip to "
 	        "a server\n"
 	        "  tailcat-c resolve <tc-address>          embed the relay, for "
@@ -103,6 +112,7 @@ static void usage(FILE *f)
 	        "choosing one\n"
 	        "      --bind ADDR       listen address for forward and socks "
 	        "(default 127.0.0.1)\n"
+	        "  -p, PORT              server port for ssh and cp (default 22)\n"
 	        "      --derpmap-url URL where to fetch the relay list\n"
 	        "      --timeout SEC     give up after SEC seconds (default 60; "
 	        "0 = never, for serve <ports>)\n"
@@ -1519,12 +1529,28 @@ static int socks_handshake(int fd, uint16_t *out_port)
 /* ---- the shared listen-and-dial loop ----------------------------------- */
 
 static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
-                         tc_proxy *proxy, bool socks, uint64_t deadline)
+                         tc_proxy *proxy, bool socks, pid_t child,
+                         uint64_t deadline)
 {
 	tc_derp_set_read_timeout(&cl->derp, 20);
 
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
+
+		/* With a child command, the proxy exists for its lifetime and no
+		 * longer: `socks <addr> -- curl ...` should exit when curl does,
+		 * with curl's status, rather than leaving a proxy behind. */
+		if (child > 0) {
+			int wstatus = 0;
+			pid_t got = waitpid(child, &wstatus, WNOHANG);
+			if (got == child) {
+				if (WIFEXITED(wstatus))
+					return WEXITSTATUS(wstatus);
+				return 1;
+			}
+			if (got < 0 && errno != EINTR)
+				return 1;
+		}
 
 		if (cl->ctx.relay_stalled) {
 			cl->ctx.relay_stalled = false;
@@ -1668,9 +1694,38 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 
 /* cmd_forward_or_socks runs both commands: they differ only in where the
  * listeners come from and whether each connection negotiates its own port. */
+/* spawn_with_proxy starts a child with all_proxy pointing at our listener.
+ *
+ * That environment variable is what curl, and much else, reads to find a
+ * SOCKS proxy, so a command run this way goes through the tunnel without
+ * knowing anything about tailcat. */
+static pid_t spawn_with_proxy(const char *const *argv, const char *bind_addr,
+                              uint16_t port)
+{
+	char proxy[128];
+	(void)snprintf(proxy, sizeof proxy, "socks5h://%s:%u", bind_addr,
+	               (unsigned)port);
+
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid > 0)
+		return pid;
+
+	/* Child. Both spellings: tools disagree about the case, and setting one
+	 * without the other works until you meet a tool that reads the other. */
+	(void)setenv("all_proxy", proxy, 1);
+	(void)setenv("ALL_PROXY", proxy, 1);
+	execvp(argv[0], (char *const *)(uintptr_t)argv);
+	fprintf(stderr, "tailcat-c: could not run %s: %s\n", argv[0],
+	        strerror(errno));
+	_exit(127);
+}
+
 static int cmd_forward_or_socks(const char *addr_str, const char **specs,
                                 size_t nspecs, const char *bind_addr,
-                                bool socks, bool insecure, unsigned timeout_s,
+                                bool socks, const char *const *child_argv,
+                                bool insecure, unsigned timeout_s,
                                 const char *derpmap_url)
 {
 	static tc_client cl;
@@ -1737,6 +1792,7 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	fflush(stderr);
 
 	int status = 1;
+	pid_t child = 0;
 	tc_proxy *proxy = NULL;
 	if (client_up(&cl, addr_str, insecure, derpmap_url,
 	              now_ms() + 60000) != TC_OK)
@@ -1748,7 +1804,25 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 		goto out;
 	}
 
-	status = run_listeners(&cl, ls, nls, proxy, socks, deadline);
+	/* The child starts only once the tunnel is up, so it cannot race ahead
+	 * and get a connection refused from a proxy that is not ready. */
+	if (child_argv != NULL) {
+		child = spawn_with_proxy(child_argv, bind_addr, ls[0].local_port);
+		if (child < 0) {
+			fprintf(stderr, "tailcat-c: could not start the command\n");
+			goto out;
+		}
+	}
+
+	status = run_listeners(&cl, ls, nls, proxy, socks, child, deadline);
+
+	if (child > 0) {
+		/* If the loop ended for its own reasons, the child outlives its
+		 * proxy and would hang on a connection that can no longer be
+		 * served. */
+		(void)kill(child, SIGTERM);
+		(void)waitpid(child, NULL, 0);
+	}
 
 out:
 	/* Order matters: the proxy refers to connections the mux owns. */
@@ -1757,6 +1831,241 @@ out:
 	for (size_t i = 0; i < nls; i++)
 		(void)close(ls[i].fd);
 	return status;
+}
+
+/* ---- ssh and cp: handing the connection to a real client --------------- */
+
+/* These do not implement SSH. They exec the system ssh or scp with a
+ * ProxyCommand that runs this program in pipe mode, exactly as upstream does,
+ * so the real client does the protocol and this only carries the bytes. That
+ * is why they are a hundred lines rather than five thousand -- and why they
+ * get the user's own ssh configuration, agent, and known_hosts behaviour for
+ * free.
+ */
+
+/* self_path finds this executable, for naming in the ProxyCommand.
+ *
+ * argv[0] is not enough on its own: a program found through PATH gets a bare
+ * name, and ssh runs the ProxyCommand through a shell whose PATH may differ.
+ * /proc/self/exe is exact where it exists; otherwise argv[0] is used, and a
+ * bare name is left for the shell to resolve as the user's own PATH would. */
+static const char *self_path(const char *argv0)
+{
+	static char buf[1024];
+#ifdef __linux__
+	ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+	if (n > 0) {
+		buf[n] = '\0';
+		return buf;
+	}
+#endif
+	if (argv0 != NULL && argv0[0] != '\0') {
+		(void)snprintf(buf, sizeof buf, "%s", argv0);
+		return buf;
+	}
+	return "tailcat-c";
+}
+
+/* on_windows reports whether the ProxyCommand will be run by cmd.exe.
+ *
+ * A fat APE runs on six operating systems from one file, so this cannot be
+ * decided at compile time the way upstream's runtime.GOOS is. */
+static bool on_windows(void)
+{
+	/* Windows is the only target where this is set, and Cosmopolitan passes
+	 * the host environment through. */
+	return getenv("SYSTEMROOT") != NULL || getenv("SystemRoot") != NULL;
+}
+
+/* find_in_path resolves a program name the way a shell would. */
+static bool find_in_path(const char *name, char *out, size_t cap)
+{
+	if (strchr(name, '/') != NULL) {
+		(void)snprintf(out, cap, "%s", name);
+		return access(out, X_OK) == 0;
+	}
+	const char *path = getenv("PATH");
+	if (path == NULL)
+		path = "/usr/bin:/bin";
+	while (*path != '\0') {
+		const char *sep = strchr(path, ':');
+		size_t len = (sep != NULL) ? (size_t)(sep - path) : strlen(path);
+		if (len > 0 && len < cap) {
+			int n = snprintf(out, cap, "%.*s/%s", (int)len, path, name);
+			if (n > 0 && (size_t)n < cap && access(out, X_OK) == 0)
+				return true;
+		}
+		if (sep == NULL)
+			break;
+		path = sep + 1;
+	}
+	return false;
+}
+
+/* build_proxy_command assembles the command ssh will run for us. */
+static int build_proxy_command(char *out, size_t cap, const char *self,
+                               const char *addr, const char *port,
+                               const char *derpmap_url, bool insecure)
+{
+	const char *args[8];
+	size_t n = 0;
+	char urlarg[512];
+
+	args[n++] = self;
+	if (derpmap_url != NULL) {
+		(void)snprintf(urlarg, sizeof urlarg, "--derpmap-url=%s",
+		               derpmap_url);
+		args[n++] = urlarg;
+	}
+	if (insecure)
+		args[n++] = "--insecure";
+	args[n++] = addr;
+	args[n++] = port;
+
+	int rc = tc_proxycmd_join(out, cap, args, n, on_windows());
+	if (rc == TC_ERR_INVAL)
+		fprintf(stderr, "tailcat-c: this program's path cannot be passed "
+		                "safely to ssh as a ProxyCommand\n");
+	return rc;
+}
+
+/* cmd_ssh_or_cp execs the system ssh or scp.
+ *
+ * Nothing is validated about the extra arguments: they are the user's own,
+ * handed to their own ssh, and this process is replaced rather than
+ * interpreting them. */
+static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
+                         size_t nargs, const char *port, bool insecure,
+                         const char *derpmap_url)
+{
+	const char *tool = is_cp ? "scp" : "ssh";
+	char toolpath[1024];
+	if (!find_in_path(tool, toolpath, sizeof toolpath)) {
+		fprintf(stderr, "tailcat-c: no %s found in $PATH\n", tool);
+		return 1;
+	}
+
+	/* The address is the first argument for ssh. For cp it is embedded in
+	 * whichever operands look like <addr>:path. */
+	const char *addr = NULL;
+	if (!is_cp) {
+		if (nargs < 1) {
+			fprintf(stderr, "tailcat-c: ssh needs an address\n");
+			return 2;
+		}
+		addr = args[0];
+	} else {
+		for (size_t i = 0; i < nargs && addr == NULL; i++) {
+			const char *colon = strchr(args[i], ':');
+			if (colon != NULL && colon - args[i] > 2 &&
+			    strncmp(args[i], "tc", 2) == 0) {
+				static char buf[TC_ADDR_STR_MAX];
+				size_t len = (size_t)(colon - args[i]);
+				if (len >= sizeof buf) {
+					fprintf(stderr, "tailcat-c: address too long\n");
+					return 2;
+				}
+				memcpy(buf, args[i], len);
+				buf[len] = '\0';
+				addr = buf;
+			}
+		}
+		if (addr == NULL) {
+			fprintf(stderr, "tailcat-c: cp needs one operand of the form "
+			                "<tc-address>:path\n");
+			return 2;
+		}
+	}
+
+	/* A user@ prefix belongs to ssh, not to the address. */
+	const char *user = NULL;
+	static char userbuf[256];
+	const char *at = strchr(addr, '@');
+	if (at != NULL) {
+		size_t len = (size_t)(at - addr);
+		if (len < sizeof userbuf) {
+			memcpy(userbuf, addr, len);
+			userbuf[len] = '\0';
+			user = userbuf;
+		}
+		addr = at + 1;
+	}
+
+	char dest[64];
+	if (tc_ssh_dest_host(dest, sizeof dest, addr) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not name the destination\n");
+		return 1;
+	}
+
+	char proxy[2048];
+	if (build_proxy_command(proxy, sizeof proxy, self_path(argv0), addr, port,
+	                        derpmap_url, insecure) != TC_OK)
+		return 1;
+
+	char proxyopt[2100];
+	(void)snprintf(proxyopt, sizeof proxyopt, "ProxyCommand=%s", proxy);
+
+	/* Host key checking is off because the destination name is a hash of the
+	 * address, not a host anyone has a key for, and the address itself
+	 * already authenticates the server: reaching it at all required the
+	 * pre-shared key and the server's public key. A known_hosts entry keyed
+	 * on a synthetic name would add a prompt and no security. */
+	const char *fixed[] = {
+		toolpath,
+		"-o", "UpdateHostKeys no",
+		"-o", "StrictHostKeyChecking no",
+		"-o", "UserKnownHostsFile /dev/null",
+		"-o", "LogLevel ERROR",
+		"-o", proxyopt,
+	};
+
+	char *argv[64];
+	size_t n = 0;
+	for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++)
+		argv[n++] = (char *)(uintptr_t)fixed[i];
+
+	static char operands[16][TC_ADDR_STR_MAX + 256];
+	size_t nops = 0;
+
+	if (!is_cp) {
+		char withuser[320];
+		if (user != NULL) {
+			(void)snprintf(withuser, sizeof withuser, "%s@%s", user, dest);
+			(void)snprintf(operands[nops], sizeof operands[0], "%s",
+			               withuser);
+		} else {
+			(void)snprintf(operands[nops], sizeof operands[0], "%s", dest);
+		}
+		argv[n++] = (char *)(uintptr_t) "--";
+		argv[n++] = operands[nops];
+		nops++;
+		/* Anything after the address goes to ssh untouched: a remote command,
+		 * more flags, whatever the user meant. */
+		for (size_t i = 1; i < nargs && n < 60; i++)
+			argv[n++] = (char *)(uintptr_t)args[i];
+	} else {
+		argv[n++] = (char *)(uintptr_t) "--";
+		for (size_t i = 0; i < nargs && n < 60 && nops < 16; i++) {
+			const char *colon = strchr(args[i], ':');
+			if (colon != NULL && strncmp(args[i], "tc", 2) == 0) {
+				/* Rewrite <addr>:path into <short-host>:path, so scp gets a
+				 * name short enough for its own bookkeeping. */
+				(void)snprintf(operands[nops], sizeof operands[0], "%s%s",
+				               dest, colon);
+				argv[n++] = operands[nops];
+				nops++;
+			} else {
+				argv[n++] = (char *)(uintptr_t)args[i];
+			}
+		}
+	}
+	argv[n] = NULL;
+
+	vlogf("exec %s with ProxyCommand=%s", toolpath, proxy);
+	execv(toolpath, argv);
+	fprintf(stderr, "tailcat-c: could not run %s: %s\n", toolpath,
+	        strerror(errno));
+	return 1;
 }
 
 /* ---- serve mode ------------------------------------------------------- */
@@ -2021,11 +2330,26 @@ int main(int argc, char **argv)
 	 * consequences -- anyone who can reach this machine can then reach the
 	 * server through it -- so it has to be asked for. */
 	const char *bind_addr = "127.0.0.1";
+	/* The server port ssh and cp reach through the tunnel. */
+	const char *ssh_port = "22";
 	/* Room for a subcommand plus several port specs: upstream allows the
 	 * list to be spread over arguments, as in `serve 80,443 8000-8999`. */
 	const char *args[16];
 	size_t nargs = 0;
 	memset(args, 0, sizeof args);
+
+	/* Everything after a bare `--` is a command for socks to run, not
+	 * arguments for us. Split it off before parsing anything, so a flag
+	 * meant for the child is never claimed here. */
+	const char *const *child_argv = NULL;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--") == 0) {
+			if (i + 1 < argc)
+				child_argv = (const char *const *)&argv[i + 1];
+			argc = i;
+			break;
+		}
+	}
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -2035,6 +2359,8 @@ int main(int argc, char **argv)
 			insecure = true;
 		} else if (strcmp(a, "--relay") == 0 && i + 1 < argc) {
 			relay = argv[++i];
+		} else if (strcmp(a, "-p") == 0 && i + 1 < argc) {
+			ssh_port = argv[++i];
 		} else if (strcmp(a, "--bind") == 0 && i + 1 < argc) {
 			bind_addr = argv[++i];
 		} else if (strcmp(a, "--derpmap-url") == 0 && i + 1 < argc) {
@@ -2068,6 +2394,11 @@ int main(int argc, char **argv)
 	if (timeout_s == 0 && strcmp(args[0], "serve") != 0 &&
 	    strcmp(args[0], "forward") != 0 && strcmp(args[0], "socks") != 0)
 		timeout_s = 60;
+
+	/* ssh and cp pass everything after their own arguments straight through,
+	 * including things that look like our flags, so they take the tail of
+	 * argv rather than the parsed list. Re-scan for them before anything
+	 * else claims a flag that was meant for ssh. */
 	if (strcmp(args[0], "version") == 0) {
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);
 		return 0;
@@ -2123,7 +2454,7 @@ int main(int argc, char **argv)
 			return 2;
 		}
 		return cmd_forward_or_socks(args[1], &args[2], nargs - 2, bind_addr,
-		                            false, insecure,
+		                            false, NULL, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url);
 	}
@@ -2134,9 +2465,26 @@ int main(int argc, char **argv)
 		}
 		return cmd_forward_or_socks(args[1], nargs >= 3 ? &args[2] : NULL,
 		                            nargs >= 3 ? nargs - 2 : 0, bind_addr,
-		                            true, insecure,
+		                            true, child_argv, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url);
+	}
+	if (strcmp(args[0], "ssh") == 0) {
+		if (nargs < 2) {
+			fprintf(stderr, "tailcat-c: ssh needs an address\n");
+			return 2;
+		}
+		return cmd_ssh_or_cp(false, argv[0], &args[1], nargs - 1, ssh_port,
+		                     insecure, derpmap_url);
+	}
+	if (strcmp(args[0], "cp") == 0) {
+		if (nargs < 3) {
+			fprintf(stderr, "tailcat-c: cp needs a source and a "
+			                "destination\n");
+			return 2;
+		}
+		return cmd_ssh_or_cp(true, argv[0], &args[1], nargs - 1, ssh_port,
+		                     insecure, derpmap_url);
 	}
 	if (strcmp(args[0], "parse") == 0) {
 		if (nargs < 2) {

@@ -132,26 +132,9 @@ done
 grep -E '^# SOCKS5' "$WORK/socks.log" | sed 's/^/    /'
 
 MSG2="through the socks proxy"
-RESP2=$(printf '%s\n' "$MSG2" | timeout 40 python3 -c '
-import socket,sys,struct
-s=socket.create_connection(("127.0.0.1", '"$SOCKSPORT"'), timeout=30)
-s.sendall(b"\x05\x01\x00")
-assert s.recv(2) == b"\x05\x00", "greeting refused"
-# CONNECT to example.invalid:PORT -- the host is ignored, only the port is
-# used, because there is exactly one place this proxy can go.
-host=b"example.invalid"
-s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host +
-          struct.pack("!H", '"$SVCPORT"'))
-rep=s.recv(10)
-assert rep[0:2] == b"\x05\x00", "connect refused: %r" % rep
-s.sendall(sys.stdin.buffer.read()); s.shutdown(socket.SHUT_WR)
-out=b""
-while True:
-    b=s.recv(4096)
-    if not b: break
-    out+=b
-sys.stdout.write(out.decode("utf-8","replace"))
-' 2>"$WORK/socks-client.err" || true)
+RESP2=$(printf '%s\n' "$MSG2" |
+	timeout 40 python3 scripts/socks-client.py "$SOCKSPORT" "$SVCPORT" \
+	    2>"$WORK/socks-client.err" || true)
 
 echo "    got: $RESP2"
 if ! printf '%s' "$RESP2" | grep -qF "service-said: $MSG2"; then
@@ -163,6 +146,28 @@ if ! printf '%s' "$RESP2" | grep -qF "service-said: $MSG2"; then
 	exit 1
 fi
 
+kill "$SOCKS_PID" 2>/dev/null || true
+SOCKS_PID=""
+
+# ---- socks with a child command ------------------------------------------
+# The proxy exists for the child's lifetime and no longer, and the child finds
+# it through all_proxy without knowing anything about tailcat -- which is how
+# curl and most other tools would use this.
+echo
+echo "\$ tailcat-c socks <addr> $SOCKSPORT -- <client reading all_proxy>"
+CHILD_OUT=$(printf 'via all_proxy\n' |
+	timeout 90 "$CLI" socks "$ADDR" "$SOCKSPORT" -- \
+	    python3 scripts/socks-client.py --from-env "$SVCPORT" \
+	    2>"$WORK/child.err" || true)
+echo "    got: $CHILD_OUT"
+if ! printf '%s' "$CHILD_OUT" | grep -qF "service-said: via all_proxy"; then
+	echo >&2
+	echo "live-forward: the child command did not reach the service." >&2
+	sed 's/^/    /' "$WORK/child.err" >&2
+	exit 1
+fi
+
 echo
 echo "ok   live-forward             forward and socks both carried a local"
-echo "                              client to a real Go tailcat server"
+echo "                              client to a real Go tailcat server,"
+echo "                              including a child run with all_proxy"
