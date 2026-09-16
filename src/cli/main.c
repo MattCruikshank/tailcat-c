@@ -28,7 +28,7 @@
 #include "tc/crypto.h"
 #include "tc/derp.h"
 #include "tc/derpmap.h"
-#include "tc/noise.h"
+#include "tc/wgpeer.h"
 #include "tc/tailcat.h"
 #include "tc/tcpmux.h"
 
@@ -331,20 +331,30 @@ static int cmd_ping(const char *addr_str, bool insecure, unsigned timeout_s,
 
 typedef struct {
 	tc_derp_client *derp;
-	tc_wg_session *sess;
+	tc_wg_peer *peer;
 	uint8_t server_key[32];
 } pump;
+
+/* wg_out is how the WireGuard layer reaches the wire: everything it emits --
+ * transport packets, handshakes, keepalives -- goes to the relay addressed to
+ * the peer's node key. */
+static int wg_out(void *vctx, const uint8_t *pkt, size_t len)
+{
+	pump *p = (pump *)vctx;
+	/* A failed relay write is packet loss, which both WireGuard and TCP above
+	 * already handle by retrying. */
+	(void)tc_derp_send(p->derp, p->server_key, pkt, len);
+	return TC_OK;
+}
 
 static int tcp_out(void *vctx, const uint8_t *ip_pkt, size_t len)
 {
 	pump *p = (pump *)vctx;
-	uint8_t wg[TC_DERP_MAX_PACKET_SIZE];
-	size_t wg_len = 0;
-
-	if (tc_wg_encrypt(wg, sizeof wg, &wg_len, p->sess, ip_pkt, len) != TC_OK)
-		return TC_ERR_INVAL;
-	/* A failed relay write is packet loss; TCP will retransmit. */
-	(void)tc_derp_send(p->derp, p->server_key, wg, wg_len);
+	/* TC_ERR_AGAIN means a rekey is in progress and there is no session to
+	 * send under. That is ordinary packet loss as far as TCP is concerned,
+	 * and TCP is the thing that knows how to retransmit -- so it is reported
+	 * as success and the segment is simply dropped. */
+	(void)tc_wg_peer_send(p->peer, ip_pkt, len, now_ms());
 	return TC_OK;
 }
 
@@ -377,7 +387,7 @@ static bool write_all(int fd, const uint8_t *p, size_t n)
  * listener accepts. Routing a lone connection through the mux costs one array
  * scan per packet and means the dispatch path is the one exercised by every
  * live run, rather than only by its own tests. */
-static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
+static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
                     tc_tcp_mux *mux, tc_tcp_conn *tcp,
                     const uint8_t peer_key[32], uint64_t deadline)
 {
@@ -395,6 +405,9 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
 		bool progress = false;
+		/* The WireGuard timers run first: a session that has reached its
+		 * rekey age must start renewing before TCP tries to send under it. */
+		tc_wg_peer_tick(peer, t);
 		tc_tcp_mux_tick(mux, t);
 
 		/* Serving: the connection arrives rather than being dialled. Only
@@ -482,6 +495,9 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 
 			int wait_ms = 20;
 			uint64_t dl = tc_tcp_mux_next_deadline(mux);
+			uint64_t wdl = tc_wg_peer_next_deadline(peer);
+			if (wdl < dl)
+				dl = wdl;
 			if (dl != UINT64_MAX) {
 				uint64_t nowv = now_ms();
 				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
@@ -506,20 +522,42 @@ static int run_pipe(tc_derp_client *derp, tc_wg_session *sess,
 		}
 		if (memcmp(src, peer_key, 32) != 0 || len == 0)
 			continue;
-		if (buf[0] != TC_WG_MSG_TRANSPORT)
-			continue;
 
+		/* Every WireGuard message goes here, not just transport packets:
+		 * a rekey initiation from the peer arrives on this same path and
+		 * has to be answered, or the tunnel dies when the session ages
+		 * out. */
 		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
 		size_t inner_len = 0;
-		if (tc_wg_decrypt(inner, sizeof inner, &inner_len, sess, buf, len) !=
-		    TC_OK)
-			continue; /* forged, replayed, or a rekey we do not implement */
+		if (tc_wg_peer_input(peer, buf, len, inner, sizeof inner, &inner_len,
+		                     now_ms()) != TC_OK)
+			continue;
 		if (inner_len == 0)
-			continue; /* keepalive */
+			continue; /* a handshake, a keepalive, or something rejected */
 		tc_tcp_mux_input(mux, inner, inner_len, now_ms());
 	}
 
 	return 1;
+}
+
+/* log_wg_summary reports what the session lifetime machinery actually did.
+ * A long-lived run is the only place rekeying is visible, and without this
+ * there is no way for a test to tell a tunnel that renewed itself from one
+ * the peer renewed on its behalf -- both look like "it still works". */
+static void log_wg_summary(const tc_wg_peer *peer)
+{
+	if (!g_verbose)
+		return;
+	tc_wg_peer_stats st;
+	tc_wg_peer_get_stats(peer, &st);
+	vlogf("wg: initiated=%llu responded=%llu rekeys=%llu retried=%llu "
+	      "keepalives=%llu on-previous=%llu",
+	      (unsigned long long)st.handshakes_initiated,
+	      (unsigned long long)st.handshakes_responded,
+	      (unsigned long long)st.rekeys,
+	      (unsigned long long)st.handshakes_retried,
+	      (unsigned long long)st.keepalives_sent,
+	      (unsigned long long)st.recv_on_previous);
 }
 
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
@@ -564,8 +602,10 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	int status = 1;
 	tc_tcp_conn *tcp = NULL;
 	tc_tcp_mux *mux = NULL;
-	tc_wg_session sess;
-	memset(&sess, 0, sizeof sess);
+	tc_wg_peer peer;
+	memset(&peer, 0, sizeof peer);
+	pump ctx;
+	memset(&ctx, 0, sizeof ctx);
 
 	/* ---- meow: ask the server to add us as a peer ---------------------- */
 
@@ -609,30 +649,26 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 
 	/* ---- WireGuard ----------------------------------------------------- */
 
-	tc_wg_handshake hs;
-	if (tc_wg_handshake_init(&hs, &me, ci.server_public,
-	                         ci.has_preshared_key ? ci.preshared_key : NULL) !=
-	    TC_OK) {
+	ctx.derp = &derp;
+	memcpy(ctx.server_key, ci.server_public, 32);
+	if (tc_wg_peer_init(&peer, &me, ci.server_public,
+	                    ci.has_preshared_key ? ci.preshared_key : NULL, wg_out,
+	                    &ctx) != TC_OK) {
 		fprintf(stderr, "tailcat-c: handshake setup failed\n");
 		goto out;
 	}
-	uint8_t init[TC_WG_INITIATION_SIZE];
-	if (tc_wg_create_initiation(init, &hs, &me, 0) != TC_OK) {
+	ctx.peer = &peer;
+
+	if (tc_wg_peer_start_handshake(&peer, now_ms()) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not build the handshake\n");
 		goto out;
 	}
 
-	bool up = false;
-	next_send = 0;
-	while (!up && now_ms() < deadline) {
-		if (now_ms() >= next_send) {
-			if (tc_derp_send(&derp, ci.server_public, init, sizeof init) !=
-			    TC_OK) {
-				fprintf(stderr, "tailcat-c: relay send failed\n");
-				goto out;
-			}
-			next_send = now_ms() + 1000;
-		}
+	/* The peer owns the retry schedule from here; this loop only feeds it
+	 * packets and the clock. */
+	while (!tc_wg_peer_is_up(&peer, now_ms()) && now_ms() < deadline) {
+		tc_wg_peer_tick(&peer, now_ms());
+
 		uint8_t src[32];
 		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 		size_t len = 0;
@@ -645,21 +681,13 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 		}
 		if (memcmp(src, ci.server_public, 32) != 0)
 			continue;
-		if (len != TC_WG_RESPONSE_SIZE || buf[0] != TC_WG_MSG_RESPONSE)
-			continue;
-		if (tc_wg_consume_response(&hs, &me, buf) != TC_OK) {
-			fprintf(stderr, "tailcat-c: the handshake response did not "
-			                "verify\n");
-			goto out;
-		}
-		up = true;
+		size_t ignored = 0;
+		static uint8_t scratch[TC_DERP_MAX_PACKET_SIZE];
+		(void)tc_wg_peer_input(&peer, buf, len, scratch, sizeof scratch,
+		                       &ignored, now_ms());
 	}
-	if (!up) {
+	if (!tc_wg_peer_is_up(&peer, now_ms())) {
 		fprintf(stderr, "tailcat-c: no handshake response from the server\n");
-		goto out;
-	}
-	if (tc_wg_begin_session(&sess, &hs) != TC_OK) {
-		fprintf(stderr, "tailcat-c: could not derive session keys\n");
 		goto out;
 	}
 	vlogf("tunnel up");
@@ -669,11 +697,6 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	uint8_t our_ip[TC_TUNNEL_ADDR_LEN], their_ip[TC_TUNNEL_ADDR_LEN];
 	tc_tunnel_addr_for_key(our_ip, me.public_key);
 	tc_tunnel_addr_for_key(their_ip, ci.server_public);
-
-	pump ctx;
-	ctx.derp = &derp;
-	ctx.sess = &sess;
-	memcpy(ctx.server_key, ci.server_public, 32);
 
 	mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &ctx);
 	if (mux == NULL) {
@@ -687,7 +710,7 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	vlogf("connecting to port %u from %u", (unsigned)port,
 	      (unsigned)tc_tcp_local_port(tcp));
 
-	status = run_pipe(&derp, &sess, mux, tcp, ci.server_public, deadline);
+	status = run_pipe(&derp, &peer, mux, tcp, ci.server_public, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
@@ -695,7 +718,8 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 out:
 	/* The mux owns every connection it handed out. */
 	tc_tcp_mux_free(mux);
-	tc_wg_session_clear(&sess);
+	log_wg_summary(&peer);
+	tc_wg_peer_clear(&peer);
 	tc_derp_close(&derp);
 	return status;
 }
@@ -774,13 +798,14 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 
 	int status = 1;
 	tc_tcp_mux *mux = NULL;
-	tc_wg_session sess;
-	memset(&sess, 0, sizeof sess);
+	tc_wg_peer peer;
+	memset(&peer, 0, sizeof peer);
+	pump ctx;
+	memset(&ctx, 0, sizeof ctx);
 
 	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
 	uint8_t client_key[32];
 	bool have_client = false;
-	tc_wg_handshake hs;
 	bool up = false;
 
 	/* Wait for a client to introduce itself, then answer its handshake. Both
@@ -822,28 +847,31 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 
 		if (!have_client || memcmp(src, client_key, 32) != 0)
 			continue;
-		if (len != TC_WG_INITIATION_SIZE || buf[0] != TC_WG_MSG_INITIATION)
-			continue;
 
-		if (tc_wg_handshake_init(&hs, &me, client_key, ci.preshared_key) !=
-		    TC_OK)
-			continue;
-		if (tc_wg_consume_initiation(&hs, &me, buf, NULL, NULL) != TC_OK) {
-			vlogf("rejected a handshake initiation");
-			continue;
+		/* The peer object cannot exist before the meow tells us who the
+		 * client is, so it is built on first contact and reused for every
+		 * handshake after -- including the rekeys, which is the whole
+		 * point of keeping it. */
+		if (ctx.peer == NULL) {
+			ctx.derp = &derp;
+			memcpy(ctx.server_key, client_key, 32);
+			if (tc_wg_peer_init(&peer, &me, client_key, ci.preshared_key,
+			                    wg_out, &ctx) != TC_OK) {
+				fprintf(stderr, "tailcat-c: handshake setup failed\n");
+				goto out;
+			}
+			ctx.peer = &peer;
 		}
-		uint8_t resp[TC_WG_RESPONSE_SIZE];
-		if (tc_wg_create_response(resp, &hs, &me, 0) != TC_OK)
-			continue;
-		if (tc_derp_send(&derp, client_key, resp, sizeof resp) != TC_OK) {
-			fprintf(stderr, "tailcat-c: relay send failed\n");
-			goto out;
-		}
-		if (tc_wg_begin_session(&sess, &hs) != TC_OK) {
-			fprintf(stderr, "tailcat-c: could not derive session keys\n");
-			goto out;
-		}
-		up = true;
+
+		size_t ignored = 0;
+		static uint8_t scratch[TC_DERP_MAX_PACKET_SIZE];
+		(void)tc_wg_peer_input(&peer, buf, len, scratch, sizeof scratch,
+		                       &ignored, now_ms());
+		/* A responder holds its new keys in `next` until the client sends
+		 * data under them, so "up" here means the handshake was answered,
+		 * not that we can transmit yet. */
+		if (tc_wg_peer_has_keys(&peer, now_ms()))
+			up = true;
 	}
 
 	if (!up) {
@@ -855,11 +883,6 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 	uint8_t our_ip[TC_TUNNEL_ADDR_LEN], their_ip[TC_TUNNEL_ADDR_LEN];
 	tc_tunnel_addr_for_key(our_ip, me.public_key);
 	tc_tunnel_addr_for_key(their_ip, client_key);
-
-	pump ctx;
-	ctx.derp = &derp;
-	ctx.sess = &sess;
-	memcpy(ctx.server_key, client_key, 32);
 
 	mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &ctx);
 	if (mux == NULL) {
@@ -873,7 +896,7 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 	vlogf("listening on port %u inside the tunnel", (unsigned)port);
 
 	/* The connection is accepted inside the loop, so NULL here. */
-	status = run_pipe(&derp, &sess, mux, NULL, client_key, deadline);
+	status = run_pipe(&derp, &peer, mux, NULL, client_key, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
@@ -881,7 +904,8 @@ static int cmd_serve(const char *relay_host, uint16_t port, bool insecure,
 out:
 	/* The mux owns every connection it handed out. */
 	tc_tcp_mux_free(mux);
-	tc_wg_session_clear(&sess);
+	log_wg_summary(&peer);
+	tc_wg_peer_clear(&peer);
 	tc_derp_close(&derp);
 	return status;
 }

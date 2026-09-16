@@ -155,6 +155,7 @@ LIB_SRCS := \
 	src/crypto/salsa20.c \
 	src/crypto/random.c \
 	src/wg/noise.c \
+	src/wg/peer.c \
 	src/tailcat/meow.c \
 	src/derp/frame.c \
 	src/derp/client.c \
@@ -172,7 +173,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -279,6 +280,12 @@ live-cli: $(CLI)
 # check that covers the passive open and the listener.
 live-serve: $(CLI)
 	CLI=$(CLI) sh scripts/live-serve.sh
+
+# Slow on purpose: about six minutes, because it holds one session across
+# WireGuard's 120-second rekey and 180-second expiry against the real Go
+# server. Nothing faster can prove that rekeying interoperates.
+live-rekey: $(CLI)
+	CLI=$(CLI) sh scripts/live-rekey.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh

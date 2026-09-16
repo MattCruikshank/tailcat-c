@@ -22,7 +22,8 @@ enum {
 	TC_ERR_UNSUPPORTED = -5, /* well-formed but not a feature we implement */
 	TC_ERR_TOOMANY = -6,     /* more elements than a fixed-size limit allows */
 	TC_ERR_TIMEOUT = -7,     /* the deadline passed with nothing to read */
-	TC_ERR_EXIST = -8        /* the thing being created is already there */
+	TC_ERR_EXIST = -8,       /* the thing being created is already there */
+	TC_ERR_AGAIN = -9        /* not ready yet; the caller should retry */
 };
 
 /* tc_strerror returns a short static description of a TC_ERR_* code.

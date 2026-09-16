@@ -144,6 +144,14 @@ static bool check_mac1(const uint8_t *msg, size_t len,
 	return ok;
 }
 
+/* Set by tc_wg_timestamp_force_offset_ms; zero in every real build. */
+static uint64_t g_timestamp_offset_ms;
+
+void tc_wg_timestamp_force_offset_ms(uint64_t ms)
+{
+	g_timestamp_offset_ms = ms;
+}
+
 void tc_wg_timestamp(uint8_t out[TC_WG_TIMESTAMP_LEN])
 {
 	/* TAI64N: 8 bytes of big-endian seconds offset by 2^62 + 10, then 4
@@ -156,7 +164,11 @@ void tc_wg_timestamp(uint8_t out[TC_WG_TIMESTAMP_LEN])
 		return;
 	}
 
-	uint64_t secs = kBase + (uint64_t)ts.tv_sec;
+	uint64_t nsec = (uint64_t)ts.tv_nsec + (g_timestamp_offset_ms % 1000u) *
+	                                           1000000ull;
+	uint64_t secs = kBase + (uint64_t)ts.tv_sec + g_timestamp_offset_ms / 1000u +
+	                nsec / 1000000000ull;
+	ts.tv_nsec = (long)(nsec % 1000000000ull);
 	/* WireGuard whitens the low 24 bits of the nanosecond field so the
 	 * timestamp cannot serve as a high-resolution clock fingerprint. */
 	uint32_t nanos = (uint32_t)ts.tv_nsec & ~(uint32_t)0x00ffffffu;

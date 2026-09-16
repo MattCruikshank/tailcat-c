@@ -16,6 +16,7 @@ const char *tc_strerror(int err)
 	case TC_ERR_TOOMANY:     return "too many elements";
 	case TC_ERR_TIMEOUT:     return "timed out";
 	case TC_ERR_EXIST:       return "already exists";
+	case TC_ERR_AGAIN:       return "not ready yet";
 	default:                 return "unknown error";
 	}
 }

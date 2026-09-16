@@ -52,6 +52,12 @@
 #define TC_WG_MSG_COOKIE_REPLY 3u
 #define TC_WG_MSG_TRANSPORT 4u
 
+/* The largest payload a transport packet carries here. tailcat's tunnel
+ * offers a 1232-byte UDP payload and the transport header plus tag take 32 of
+ * it, so anything larger could not have been sent in the first place. Callers
+ * that size a buffer from this get one that cannot be overrun. */
+#define TC_WG_MAX_PAYLOAD 1200
+
 #define TC_WG_INITIATION_SIZE 148
 #define TC_WG_RESPONSE_SIZE 92
 #define TC_WG_TRANSPORT_HEADER_SIZE 16
@@ -219,5 +225,17 @@ void tc_wg_mac1_key(uint8_t out[TC_WG_KEY_LEN],
  * does, so the timestamp cannot be used as a high-resolution clock
  * fingerprint. */
 void tc_wg_timestamp(uint8_t out[TC_WG_TIMESTAMP_LEN]);
+
+/* tc_wg_timestamp_force_offset_ms shifts that clock forward by ms.
+ *
+ * FOR TESTS ONLY. A simulation that runs hours of protocol time in
+ * milliseconds of real time produces the *same* TAI64N for handshakes it
+ * believes are minutes apart -- the nanosecond field is whitened to roughly
+ * 16.8 ms of resolution -- and a peer enforcing initiation replay protection
+ * correctly rejects every one of them after the first. The offset lets a test
+ * with a virtual clock advance this one to match. Nothing outside a test may
+ * call it: moving the timestamp forward is exactly what an attacker replaying
+ * an initiation would want to do. */
+void tc_wg_timestamp_force_offset_ms(uint64_t ms);
 
 #endif /* TC_NOISE_H_ */
