@@ -94,7 +94,7 @@ approximation described above.
 
 ---
 
-## Phase 2 — make the existing data path robust
+## Phase 2 — make the existing data path robust  ✅ DONE
 
 These are the things that make the difference between a demo and something
 you would leave running. Several are already recorded as limitations in the
@@ -137,31 +137,48 @@ found it.
 `make live-rekey` holds a session open for 280 seconds against the real Go
 server. It takes six minutes and there is no shortcut to proving this one.
 
-### 2.3 Cookie reply / DoS mitigation · ~200 lines · medium risk
+### 2.3 Cookie reply / DoS mitigation ✅ · 290 lines
 
-`mac2` is currently written as zero and never checked; `tests/test_noise.c`
-asserts that tolerance so it stays visible. A peer under load that demands a
-cookie will reject us today.
+XChaCha20-Poly1305 (HChaCha20 plus the existing ChaCha20-Poly1305), the
+cookie reply message, and mac2 on both sides.
 
-Needs the cookie reply message (type 3), XChaCha20-Poly1305 — which means
-extending `salsa20.c`'s neighbours or adding XChaCha — and the mac2
-computation on both sides.
+Demanding cookies is **off by default**: the exchange costs an extra round
+trip on every handshake, and this is a netcat rather than a relay. Consuming
+a reply is unconditional, so a peer that demands one from us always gets an
+answer.
+
+Two things the estimate did not anticipate. The sender identifier is the
+peer's node key rather than an IP, because over a relay there is no address
+to bind a cookie to — which turns out not to affect interoperability at all,
+since the cookie is opaque to the initiator. And the mac2 check has to run
+before `tc_wg_handshake_init`, not merely before consuming the message: that
+call does an X25519 of its own, so checking after it would still pay the
+expensive cost for every forged initiation.
 
 ### 2.4 Initiation replay protection ✅ · 20 lines
 
 Done as part of 2.2, because the thing it needs -- the last timestamp seen
 from a peer -- only exists once something tracks a peer over time.
 
-### 2.5 Reconnection and liveness · ~250 lines · medium risk
+### 2.5 Reconnection and liveness ✅ · 260 lines
 
-Act on `FRAME_RESTARTING` instead of ignoring it, track keep-alives to notice
-a dead relay, reconnect with backoff, and re-meow after reconnecting. Also
-write timeouts, which reads have and writes do not.
+`FRAME_RESTARTING` ends the connection instead of being discarded, every
+frame records liveness, `tc_derp_reconnect` redials under the same identity,
+and the CLI backs off and re-meows. Write timeouts via `SO_SNDTIMEO`, and
+documented as unrecoverable unlike read timeouts — a half-written frame
+leaves the stream unparseable.
 
-**Phase 2: 2.1, 2.2 and 2.4 done (840 lines). Remaining: 2.3 and 2.5,
-~450 lines.** Neither is now load-bearing for a working tunnel: 2.3 only
-matters against a relay under enough load to demand cookies, and 2.5 is about
-surviving a relay restart rather than a session expiring.
+Nothing above DERP is disturbed by a reconnection: the WireGuard session is
+keyed to the peers rather than to the path, so a tunnel resumes rather than
+rehandshaking.
+
+This is also where the **Makefile turned out to have no header dependency
+tracking**. Adding one member to `tc_stream` left `http.c` compiled against
+the old layout and crashed three call frames away. Fixed with `-MMD -MP`.
+
+**Phase 2 done: ~1,390 lines**, against an estimate of ~1,150. The data path
+is now robust rather than merely working: sessions renew, relays can restart
+under it, replays and floods are refused, and no call can block forever.
 
 ---
 
@@ -308,7 +325,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | Phase | New C | Risk |
 |---|---:|---|
 | 1 — self-sufficient | ~1,330 ✅ | done |
-| 2 — robust | ~450 left (840 done) | medium |
+| 2 — robust | ~1,390 ✅ | done |
 | 3 — commands | ~1,400 | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
@@ -325,13 +342,14 @@ dangerous work is where a plausible-looking implementation is subtly wrong,
 and the defence is differential testing against the Go implementation plus a
 second, stricter toolchain.
 
-**Phases 1, 2.1, 2.2 and 2.4 are done**, which covers everything that made a
-tunnel unreliable rather than merely incomplete. What remains in Phase 2 is
-robustness against conditions we have not hit: a relay demanding cookies
-(2.3), and a relay restarting under us (2.5).
+**Phases 1 and 2 are done.** Everything that made the tunnel unreliable
+rather than merely incomplete is closed.
 
-The next thing worth doing is **Phase 3**, which is now unblocked and mostly
-mechanical -- `serve` with ports, `forward`, `socks`, and the `ssh`/`cp`
-wrappers all wanted the demultiplexer and a session that lasts, and now have
-both. 3.5 (`recv`) is the one to write carefully, since it writes
-attacker-named files.
+The next thing is **Phase 3**, which is now unblocked and mostly mechanical:
+`serve` with ports, `forward`, `socks` and the `ssh`/`cp` wrappers all wanted
+the demultiplexer and a session that lasts, and now have both. 3.5 (`recv`)
+is the one to write carefully, since it writes attacker-named files.
+
+Worth doing alongside it, from the cross-cutting list: **CI**. Everything so
+far has been run by hand on one machine, and the header-dependency bug in 2.5
+is the kind of thing a clean build in CI catches for free.

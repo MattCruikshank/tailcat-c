@@ -79,14 +79,14 @@ Both columns are release builds: upstream with its own `-s -w` and 75
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **1.74 MB** | 17.67 MB |
+| binary | **1.75 MB** | 17.67 MB |
 | gzipped | **0.86 MB** | 6.77 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
 The ratio is about 10×, and **most of it is the feature gap below, not
 craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
-of the rest. The interesting number is not 1.74 MB, it is that one file covers
+of the rest. The interesting number is not 1.75 MB, it is that one file covers
 every target: our own protocol code is only ~40 KB of it, and the single
 largest thing we add is the 181 KB CA bundle.
 
@@ -101,7 +101,7 @@ largest thing we add is the 181 KB CA bundle.
 | Bring your own relay | ✅ | ✅ |
 | Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ❌ | ✅ |
 | Rekeying / session renewal | ✅ | ✅ |
-| Cookie reply (DoS mitigation) | ❌ | ✅ |
+| Cookie reply (DoS mitigation) | ✅ | ✅ |
 | DERP map fetch | ✅ | ✅ |
 | Region choice by latency | approximate | ✅ (netcheck) |
 | Multiple concurrent connections | ✅ (library) | ✅ |
@@ -423,6 +423,18 @@ emits and requires that *this* side initiated the rotations. Worth separating
 from the rest: the code was already correct, and the test was the thing that
 was wrong.
 
+**14. The Makefile had no header dependency tracking.** *(Phase 2.5, found by
+AddressSanitizer.)* Adding one member to `tc_stream` grew it from 56 bytes to
+64. Nothing rebuilt the objects that include the header, so `http.c` kept a
+stack frame laid out for the old struct while `tls.c` wrote into the new one,
+and `serve` crashed in `tc_net_tcp_connect` — three call frames from anything
+that had changed. This is not a link error: it is a program whose files
+disagree about where the fields are, and it had been latent since the first
+commit, invisible until the first change to a widely-included struct. Fixed
+with `-MMD -MP` and `-include`. ASan named the overflowing variable, its
+frame and the byte offset, which turned a mystifying crash into an obvious
+struct mismatch in about a minute.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -490,11 +502,11 @@ Current, and deliberate unless noted.
   packet is answered with an empty one if nothing else goes back within ten
   seconds -- but there is no configurable interval for holding a NAT binding
   open, which is moot while every path goes through a relay.
-- **No cookie / DoS mitigation.** mac2 is always written as zero and never
-  checked. A peer that is not rate-limiting accepts this, which is why the
-  interop test passes, but a relay or peer under load that demands a cookie
-  will reject us. `tests/test_noise.c` asserts the mac2 tolerance explicitly
-  so the gap stays visible rather than merely absent.
+- **Demanding cookies is off by default.** The exchange is implemented in
+  both directions, but `tc_wg_peer_set_under_load` has to be turned on before
+  we ask a peer for one. It costs an extra round trip on every handshake, and
+  the traffic reaching a tool like this is already bounded by the relay.
+  Answering a peer that demands one is unconditional.
 - **No handshake rate limit.** Initiation replay is rejected, but a peer that
   floods us with *fresh* initiations will make us do the expensive half of a
   handshake each time. wireguard-go caps this at one per 20 ms. Nothing here
@@ -564,11 +576,9 @@ Roughly in the order they should be picked up.
 - [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
 - [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
       closed connections hold their table slots; nothing does it on a timer.
-- [ ] **Write timeouts** on the DERP stream. Reads are now bounded by
-      `tc_derp_set_read_timeout`; writes still are not.
-- [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
-      ignoring it, and tracking keep-alives to notice a dead relay.
 - [ ] **CI**, building both toolchains and running tests, interop and fuzzing.
+      Overdue: a stale-object bug survived for the whole project because
+      nothing ever did a clean build except by hand.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
       covered; the other four targets and the entire aarch64 half are not.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
@@ -637,6 +647,14 @@ Roughly in the order they should be picked up.
       seconds against a real tailcat server, across rotations this side
       initiated; it takes six minutes, which is the shortest honest way to
       test it.
+
+- [x] **Phase 2.3 — cookies.** XChaCha20-Poly1305, the cookie reply, and mac2
+      on both sides, so a peer under load can be answered rather than lost.
+      Verified against wireguard-go's own `CookieChecker` end to end.
+- [x] **Phase 2.5 — reconnection and liveness.** `FRAME_RESTARTING` acted on,
+      keep-alives tracked, redial under the same identity with backoff, and
+      write timeouts. A tunnel now survives its relay restarting, because
+      WireGuard is keyed to the peers rather than to the path.
 
 Beyond here, see [PLAN.md](PLAN.md). Phase 3 is next and is now unblocked:
 `serve` with ports, `forward`, `socks` and the `ssh`/`cp` wrappers were all
