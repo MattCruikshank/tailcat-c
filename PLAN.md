@@ -100,15 +100,28 @@ These are the things that make the difference between a demo and something
 you would leave running. Several are already recorded as limitations in the
 README.
 
-### 2.1 Connection demultiplexer · ~350 lines · medium risk
+### 2.1 Connection demultiplexer ✅ · 400 lines
 
-**The key structural change in the whole plan.** Today one `tc_tcp_conn` is
-one connection, with no dispatcher. Almost everything in Phase 3 needs many
-at once.
+**The key structural change in the whole plan**, and it is done. `src/net/
+tcpmux.c` holds a table keyed by (local port, remote port), dispatches
+inbound IPv6 packets, accepts repeatedly on a listener set, and allocates
+ephemeral ports. The TCP state machine did not change.
 
-Needs a table keyed by (local port, remote port), dispatch of inbound IPv6
-packets to the right connection, a listener that can accept repeatedly, and
-port allocation. The TCP state machine itself does not change.
+Two decisions that were not in the estimate:
+
+- A packet for a port pair nobody owns draws a **reset** rather than a drop,
+  so dialling a closed port fails at once instead of retransmitting for a
+  minute. `tc_tcp_reject` builds the reply from the offending segment alone.
+- A bare SYN for a pair held in **TIME_WAIT is accepted**, per RFC 1122
+  4.2.2.13. The straggler TIME_WAIT guards against carries an ACK; a bare SYN
+  is the peer reopening. The usual objection does not apply here, because
+  everything reaching this stack was authenticated by the WireGuard session
+  that carried it.
+
+The CLI routes through the mux even though a pipe uses one connection, so
+dispatch is exercised by every live run. `scripts/live-serve.sh` is new and
+covers the passive open against a real Go client -- the direction nothing
+automated reached before.
 
 ### 2.2 Rekeying and session lifetime · ~250 lines · high risk
 
@@ -147,13 +160,15 @@ Act on `FRAME_RESTARTING` instead of ignoring it, track keep-alives to notice
 a dead relay, reconnect with backoff, and re-meow after reconnecting. Also
 write timeouts, which reads have and writes do not.
 
-**Phase 2 total: ~1,150 lines.**
+**Phase 2: 2.1 done (400 lines). Remaining: ~780 lines**, and 2.2 is the one
+to be careful with -- a tunnel that works for two minutes in testing and then
+stops is the worst failure mode on this list.
 
 ---
 
 ## Phase 3 — the commands people actually use
 
-All of these depend on 2.1.
+All of these depend on 2.1, which is now in place, so none of them is blocked.
 
 ### 3.1 `serve` with ports · ~200 lines · low risk
 
@@ -293,8 +308,8 @@ These are already in the README's TODO list and do not depend on any feature.
 
 | Phase | New C | Risk |
 |---|---:|---|
-| 1 — self-sufficient | ~1,100 | low |
-| 2 — robust | ~1,150 | medium/high |
+| 1 — self-sufficient | ~1,330 ✅ | done |
+| 2 — robust | ~780 left (400 done) | medium/high |
 | 3 — commands | ~1,400 | low |
 | 4 — direct paths | ~1,950 | **high** |
 | 5 — long tail (excl. SSH/WASM) | ~350 | low |
@@ -311,6 +326,8 @@ dangerous work is where a plausible-looking implementation is subtly wrong,
 and the defence is differential testing against the Go implementation plus a
 second, stricter toolchain.
 
-**Start with Phase 1.** It is self-contained, low risk, removes the last
-external dependency on the Go binary, and 1.2's JSON parser gets reused by
-anything later that touches a control document.
+**Phases 1 and 2.1 are done.** The next thing worth doing is **2.2, rekeying**:
+it is the highest-risk item outside Phase 4, and it is the one limitation that
+makes a long-lived session quietly stop working rather than fail visibly.
+After that Phase 3 is mechanical, since everything in it was waiting on the
+demultiplexer.

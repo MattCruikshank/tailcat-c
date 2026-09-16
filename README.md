@@ -104,7 +104,7 @@ largest thing we add is the 181 KB CA bundle.
 | Cookie reply (DoS mitigation) | ❌ | ✅ |
 | DERP map fetch | ✅ | ✅ |
 | Region choice by latency | approximate | ✅ (netcheck) |
-| Multiple concurrent connections | ❌ | ✅ |
+| Multiple concurrent connections | ✅ (library) | ✅ |
 | UDP forwarding | ❌ | ✅ |
 | IPv4 into the tunnel via NAT64 | ❌ | ✅ |
 | TLS to the relay | 1.2 | 1.2 + 1.3 |
@@ -377,6 +377,32 @@ test TUN names its channels from the device's point of view, so packets the
 device receives arrive on `Inbound`; the harness waited on `Outbound` and saw
 nothing. Again the implementation was right and the test was wrong.
 
+**9. TCP sent uninitialised memory when the send buffer was shorter than the
+sequence space.** *(M6, found by a 40,000-byte transfer arriving as 54,087.)*
+SYN and FIN each consume a sequence number without occupying the buffer, so
+`snd_len - in_flight()` underflowed a `size_t` and `try_send` transmitted a
+full segment of whatever was in the buffer. The size mismatch was the only
+symptom; nothing crashed.
+
+**10. The JSON reader negated `INT64_MIN`.** *(Phase 2.1, found by
+UndefinedBehaviorSanitizer -- eventually.)* `-(int64_t)mag` is undefined for
+the one magnitude only the negative side can hold. UBSan had been reporting it
+for as long as the code existed, but **its diagnostics are non-fatal by
+default**: it printed a line and the suite still said `ok json 264 checks`, so
+several runs were reported as clean that were not. `SANITIZE=1` now passes
+`-fno-sanitize-recover=all`, and a finding fails the run. The lesson is not
+about the bug, which was trivial; it is that a checker whose output does not
+fail anything is a checker nobody reads.
+
+**11. A connection reset before it was accepted left a freed pointer in the
+accept queue.** *(Phase 2.1, found by mutation testing.)* This is the only
+entry found by deliberately breaking working code to see whether the tests
+noticed. Removing the accept-queue cleanup from the mux's drop path made no
+test fail -- a real gap, since the sequence (SYN queued, peer resets, loop
+reaps, application accepts) is ordinary. Notably ASan did not catch it either,
+because the freed pointer was returned and compared rather than dereferenced.
+A test for that exact sequence now exists, and the mutation fails it.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -388,6 +414,11 @@ Bugs 7 and 8 are worth separating out, because they are the opposite failure:
 cases with a symptom that pointed squarely at the implementation. When an
 interop test fails, the scaffolding deserves as much suspicion as the code
 under test.
+
+Bug 10 is the uncomfortable one. Every other entry here was found because
+something failed loudly. That one was reported, in plain text, in runs that
+were then described as passing -- which is a reminder that a verification
+story is only worth what its failure signals are worth.
 
 ## Limitations
 
@@ -409,8 +440,10 @@ Current, and deliberate unless noted.
   DERP connection (TCP, TLS and the key exchange), not by STUN probes as
   upstream's netcheck does. It measures the path a relayed session actually
   uses, but will choose differently where TCP and UDP diverge.
-- **`serve` handles one client and one connection**, then exits. There is no
-  accept loop and no demultiplexer.
+- **`serve` handles one client and one connection**, then exits. The
+  demultiplexer underneath supports many, and the CLI routes through it, but
+  the pipe has one stdin to give out so it takes the first connection only.
+  The commands that use the rest of it are Phase 3.
 
 ### TLS
 
@@ -509,6 +542,8 @@ Roughly in the order they should be picked up.
 - [ ] **Initiation replay protection**: remember the last TAI64N timestamp
       per peer and reject anything not strictly newer.
 - [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
+- [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
+      closed connections hold their table slots; nothing does it on a timer.
 - [ ] **Write timeouts** on the DERP stream. Reads are now bounded by
       `tc_derp_set_read_timeout`; writes still are not.
 - [ ] **Reconnect logic**, including acting on `FRAME_RESTARTING` rather than
@@ -569,8 +604,14 @@ Roughly in the order they should be picked up.
       else has to be installed alongside the binary. `tailcat-c resolve`
       produces a byte-identical result to `tailcat resolve`.
 
-Beyond here, see [PLAN.md](PLAN.md). The next structural piece is the
-connection demultiplexer, which most of the remaining commands wait on.
+- [x] **Phase 2.1 — the demultiplexer.** Many TCP connections over one tunnel:
+      a table keyed by the port pair, a listener set, ephemeral port
+      allocation, and a reset for anything addressed to a port nobody owns.
+      The CLI routes through it, so dispatch is exercised by every live run.
+      `make live-serve` covers the passive open against a real Go client.
+
+Beyond here, see [PLAN.md](PLAN.md). Next is rekeying, which is what stops a
+long-lived session from quietly dying after two minutes.
 
 ## Licence
 
