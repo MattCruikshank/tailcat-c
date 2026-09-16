@@ -173,7 +173,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -297,6 +297,19 @@ live-rekey: $(CLI)
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
+
+# Tiered local checks, numbered like Starfleet diagnostics: 1 is the one where
+# you take the panels off, 5 is the quick sweep. scripts/diagnostic.sh has the
+# details and times every stage it runs.
+#
+#   make diag5   seconds   did I just break the build
+#   make diag3   minutes   both toolchains, sanitizers, fuzzing, crosscheck
+#   make diag1   long      the above from a clean tree, plus every live test
+#
+# diag3 is what the pre-push hook runs. Install it once with:
+#   git config core.hooksPath scripts/githooks
+diag1 diag3 diag5:
+	@sh scripts/diagnostic.sh $(patsubst diag%,%,$@)
 
 # -include, not include: the files do not exist on a first build, and make
 # must not treat that as an error.

@@ -1,0 +1,51 @@
+#!/bin/sh
+# Pre-push: run the level 3 diagnostic.
+#
+# Level 3 is the tier chosen to be short enough that bypassing it never feels
+# worth it. The deeper level 1 talks to the network and takes the better part
+# of an hour, which is a pre-release decision rather than something to impose
+# on every push.
+#
+# Install once:
+#   git config core.hooksPath scripts/githooks
+#
+# Escape hatches, in order of preference:
+#   TC_DIAG=5 git push      run the quick sweep instead
+#   TC_DIAG=0 git push      skip entirely, deliberately
+#   git push --no-verify    skip entirely, git's own way
+set -eu
+
+LEVEL="${TC_DIAG:-3}"
+if [ "$LEVEL" = "0" ]; then
+	echo "pre-push: diagnostic skipped (TC_DIAG=0)"
+	exit 0
+fi
+
+# A push that only deletes refs builds nothing worth testing.
+only_deletes=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+	case "$local_sha" in
+	0000000000000000000000000000000000000000) ;;
+	*) only_deletes=0 ;;
+	esac
+done
+if [ "$only_deletes" = "1" ]; then
+	echo "pre-push: nothing but deletions; skipping the diagnostic"
+	exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+# The toolchain lives in WSL on this machine but the push may come from
+# either side, so find out rather than assume. scripts/wslmake.sh exists
+# because the APE loader has to be registered in the same WSL invocation as
+# the build -- see its own comment.
+if [ -x "${COSMOCC:-$HOME/cosmocc/bin/cosmocc}" ]; then
+	sh scripts/diagnostic.sh "$LEVEL"
+elif command -v wsl.exe >/dev/null 2>&1; then
+	sh scripts/wslmake.sh "sh scripts/diagnostic.sh $LEVEL"
+else
+	echo "pre-push: no cosmocc and no WSL; cannot run the diagnostic." >&2
+	echo "          Set COSMOCC, or use TC_DIAG=0 to push anyway." >&2
+	exit 1
+fi

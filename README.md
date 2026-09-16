@@ -162,6 +162,40 @@ both sides:
 sh scripts/live-cross.sh   # one binary, two operating systems, both ways
 ```
 
+### Checking it
+
+Local, tiered, numbered like Starfleet diagnostics -- **1 is the one where you
+take the panels off**, 5 is the quick sweep:
+
+```console
+$ make diag5     # ~5s    did I just break the build
+$ make diag3     # ~30s   both toolchains, sanitizers, fuzzing, crosscheck
+$ make diag1     # long   the above from a clean tree, plus every live test
+```
+
+Level 3 runs before every push. Install the hook once:
+
+```console
+$ git config core.hooksPath scripts/githooks
+```
+
+`TC_DIAG=5 git push` drops to the quick sweep and `TC_DIAG=0 git push` skips
+it, for when you know better.
+
+Levels 4 and 2 are deliberately undefined rather than missing: three tiers is
+what the work divides into, and two more would be distinctions nobody would
+remember.
+
+The split is about more than duration. **Level 1 is the only level that
+touches the network**, because the live tests dial Tailscale's production
+relays and run a real `tailcat` -- which is a thing to do deliberately before
+a release, not on every push. It is also the only level that starts from
+`rm -rf build`, which is what rules out the stale-object class of bug that
+went unnoticed here for the whole project.
+
+Every stage times itself, so the cost of each level stays a measured fact
+rather than an estimate in a comment.
+
 Then:
 
 ```console
@@ -576,9 +610,13 @@ Roughly in the order they should be picked up.
 - [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
 - [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
       closed connections hold their table slots; nothing does it on a timer.
-- [ ] **CI**, building both toolchains and running tests, interop and fuzzing.
-      Overdue: a stale-object bug survived for the whole project because
-      nothing ever did a clean build except by hand.
+- [x] **Tiered local diagnostics** (`make diag5/3/1`) with a pre-push hook.
+      Deliberately not hosted CI: the live tests dial Tailscale's production
+      relays, and pointing a robot at someone else's infrastructure on every
+      push is not a reasonable default.
+- [ ] **Run the aarch64 half.** The diagnostics cover x86_64 on two operating
+      systems. Every binary contains an aarch64 half that is built, linked and
+      never executed, which remains the largest untested claim here.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
       covered; the other four targets and the entire aarch64 half are not.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement

@@ -305,8 +305,10 @@ APE.
 
 These are already in the README's TODO list and do not depend on any feature.
 
-- **CI**: build both toolchains, run tests, interop and fuzzing. Everything so
-  far has been run by hand on one machine.
+- ~~**CI**~~: done differently. `make diag5/3/1` and a pre-push hook run the
+  checks locally in three tiers; see the README. Hosted CI was rejected
+  deliberately -- the live tests dial Tailscale's production relays, and that
+  is not something to automate on every push.
 - **Test on macOS, the BSDs, and aarch64.** Two of six target operating
   systems are covered, both x86_64. The aarch64 half of every binary is built
   and linked but **has never been executed**. This is the largest untested
@@ -350,6 +352,7 @@ The next thing is **Phase 3**, which is now unblocked and mostly mechanical:
 the demultiplexer and a session that lasts, and now have both. 3.5 (`recv`)
 is the one to write carefully, since it writes attacker-named files.
 
-Worth doing alongside it, from the cross-cutting list: **CI**. Everything so
-far has been run by hand on one machine, and the header-dependency bug in 2.5
-is the kind of thing a clean build in CI catches for free.
+The cross-cutting item worth doing alongside it is **running the aarch64
+half**, which is now the largest untested claim in the project: the
+diagnostics cover x86_64 on two operating systems, and the other half of every
+binary has never been executed at all.
