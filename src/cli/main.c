@@ -31,11 +31,13 @@
 #include "tc/wgpeer.h"
 #include "tc/tailcat.h"
 #include "tc/fwdspec.h"
+#include "tc/keyfile.h"
 #include "tc/portset.h"
 #include "tc/shquote.h"
 #include "tc/proxy.h"
 #include "tc/tcpmux.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -48,6 +50,7 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -103,6 +106,9 @@ static void usage(FILE *f)
 	        "  tailcat-c resolve <tc-address>          embed the relay, for "
 	        "offline use\n"
 	        "  tailcat-c parse <tc-address>            describe an address\n"
+	        "  tailcat-c genkey --key <name> [--client] [--region N]\n"
+	        "  tailcat-c printpub                      the client key that "
+	        "would be used\n"
 	        "  tailcat-c version\n"
 	        "\n"
 	        "flags:\n"
@@ -110,9 +116,13 @@ static void usage(FILE *f)
 	        "      --insecure        skip TLS verification of the relay\n"
 	        "      --relay HOST      serve through this relay instead of "
 	        "choosing one\n"
+	        "      --full-address    embed the relay in the address, so "
+	        "clients need no map\n"
 	        "      --bind ADDR       listen address for forward and socks "
 	        "(default 127.0.0.1)\n"
 	        "  -p, PORT              server port for ssh and cp (default 22)\n"
+	        "      --key NAME        saved identity to use, or \"new\" for "
+	        "an ephemeral one\n"
 	        "      --derpmap-url URL where to fetch the relay list\n"
 	        "      --timeout SEC     give up after SEC seconds (default 60; "
 	        "0 = never, for serve <ports>)\n"
@@ -1124,6 +1134,319 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 	return 0;
 }
 
+/* ---- saved identities --------------------------------------------------- */
+
+/* config_dir mirrors Go's os.UserConfigDir, because that is where upstream
+ * puts its keys and the two implementations have to look in the same place
+ * for a key to be shared between them. */
+static const char *config_dir(void)
+{
+	static char buf[768];
+	const char *v;
+
+	if ((v = getenv("XDG_CONFIG_HOME")) != NULL && v[0] == '/') {
+		(void)snprintf(buf, sizeof buf, "%s", v);
+		return buf;
+	}
+	/* Windows, where an APE may well be running. */
+	if ((v = getenv("AppData")) != NULL && v[0] != '\0') {
+		(void)snprintf(buf, sizeof buf, "%s", v);
+		return buf;
+	}
+	if ((v = getenv("HOME")) == NULL || v[0] == '\0')
+		return NULL;
+#ifdef __APPLE__
+	(void)snprintf(buf, sizeof buf, "%s/Library/Application Support", v);
+#else
+	(void)snprintf(buf, sizeof buf, "%s/.config", v);
+#endif
+	return buf;
+}
+
+/* key_is_path distinguishes a name from a path exactly as upstream does: by
+ * whether it contains a separator. */
+static bool key_is_path(const char *name)
+{
+	return strchr(name, '/') != NULL || strchr(name, '\\') != NULL;
+}
+
+static int key_path(char *out, size_t cap, const char *name)
+{
+	if (key_is_path(name)) {
+		if ((size_t)snprintf(out, cap, "%s", name) >= cap)
+			return TC_ERR_NOSPACE;
+		return TC_OK;
+	}
+	const char *cfg = config_dir();
+	if (cfg == NULL) {
+		fprintf(stderr, "tailcat-c: no config directory; set HOME or give "
+		                "a path\n");
+		return TC_ERR_INVAL;
+	}
+	int n = snprintf(out, cap, "%s/tailcat/keys/%s.private.json", cfg, name);
+	if (n < 0 || (size_t)n >= cap)
+		return TC_ERR_NOSPACE;
+	return TC_OK;
+}
+
+/* mkdir_p creates a directory and its parents, 0700 -- these hold secrets. */
+static int mkdir_p(const char *path)
+{
+	char buf[1024];
+	if ((size_t)snprintf(buf, sizeof buf, "%s", path) >= sizeof buf)
+		return TC_ERR_NOSPACE;
+	for (char *p = buf + 1; *p != '\0'; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		(void)mkdir(buf, 0700);
+		*p = '/';
+	}
+	if (mkdir(buf, 0700) != 0 && errno != EEXIST)
+		return TC_ERR_INVAL;
+	return TC_OK;
+}
+
+static int read_file(const char *path, char *out, size_t cap, size_t *len)
+{
+	FILE *f = fopen(path, "rb");
+	if (f == NULL)
+		return TC_ERR_INVAL;
+	size_t n = fread(out, 1, cap - 1, f);
+	int bad = ferror(f);
+	(void)fclose(f);
+	if (bad)
+		return TC_ERR_INVAL;
+	out[n] = '\0';
+	*len = n;
+	return TC_OK;
+}
+
+/* load_key reads a saved identity.
+ *
+ * `spec` is "new" for an ephemeral key, a path, or a name. An empty spec means
+ * the default for the mode, which is loaded if it exists and otherwise means
+ * ephemeral -- so a first run works without any setup, and a later `genkey
+ * --key default` changes nothing about how the command is invoked. */
+static int load_key(tc_keyfile *k, const char *spec, bool client, bool *found)
+{
+	*found = false;
+	if (spec != NULL && strcmp(spec, "new") == 0)
+		return TC_OK;
+
+	char path[1024];
+	const char *name = (spec != NULL && spec[0] != '\0')
+	                       ? spec
+	                       : (client ? "client-default" : "default");
+	if (key_path(path, sizeof path, name) != TC_OK)
+		return TC_ERR_INVAL;
+
+	static char buf[8192];
+	size_t len = 0;
+	if (read_file(path, buf, sizeof buf, &len) != TC_OK) {
+		if (spec != NULL && spec[0] != '\0') {
+			/* An explicitly named key that is missing is an error; the
+			 * implicit default simply not existing is not. */
+			fprintf(stderr, "tailcat-c: cannot read %s\n", path);
+			return TC_ERR_INVAL;
+		}
+		return TC_OK;
+	}
+	if (tc_keyfile_parse(k, buf, len) != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s: %s\n", path,
+		        tc_keyfile_error_string());
+		return TC_ERR_INVAL;
+	}
+	vlogf("using the saved key %s", path);
+	*found = true;
+	return TC_OK;
+}
+
+static int cmd_printpub(const char *key_spec)
+{
+	static tc_keyfile k;
+	bool found = false;
+	if (load_key(&k, key_spec, true, &found) != TC_OK)
+		return 1;
+	if (!found) {
+		fprintf(stderr, "tailcat-c: no client key saved; make one with "
+		                "`genkey --client --key client-default`\n");
+		return 1;
+	}
+	char s[128];
+	if (tc_key_format_hex(s, sizeof s, "nodekey", k.pub.server_public) !=
+	    TC_OK)
+		return 1;
+	printf("%s\n", s);
+	return 0;
+}
+
+static int list_keys(void)
+{
+	const char *cfg = config_dir();
+	if (cfg == NULL)
+		return 1;
+	char dir[900];
+	(void)snprintf(dir, sizeof dir, "%s/tailcat/keys", cfg);
+
+	DIR *d = opendir(dir);
+	if (d == NULL) {
+		fprintf(stderr, "# no keys in %s\n", dir);
+		return 0;
+	}
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		const char *suffix = ".private.json";
+		size_t nlen = strlen(e->d_name);
+		size_t slen = strlen(suffix);
+		if (nlen <= slen || strcmp(e->d_name + nlen - slen, suffix) != 0)
+			continue;
+		printf("%.*s\n", (int)(nlen - slen), e->d_name);
+	}
+	(void)closedir(d);
+	return 0;
+}
+
+static int cmd_genkey(const char *key_spec, bool client, bool force,
+                      bool delete_it, bool list, const char *region,
+                      bool psk, bool insecure, const char *derpmap_url)
+{
+	if (list)
+		return list_keys();
+
+	if (key_spec == NULL || key_spec[0] == '\0') {
+		fprintf(stderr, "tailcat-c: genkey needs --key <name-or-path>\n");
+		return 2;
+	}
+
+	char path[1024];
+	if (key_path(path, sizeof path, key_spec) != TC_OK)
+		return 1;
+
+	if (delete_it) {
+		if (key_is_path(key_spec)) {
+			fprintf(stderr, "tailcat-c: --delete takes a name, not a path\n");
+			return 2;
+		}
+		if (remove(path) != 0) {
+			fprintf(stderr, "tailcat-c: cannot delete %s: %s\n", path,
+			        strerror(errno));
+			return 1;
+		}
+		fprintf(stderr, "# deleted %s\n", path);
+		return 0;
+	}
+
+	/* Refusing to overwrite is the whole safety of this command: a key file
+	 * is the only copy of an identity, and a server's address is derived
+	 * from it. Silently replacing one would strand every client that has the
+	 * old address. */
+	if (!force && access(path, F_OK) == 0) {
+		fprintf(stderr, "tailcat-c: %s already exists; --force to replace "
+		                "it (every client with the old address loses "
+		                "access)\n",
+		        path);
+		return 1;
+	}
+
+	int64_t region_id = 0;
+	if (region != NULL && strcmp(region, "auto") != 0 && !client) {
+		if (strcmp(region, "list") == 0) {
+			static tc_derp_map m;
+			if (tc_derpmap_fetch(&m, derpmap_url, insecure, 15000) != TC_OK) {
+				fprintf(stderr, "tailcat-c: %s\n",
+				        tc_derpmap_error_string());
+				return 1;
+			}
+			for (size_t i = 0; i < m.num_regions; i++)
+				printf("%4lld %-6s %s\n", (long long)m.regions[i].region_id,
+				       m.regions[i].region_code, m.regions[i].region_name);
+			return 0;
+		}
+		char *end = NULL;
+		long v = strtol(region, &end, 10);
+		if (end != NULL && *end == '\0' && v > 0 && v < 65536) {
+			region_id = v;
+		} else {
+			/* A code or a substring: look it up rather than guess. */
+			static tc_derp_map m;
+			if (tc_derpmap_fetch(&m, derpmap_url, insecure, 15000) != TC_OK) {
+				fprintf(stderr, "tailcat-c: %s\n",
+				        tc_derpmap_error_string());
+				return 1;
+			}
+			for (size_t i = 0; i < m.num_regions && region_id == 0; i++) {
+				if (strstr(m.regions[i].region_code, region) != NULL ||
+				    strstr(m.regions[i].region_name, region) != NULL)
+					region_id = m.regions[i].region_id;
+			}
+			if (region_id == 0) {
+				fprintf(stderr, "tailcat-c: no region matching \"%s\"; "
+				                "try --region list\n",
+				        region);
+				return 1;
+			}
+		}
+	}
+
+	static tc_keyfile k;
+	if (tc_keyfile_generate(&k, psk, region_id) != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_keyfile_error_string());
+		return 1;
+	}
+
+	static char out[4096];
+	size_t out_len = 0;
+	if (tc_keyfile_format(out, sizeof out, &out_len, &k) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not format the key\n");
+		return 1;
+	}
+
+	if (!key_is_path(key_spec)) {
+		char dir[900];
+		const char *cfg = config_dir();
+		(void)snprintf(dir, sizeof dir, "%s/tailcat/keys", cfg);
+		if (mkdir_p(dir) != TC_OK) {
+			fprintf(stderr, "tailcat-c: cannot create %s\n", dir);
+			return 1;
+		}
+	}
+
+	/* 0600 from the moment it exists, rather than created and then chmod'd:
+	 * the whole file is secret, including the pre-shared key that lives
+	 * under the misleading name "Public". */
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "tailcat-c: cannot write %s: %s\n", path,
+		        strerror(errno));
+		return 1;
+	}
+	bool ok = write_all(fd, (const uint8_t *)out, out_len);
+	(void)close(fd);
+	if (!ok) {
+		fprintf(stderr, "tailcat-c: could not write %s\n", path);
+		return 1;
+	}
+	fprintf(stderr, "# wrote %s\n", path);
+
+	if (client) {
+		/* A client key has no address; its public key is what a server's
+		 * allow list would name. */
+		char s[128];
+		(void)tc_key_format_hex(s, sizeof s, "nodekey", k.pub.server_public);
+		printf("%s\n", s);
+		return 0;
+	}
+
+	char addr[TC_ADDR_STR_MAX];
+	if (tc_addr_encode(addr, sizeof addr, &k.pub, NULL) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not build the address\n");
+		return 1;
+	}
+	printf("%s\n", addr);
+	return 0;
+}
+
 /* ---- the client side of a tunnel --------------------------------------- */
 
 /* Three commands dial a tailcat server -- pipe, forward and socks -- and the
@@ -1160,7 +1483,8 @@ static void client_down(tc_client *cl)
 
 /* client_up brings the tunnel all the way to ready, or reports why not. */
 static int client_up(tc_client *cl, const char *addr_str, bool insecure,
-                     const char *derpmap_url, uint64_t deadline)
+                     const char *derpmap_url, const char *key_spec,
+                     uint64_t deadline)
 {
 	memset(cl, 0, sizeof *cl);
 
@@ -1175,10 +1499,26 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 		return 1;
 	const tc_derp_node *node = &cl->ci.regions[0].nodes[0];
 
+	/* A saved client identity if there is one, so a server with an allow
+	 * list sees the same public key every time. Otherwise ephemeral, which
+	 * is the right default for a client: nothing depends on its address. */
+	static tc_keyfile saved;
+	bool have_saved = false;
+	if (load_key(&saved, key_spec, true, &have_saved) != TC_OK)
+		return 1;
+
 	uint8_t disco_pub[32];
-	if (tc_wg_identity_generate(&cl->me) != TC_OK ||
-	    tc_disco_key_for_node(NULL, disco_pub, cl->me.private_key) != TC_OK) {
+	if (have_saved) {
+		if (tc_wg_identity_from_private(&cl->me, saved.private_key) != TC_OK) {
+			fprintf(stderr, "tailcat-c: the saved key is not usable\n");
+			return 1;
+		}
+	} else if (tc_wg_identity_generate(&cl->me) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not generate keys\n");
+		return 1;
+	}
+	if (tc_disco_key_for_node(NULL, disco_pub, cl->me.private_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not derive the disco key\n");
 		return 1;
 	}
 
@@ -1300,12 +1640,13 @@ fail:
 }
 
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
-                    unsigned timeout_s, const char *derpmap_url)
+                    unsigned timeout_s, const char *derpmap_url,
+                    const char *key_spec)
 {
 	static tc_client cl;
 	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
 
-	if (client_up(&cl, addr_str, insecure, derpmap_url, deadline) != TC_OK)
+	if (client_up(&cl, addr_str, insecure, derpmap_url, key_spec, deadline) != TC_OK)
 		return 1;
 
 	tc_tcp_conn *tcp = NULL;
@@ -1726,7 +2067,7 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
                                 size_t nspecs, const char *bind_addr,
                                 bool socks, const char *const *child_argv,
                                 bool insecure, unsigned timeout_s,
-                                const char *derpmap_url)
+                                const char *derpmap_url, const char *key_spec)
 {
 	static tc_client cl;
 	uint64_t deadline = (timeout_s == 0)
@@ -1794,7 +2135,7 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	int status = 1;
 	pid_t child = 0;
 	tc_proxy *proxy = NULL;
-	if (client_up(&cl, addr_str, insecure, derpmap_url,
+	if (client_up(&cl, addr_str, insecure, derpmap_url, key_spec,
 	              now_ms() + 60000) != TC_OK)
 		goto out;
 
@@ -2082,29 +2423,53 @@ static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
  * localhost and stays up. */
 static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      bool insecure, unsigned timeout_s,
-                     const char *derpmap_url)
+                     const char *derpmap_url, const char *key_spec,
+                     bool full_address)
 {
-	/* A fresh identity per run, like upstream's default. The pre-shared key
-	 * is what stops a relay operator who has watched both public keys go past
-	 * from joining the tunnel, so it is always generated. */
+	/* A saved identity if one exists, otherwise a fresh one. This is the
+	 * whole point of `genkey`: without it a server's address changes on
+	 * every restart, which makes it useless in a script or a service file.
+	 *
+	 * The pre-shared key is part of that identity, not generated per run:
+	 * it is what stops a relay operator who has watched both public keys go
+	 * past from joining the tunnel, and it is embedded in the address, so a
+	 * new one would mean a new address. */
+	static tc_keyfile saved;
+	bool have_saved = false;
+	if (load_key(&saved, key_spec, false, &have_saved) != TC_OK)
+		return 1;
+
 	tc_wg_identity me;
 	uint8_t disco_pub[32];
-	if (tc_wg_identity_generate(&me) != TC_OK ||
-	    tc_disco_key_for_node(NULL, disco_pub, me.private_key) != TC_OK) {
-		fprintf(stderr, "tailcat-c: could not generate keys\n");
-		return 1;
-	}
-
 	static tc_conn_info ci;
 	memset(&ci, 0, sizeof ci);
-	memcpy(ci.server_public, me.public_key, 32);
-	memcpy(ci.server_disco_public, disco_pub, 32);
-	ci.has_disco_public = true;
-	if (tc_random_bytes(ci.preshared_key, sizeof ci.preshared_key) != TC_OK) {
-		fprintf(stderr, "tailcat-c: could not generate a pre-shared key\n");
+
+	if (have_saved) {
+		if (tc_wg_identity_from_private(&me, saved.private_key) != TC_OK) {
+			fprintf(stderr, "tailcat-c: the saved key is not usable\n");
+			return 1;
+		}
+		ci = saved.pub;
+	} else {
+		if (tc_wg_identity_generate(&me) != TC_OK) {
+			fprintf(stderr, "tailcat-c: could not generate keys\n");
+			return 1;
+		}
+		memcpy(ci.server_public, me.public_key, 32);
+		if (tc_random_bytes(ci.preshared_key, sizeof ci.preshared_key) !=
+		    TC_OK) {
+			fprintf(stderr,
+			        "tailcat-c: could not generate a pre-shared key\n");
+			return 1;
+		}
+		ci.has_preshared_key = true;
+	}
+	if (tc_disco_key_for_node(NULL, disco_pub, me.private_key) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not derive the disco key\n");
 		return 1;
 	}
-	ci.has_preshared_key = true;
+	memcpy(ci.server_disco_public, disco_pub, 32);
+	ci.has_disco_public = true;
 
 	/* Embed the relay rather than naming a region by number, so the address
 	 * is self-contained and the other side needs no DERP map either. */
@@ -2121,14 +2486,30 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		ci.region_id = -1;
 		if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
 			return 1;
-		ci.region_id = 0;
 		if (ci.regions[0].num_nodes > 2)
 			ci.regions[0].num_nodes = 2;
 		relay_host = ci.regions[0].nodes[0].hostname;
 	}
 
+	/* What we advertise is not what we dial. Upstream's default address names
+	 * its region by number and lets the client fetch the map, and only
+	 * --full-address embeds the relay; advertising the long form always made
+	 * our address differ from upstream's for the very same saved key, which
+	 * is how this was noticed.
+	 *
+	 * The embedded form is still worth offering: it saves the client a map
+	 * fetch and works with no DNS at all. */
+	static tc_conn_info advertised;
+	advertised = ci;
+	if (!full_address && ci.num_regions > 0 && ci.regions[0].region_id > 0) {
+		advertised.region_id = ci.regions[0].region_id;
+		advertised.num_regions = 0;
+	} else {
+		advertised.region_id = 0;
+	}
+
 	char addr[TC_ADDR_STR_MAX];
-	if (tc_addr_encode(addr, sizeof addr, &ci, NULL) != TC_OK) {
+	if (tc_addr_encode(addr, sizeof addr, &advertised, NULL) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not build an address\n");
 		return 1;
 	}
@@ -2332,6 +2713,16 @@ int main(int argc, char **argv)
 	const char *bind_addr = "127.0.0.1";
 	/* The server port ssh and cp reach through the tunnel. */
 	const char *ssh_port = "22";
+	/* An empty --key means "the saved default if there is one", which is how
+	 * a first run works with no setup and a later genkey changes nothing
+	 * about how commands are invoked. */
+	const char *key_spec = "";
+	bool gk_client = false, gk_force = false, gk_delete = false;
+	bool gk_list = false, gk_psk = true;
+	const char *gk_region = "auto";
+	/* Upstream's default address names a region by number; --full-address
+	 * embeds the relay so a client needs no DERP map at all. */
+	bool full_address = false;
 	/* Room for a subcommand plus several port specs: upstream allows the
 	 * list to be spread over arguments, as in `serve 80,443 8000-8999`. */
 	const char *args[16];
@@ -2361,6 +2752,22 @@ int main(int argc, char **argv)
 			relay = argv[++i];
 		} else if (strcmp(a, "-p") == 0 && i + 1 < argc) {
 			ssh_port = argv[++i];
+		} else if (strcmp(a, "--key") == 0 && i + 1 < argc) {
+			key_spec = argv[++i];
+		} else if (strcmp(a, "--full-address") == 0) {
+			full_address = true;
+		} else if (strcmp(a, "--client") == 0) {
+			gk_client = true;
+		} else if (strcmp(a, "--force") == 0) {
+			gk_force = true;
+		} else if (strcmp(a, "--delete") == 0) {
+			gk_delete = true;
+		} else if (strcmp(a, "--list") == 0) {
+			gk_list = true;
+		} else if (strcmp(a, "--region") == 0 && i + 1 < argc) {
+			gk_region = argv[++i];
+		} else if (strcmp(a, "--no-psk") == 0) {
+			gk_psk = false;
 		} else if (strcmp(a, "--bind") == 0 && i + 1 < argc) {
 			bind_addr = argv[++i];
 		} else if (strcmp(a, "--derpmap-url") == 0 && i + 1 < argc) {
@@ -2421,7 +2828,8 @@ int main(int argc, char **argv)
 		if (nargs == 1) {
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
-			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url);
+			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
+			                 key_spec, full_address);
 		}
 
 		static tc_portset ports;
@@ -2445,7 +2853,8 @@ int main(int argc, char **argv)
 			}
 		}
 		return cmd_serve(relay, &ports, insecure,
-		                 timeout_given ? timeout_s : 0, derpmap_url);
+		                 timeout_given ? timeout_s : 0, derpmap_url,
+		                 key_spec, full_address);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {
@@ -2456,7 +2865,7 @@ int main(int argc, char **argv)
 		return cmd_forward_or_socks(args[1], &args[2], nargs - 2, bind_addr,
 		                            false, NULL, insecure,
 		                            timeout_given ? timeout_s : 0,
-		                            derpmap_url);
+		                            derpmap_url, key_spec);
 	}
 	if (strcmp(args[0], "socks") == 0) {
 		if (nargs < 2) {
@@ -2467,8 +2876,14 @@ int main(int argc, char **argv)
 		                            nargs >= 3 ? nargs - 2 : 0, bind_addr,
 		                            true, child_argv, insecure,
 		                            timeout_given ? timeout_s : 0,
-		                            derpmap_url);
+		                            derpmap_url, key_spec);
 	}
+	if (strcmp(args[0], "genkey") == 0) {
+		return cmd_genkey(key_spec, gk_client, gk_force, gk_delete, gk_list,
+		                  gk_region, gk_psk, insecure, derpmap_url);
+	}
+	if (strcmp(args[0], "printpub") == 0)
+		return cmd_printpub(key_spec);
 	if (strcmp(args[0], "ssh") == 0) {
 		if (nargs < 2) {
 			fprintf(stderr, "tailcat-c: ssh needs an address\n");
@@ -2503,5 +2918,6 @@ int main(int argc, char **argv)
 		}
 		port = (uint16_t)p;
 	}
-	return cmd_pipe(args[0], port, insecure, timeout_s, derpmap_url);
+	return cmd_pipe(args[0], port, insecure, timeout_s, derpmap_url,
+	                key_spec);
 }

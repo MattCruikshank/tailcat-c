@@ -149,6 +149,7 @@ LIB_SRCS := \
 	src/portset.c \
 	src/fwdspec.c \
 	src/shquote.c \
+	src/keyfile.c \
 	src/json.c \
 	src/addr.c \
 	src/crypto/blake2s.c \
@@ -177,7 +178,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -318,6 +319,10 @@ live-ssh: $(CLI)
 # Our cp delivering into a real `tailcat recv` drop box.
 live-recv: $(CLI)
 	CLI=$(CLI) sh scripts/live-recv.sh
+
+# A saved identity, shared between both implementations in both directions.
+live-genkey: $(CLI)
+	CLI=$(CLI) sh scripts/live-genkey.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
