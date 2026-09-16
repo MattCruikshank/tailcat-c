@@ -147,6 +147,7 @@ LIB_SRCS := \
 	src/base64url.c \
 	src/cbor.c \
 	src/portset.c \
+	src/fwdspec.c \
 	src/json.c \
 	src/addr.c \
 	src/crypto/blake2s.c \
@@ -175,7 +176,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -304,6 +305,10 @@ live-serve-ports: $(CLI)
 # Several real Go clients through one server at the same time.
 live-multi: $(CLI)
 	CLI=$(CLI) sh scripts/live-multi.sh
+
+# The other direction: our forward and socks reaching a real Go server.
+live-forward: $(CLI)
+	CLI=$(CLI) sh scripts/live-forward.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh

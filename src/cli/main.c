@@ -30,6 +30,7 @@
 #include "tc/derpmap.h"
 #include "tc/wgpeer.h"
 #include "tc/tailcat.h"
+#include "tc/fwdspec.h"
 #include "tc/portset.h"
 #include "tc/proxy.h"
 #include "tc/tcpmux.h"
@@ -84,6 +85,10 @@ static void usage(FILE *f)
 	        "pipe it to stdout\n"
 	        "  tailcat-c serve <ports>                 serve local ports, e.g. "
 	        "22,80,8000-8999 or all\n"
+	        "  tailcat-c forward <tc-addr> <maps>      forward local ports, "
+	        "e.g. 8080 or 18080:8080\n"
+	        "  tailcat-c socks <tc-addr> [port]        SOCKS5 proxy that "
+	        "dials the server\n"
 	        "  tailcat-c ping <tc-address>             time the round trip to "
 	        "a server\n"
 	        "  tailcat-c resolve <tc-address>          embed the relay, for "
@@ -96,6 +101,8 @@ static void usage(FILE *f)
 	        "      --insecure        skip TLS verification of the relay\n"
 	        "      --relay HOST      serve through this relay instead of "
 	        "choosing one\n"
+	        "      --bind ADDR       listen address for forward and socks "
+	        "(default 127.0.0.1)\n"
 	        "      --derpmap-url URL where to fetch the relay list\n"
 	        "      --timeout SEC     give up after SEC seconds (default 60; "
 	        "0 = never, for serve <ports>)\n"
@@ -1107,25 +1114,60 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 	return 0;
 }
 
-static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
-                    unsigned timeout_s, const char *derpmap_url)
+/* ---- the client side of a tunnel --------------------------------------- */
+
+/* Three commands dial a tailcat server -- pipe, forward and socks -- and the
+ * bring-up is identical for all of them: resolve the address, connect to the
+ * relay, introduce ourselves, complete the handshake, and open a
+ * demultiplexer. It lives here once so that a change to any step (a rekey
+ * rule, a reconnection, an extra round trip) reaches all three. */
+typedef struct {
+	tc_conn_info ci;
+	tc_wg_identity me;
+	tc_derp_client derp;
+	tc_wg_peer peer;
+	pump ctx;
+	tc_tcp_mux *mux;
+	/* Kept so the relay can be re-introduced to us after a reconnection: the
+	 * relay forgets who is talking to whom, the tunnel does not. */
+	uint8_t ping[TC_MEOW_PING_LEN];
+	size_t ping_len;
+	bool up;
+} tc_client;
+
+static void client_down(tc_client *cl)
 {
-	static tc_conn_info ci;
-	int rc = tc_addr_parse(&ci, addr_str, strlen(addr_str));
+	if (cl == NULL)
+		return;
+	tc_tcp_mux_free(cl->mux);
+	cl->mux = NULL;
+	if (cl->up)
+		log_wg_summary(&cl->peer);
+	tc_wg_peer_clear(&cl->peer);
+	tc_derp_close(&cl->derp);
+	tc_memzero_explicit(&cl->me, sizeof cl->me);
+}
+
+/* client_up brings the tunnel all the way to ready, or reports why not. */
+static int client_up(tc_client *cl, const char *addr_str, bool insecure,
+                     const char *derpmap_url, uint64_t deadline)
+{
+	memset(cl, 0, sizeof *cl);
+
+	int rc = tc_addr_parse(&cl->ci, addr_str, strlen(addr_str));
 	if (rc != TC_OK) {
 		fprintf(stderr, "tailcat-c: bad address: %s\n", tc_strerror(rc));
 		return 1;
 	}
 	/* A short address names its relay by region number; this fetches the map
 	 * and turns that into something dialable. */
-	if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
+	if (ensure_relay(&cl->ci, derpmap_url, insecure, 15000) != TC_OK)
 		return 1;
-	const tc_derp_node *node = &ci.regions[0].nodes[0];
+	const tc_derp_node *node = &cl->ci.regions[0].nodes[0];
 
-	tc_wg_identity me;
 	uint8_t disco_pub[32];
-	if (tc_wg_identity_generate(&me) != TC_OK ||
-	    tc_disco_key_for_node(NULL, disco_pub, me.private_key) != TC_OK) {
+	if (tc_wg_identity_generate(&cl->me) != TC_OK ||
+	    tc_disco_key_for_node(NULL, disco_pub, cl->me.private_key) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not generate keys\n");
 		return 1;
 	}
@@ -1139,137 +1181,581 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 	opts.timeout_ms = 15000;
 
 	vlogf("relay %s", node->hostname);
-	tc_derp_client derp;
-	if (tc_derp_connect(&derp, &opts, me.private_key, me.public_key) != TC_OK) {
+	if (tc_derp_connect(&cl->derp, &opts, cl->me.private_key,
+	                    cl->me.public_key) != TC_OK) {
 		fprintf(stderr, "tailcat-c: relay: %s\n", tc_derp_error_string());
 		return 1;
 	}
-	tc_derp_set_read_timeout(&derp, 200);
-
-	int status = 1;
-	tc_tcp_conn *tcp = NULL;
-	tc_tcp_mux *mux = NULL;
-	tc_wg_peer peer;
-	memset(&peer, 0, sizeof peer);
-	pump ctx;
-	memset(&ctx, 0, sizeof ctx);
+	tc_derp_set_read_timeout(&cl->derp, 200);
 
 	/* ---- meow: ask the server to add us as a peer ---------------------- */
 
-	uint8_t ping[TC_MEOW_PING_LEN];
-	size_t ping_len = 0;
-	tc_meow_encode_ping(ping, sizeof ping, &ping_len, me.public_key, disco_pub);
+	tc_meow_encode_ping(cl->ping, sizeof cl->ping, &cl->ping_len,
+	                    cl->me.public_key, disco_pub);
 
-	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
 	bool meowed = false;
 	uint64_t next_send = 0;
-
 	while (!meowed && now_ms() < deadline) {
 		if (now_ms() >= next_send) {
 			/* DERP drops packets for a key that is not connected yet, so
 			 * resend rather than bet everything on the first one. */
-			if (tc_derp_send(&derp, ci.server_public, ping, ping_len) != TC_OK) {
+			if (tc_derp_send(&cl->derp, cl->ci.server_public, cl->ping,
+			                 cl->ping_len) != TC_OK) {
 				fprintf(stderr, "tailcat-c: relay send failed\n");
-				goto out;
+				goto fail;
 			}
 			next_send = now_ms() + 1000;
 		}
 		uint8_t src[32];
 		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 		size_t len = 0;
-		rc = tc_derp_recv(&derp, src, buf, sizeof buf, &len);
+		rc = tc_derp_recv(&cl->derp, src, buf, sizeof buf, &len);
 		if (rc == TC_ERR_TIMEOUT)
 			continue;
 		if (rc != TC_OK) {
 			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
-			goto out;
+			goto fail;
 		}
-		if (memcmp(src, ci.server_public, 32) == 0 &&
+		if (memcmp(src, cl->ci.server_public, 32) == 0 &&
 		    tc_meow_is_meowed(buf, len))
 			meowed = true;
 	}
 	if (!meowed) {
 		fprintf(stderr, "tailcat-c: the server never acknowledged us\n");
-		goto out;
+		goto fail;
 	}
 	vlogf("meowed: the server has added us as a peer");
 
 	/* ---- WireGuard ----------------------------------------------------- */
 
-	ctx.derp = &derp;
-	memcpy(ctx.server_key, ci.server_public, 32);
-	if (tc_wg_peer_init(&peer, &me, ci.server_public,
-	                    ci.has_preshared_key ? ci.preshared_key : NULL, wg_out,
-	                    &ctx) != TC_OK) {
+	cl->ctx.derp = &cl->derp;
+	memcpy(cl->ctx.server_key, cl->ci.server_public, 32);
+	if (tc_wg_peer_init(&cl->peer, &cl->me, cl->ci.server_public,
+	                    cl->ci.has_preshared_key ? cl->ci.preshared_key : NULL,
+	                    wg_out, &cl->ctx) != TC_OK) {
 		fprintf(stderr, "tailcat-c: handshake setup failed\n");
-		goto out;
+		goto fail;
 	}
-	ctx.peer = &peer;
+	cl->ctx.peer = &cl->peer;
 
-	if (tc_wg_peer_start_handshake(&peer, now_ms()) != TC_OK) {
+	if (tc_wg_peer_start_handshake(&cl->peer, now_ms()) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not build the handshake\n");
-		goto out;
+		goto fail;
 	}
 
 	/* The peer owns the retry schedule from here; this loop only feeds it
 	 * packets and the clock. */
-	while (!tc_wg_peer_is_up(&peer, now_ms()) && now_ms() < deadline) {
-		tc_wg_peer_tick(&peer, now_ms());
+	while (!tc_wg_peer_is_up(&cl->peer, now_ms()) && now_ms() < deadline) {
+		tc_wg_peer_tick(&cl->peer, now_ms());
 
 		uint8_t src[32];
 		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 		size_t len = 0;
-		rc = tc_derp_recv(&derp, src, buf, sizeof buf, &len);
+		rc = tc_derp_recv(&cl->derp, src, buf, sizeof buf, &len);
 		if (rc == TC_ERR_TIMEOUT)
 			continue;
 		if (rc != TC_OK) {
 			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
-			goto out;
+			goto fail;
 		}
-		if (memcmp(src, ci.server_public, 32) != 0)
+		if (memcmp(src, cl->ci.server_public, 32) != 0)
 			continue;
 		size_t ignored = 0;
 		static uint8_t scratch[TC_DERP_MAX_PACKET_SIZE];
-		(void)tc_wg_peer_input(&peer, buf, len, scratch, sizeof scratch,
+		(void)tc_wg_peer_input(&cl->peer, buf, len, scratch, sizeof scratch,
 		                       &ignored, now_ms());
 	}
-	if (!tc_wg_peer_is_up(&peer, now_ms())) {
+	if (!tc_wg_peer_is_up(&cl->peer, now_ms())) {
 		fprintf(stderr, "tailcat-c: no handshake response from the server\n");
-		goto out;
+		goto fail;
 	}
 	vlogf("tunnel up");
 
-	/* ---- TCP inside the tunnel ----------------------------------------- */
-
 	uint8_t our_ip[TC_TUNNEL_ADDR_LEN], their_ip[TC_TUNNEL_ADDR_LEN];
-	tc_tunnel_addr_for_key(our_ip, me.public_key);
-	tc_tunnel_addr_for_key(their_ip, ci.server_public);
+	tc_tunnel_addr_for_key(our_ip, cl->me.public_key);
+	tc_tunnel_addr_for_key(their_ip, cl->ci.server_public);
 
-	mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &ctx);
-	if (mux == NULL) {
+	cl->mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &cl->ctx);
+	if (cl->mux == NULL) {
 		fprintf(stderr, "tailcat-c: out of memory\n");
-		goto out;
+		goto fail;
 	}
-	if (tc_tcp_mux_connect(mux, port, now_ms(), &tcp) != TC_OK) {
+	tc_derp_set_write_timeout(&cl->derp, 15000);
+	cl->up = true;
+	return TC_OK;
+
+fail:
+	client_down(cl);
+	return 1;
+}
+
+static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
+                    unsigned timeout_s, const char *derpmap_url)
+{
+	static tc_client cl;
+	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
+
+	if (client_up(&cl, addr_str, insecure, derpmap_url, deadline) != TC_OK)
+		return 1;
+
+	tc_tcp_conn *tcp = NULL;
+	if (tc_tcp_mux_connect(cl.mux, port, now_ms(), &tcp) != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not start the connection\n");
-		goto out;
+		client_down(&cl);
+		return 1;
 	}
 	vlogf("connecting to port %u from %u", (unsigned)port,
 	      (unsigned)tc_tcp_local_port(tcp));
 
-	tc_derp_set_write_timeout(&derp, 15000);
-	status = run_pipe(&derp, &peer, mux, tcp, ci.server_public, ping, ping_len,
-	                  &ctx.relay_stalled, deadline);
+	int status = run_pipe(&cl.derp, &cl.peer, cl.mux, tcp,
+	                      cl.ci.server_public, cl.ping, cl.ping_len,
+	                      &cl.ctx.relay_stalled, deadline);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
 
+	client_down(&cl);
+	return status;
+}
+
+/* ---- forward and socks ------------------------------------------------- */
+
+/* Both commands listen locally and dial through the tunnel, so they share a
+ * loop: accept on a set of local sockets, open a tunnel connection, and hand
+ * the pair to the proxy. The only difference is how the remote port is
+ * decided -- fixed per listener for `forward`, negotiated per connection for
+ * `socks` -- which is why the SOCKS handshake is the one thing below that
+ * forward does not use. */
+
+#ifndef TC_MAX_LISTENERS
+#define TC_MAX_LISTENERS 16
+#endif
+
+typedef struct {
+	int fd;
+	uint16_t local_port;  /* as bound, so an OS-chosen port is reported */
+	uint16_t remote_port; /* 0 for socks: each connection negotiates its own */
+} local_listener;
+
+/* bind_local opens a listening socket. bind_addr is a literal address --
+ * "127.0.0.1" by default, "0.0.0.0" to accept from the network, which is a
+ * decision the user has to make explicitly. */
+static int bind_local(const char *bind_addr, uint16_t port, uint16_t *bound)
+{
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons(port);
+	if (inet_pton(AF_INET, bind_addr, &a.sin_addr) != 1) {
+		fprintf(stderr, "tailcat-c: \"%s\" is not an IPv4 address\n",
+		        bind_addr);
+		return -1;
+	}
+
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	int on = 1;
+	(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+	if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 ||
+	    listen(fd, 16) != 0) {
+		fprintf(stderr, "tailcat-c: cannot listen on %s:%u\n", bind_addr,
+		        (unsigned)port);
+		(void)close(fd);
+		return -1;
+	}
+
+	/* Read the port back rather than echoing what was asked for: with 0 the
+	 * kernel chose it, and that is the number the user needs printed. */
+	struct sockaddr_in got;
+	socklen_t glen = sizeof got;
+	if (bound != NULL) {
+		*bound = port;
+		if (getsockname(fd, (struct sockaddr *)&got, &glen) == 0)
+			*bound = ntohs(got.sin_port);
+	}
+
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0)
+		(void)fcntl(fd, F_SETFL, (int)((unsigned)fl | (unsigned)O_NONBLOCK));
+	return fd;
+}
+
+/* ---- SOCKS5 ------------------------------------------------------------ */
+
+/* Only what a tailcat client needs: no authentication, CONNECT only, and the
+ * destination host is ignored because there is exactly one place to go -- the
+ * server at the other end of this tunnel. Only the port is used.
+ *
+ * The negotiation is done in one blocking-ish pass on a non-blocking socket
+ * with a short deadline. A client that has connected to a proxy sends its
+ * greeting immediately; one that does not is not worth waiting for. */
+
+#define SOCKS_VERSION 5
+#define SOCKS_CMD_CONNECT 1
+#define SOCKS_ATYP_IPV4 1
+#define SOCKS_ATYP_NAME 3
+#define SOCKS_ATYP_IPV6 4
+
+/* read_exact reads n bytes with a deadline, on a non-blocking socket. */
+static bool socks_read(int fd, uint8_t *buf, size_t n, uint64_t until)
+{
+	size_t off = 0;
+	while (off < n) {
+		ssize_t r = recv(fd, buf + off, n - off, 0);
+		if (r > 0) {
+			off += (size_t)r;
+			continue;
+		}
+		if (r == 0)
+			return false;
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return false;
+		if (now_ms() >= until)
+			return false;
+		struct pollfd pf = { fd, POLLIN, 0 };
+		(void)poll(&pf, 1, 20);
+	}
+	return true;
+}
+
+static bool socks_write(int fd, const uint8_t *buf, size_t n, uint64_t until)
+{
+	size_t off = 0;
+	while (off < n) {
+		ssize_t w = send(fd, buf + off, n - off, 0);
+		if (w > 0) {
+			off += (size_t)w;
+			continue;
+		}
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+			return false;
+		if (now_ms() >= until)
+			return false;
+		struct pollfd pf = { fd, POLLOUT, 0 };
+		(void)poll(&pf, 1, 20);
+	}
+	return true;
+}
+
+/* socks_handshake negotiates and reports the port the client asked for.
+ * Returns TC_OK having replied "succeeded", or an error having replied with
+ * the appropriate refusal. */
+static int socks_handshake(int fd, uint16_t *out_port)
+{
+	uint64_t until = now_ms() + 10000;
+	uint8_t b[262];
+
+	/* Greeting: version, count, methods. */
+	if (!socks_read(fd, b, 2, until) || b[0] != SOCKS_VERSION)
+		return TC_ERR_INVAL;
+	size_t nmethods = b[1];
+	if (nmethods > 0 && !socks_read(fd, b, nmethods, until))
+		return TC_ERR_INVAL;
+
+	/* We only offer "no authentication". Anything else would be pretending
+	 * to a security property the tunnel already provides. */
+	bool none_ok = false;
+	for (size_t i = 0; i < nmethods; i++)
+		if (b[i] == 0x00)
+			none_ok = true;
+	uint8_t reply[2] = { SOCKS_VERSION, none_ok ? 0x00 : 0xff };
+	if (!socks_write(fd, reply, 2, until) || !none_ok)
+		return TC_ERR_UNSUPPORTED;
+
+	/* Request: version, command, reserved, address type. */
+	if (!socks_read(fd, b, 4, until) || b[0] != SOCKS_VERSION)
+		return TC_ERR_INVAL;
+	uint8_t cmd = b[1];
+	uint8_t atyp = b[3];
+
+	size_t addr_len = 0;
+	switch (atyp) {
+	case SOCKS_ATYP_IPV4: addr_len = 4; break;
+	case SOCKS_ATYP_IPV6: addr_len = 16; break;
+	case SOCKS_ATYP_NAME:
+		if (!socks_read(fd, b, 1, until))
+			return TC_ERR_INVAL;
+		addr_len = b[0];
+		break;
+	default:
+		break;
+	}
+	if (addr_len == 0 && atyp != SOCKS_ATYP_NAME) {
+		uint8_t no[10] = { SOCKS_VERSION, 0x08, 0, SOCKS_ATYP_IPV4 };
+		(void)socks_write(fd, no, sizeof no, until);
+		return TC_ERR_UNSUPPORTED; /* address type not supported */
+	}
+	/* The destination host is read and discarded: there is exactly one place
+	 * this proxy can go, which is the server at the far end of the tunnel.
+	 * Routing by hostname is what upstream's socks does with several servers;
+	 * with one, only the port means anything. */
+	if (addr_len > 0 && !socks_read(fd, b, addr_len, until))
+		return TC_ERR_INVAL;
+	if (!socks_read(fd, b, 2, until))
+		return TC_ERR_INVAL;
+	uint16_t port = (uint16_t)((uint16_t)b[0] << 8 | b[1]);
+
+	if (cmd != SOCKS_CMD_CONNECT || port == 0) {
+		uint8_t no[10] = { SOCKS_VERSION, 0x07, 0, SOCKS_ATYP_IPV4 };
+		(void)socks_write(fd, no, sizeof no, until);
+		return TC_ERR_UNSUPPORTED; /* command not supported */
+	}
+
+	/* "Succeeded", with a zero bound address: the client has no use for it
+	 * and inventing one would be a fiction. */
+	uint8_t ok[10] = { SOCKS_VERSION, 0x00, 0, SOCKS_ATYP_IPV4 };
+	if (!socks_write(fd, ok, sizeof ok, until))
+		return TC_ERR_INVAL;
+
+	*out_port = port;
+	return TC_OK;
+}
+
+/* ---- the shared listen-and-dial loop ----------------------------------- */
+
+static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
+                         tc_proxy *proxy, bool socks, uint64_t deadline)
+{
+	tc_derp_set_read_timeout(&cl->derp, 20);
+
+	while (now_ms() < deadline) {
+		uint64_t t = now_ms();
+
+		if (cl->ctx.relay_stalled) {
+			cl->ctx.relay_stalled = false;
+			vlogf("a relay write stalled; rebuilding the connection");
+			if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+			                  cl->ping_len, deadline) != TC_OK) {
+				fprintf(stderr, "tailcat-c: lost the relay\n");
+				return 1;
+			}
+		}
+
+		tc_wg_peer_tick(&cl->peer, t);
+		tc_tcp_mux_tick(cl->mux, t);
+
+		/* Accept whatever is waiting on each local listener. */
+		for (size_t i = 0; i < nls; i++) {
+			for (;;) {
+				int fd = accept(ls[i].fd, NULL, NULL);
+				if (fd < 0)
+					break;
+
+				uint16_t want = ls[i].remote_port;
+				if (socks && socks_handshake(fd, &want) != TC_OK) {
+					vlogf("SOCKS negotiation failed");
+					(void)close(fd);
+					continue;
+				}
+
+				tc_tcp_conn *c = NULL;
+				if (tc_tcp_mux_connect(cl->mux, want, t, &c) != TC_OK) {
+					vlogf("no room for another connection");
+					(void)close(fd);
+					continue;
+				}
+				if (tc_proxy_add(proxy, c, fd) != TC_OK) {
+					vlogf("no room for another connection");
+					(void)close(fd);
+					tc_tcp_mux_close(cl->mux, c, t);
+					continue;
+				}
+				vlogf("forwarding a connection to the server's port %u",
+				      (unsigned)want);
+			}
+		}
+
+		bool progress = tc_proxy_pump(proxy, t) > 0;
+		tc_proxy_reap(proxy, t);
+		/* Only now, once the proxy has dropped anything that finished: the
+		 * mux is about to free the connections it points at. */
+		tc_tcp_mux_reap(cl->mux);
+
+		if (!progress && !tc_derp_has_pending(&cl->derp)) {
+			struct pollfd pfds[1 + TC_MAX_LISTENERS + TC_TCP_MAX_CONNS];
+			nfds_t nfds = 0;
+			int dfd = tc_derp_fd(&cl->derp);
+			if (dfd >= 0) {
+				pfds[nfds].fd = dfd;
+				pfds[nfds].events = POLLIN;
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+			for (size_t i = 0; i < nls; i++) {
+				pfds[nfds].fd = ls[i].fd;
+				pfds[nfds].events = POLLIN;
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+			for (size_t i = 0; i < TC_TCP_MAX_CONNS &&
+			                   nfds < 1 + TC_MAX_LISTENERS + TC_TCP_MAX_CONNS;
+			     i++) {
+				int pfd = -1;
+				bool rd = false, wr = false;
+				if (!tc_proxy_interest(proxy, i, &pfd, &rd, &wr))
+					continue;
+				if (!rd && !wr)
+					continue;
+				pfds[nfds].fd = pfd;
+				pfds[nfds].events =
+				    (short)((rd ? POLLIN : 0) | (wr ? POLLOUT : 0));
+				pfds[nfds].revents = 0;
+				nfds++;
+			}
+
+			int wait_ms = 20;
+			uint64_t dl = tc_tcp_mux_next_deadline(cl->mux);
+			uint64_t wdl = tc_wg_peer_next_deadline(&cl->peer);
+			if (wdl < dl)
+				dl = wdl;
+			if (dl != UINT64_MAX) {
+				uint64_t nowv = now_ms();
+				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
+				if (wait_ms > 200)
+					wait_ms = 200;
+			}
+			if (nfds > 0)
+				(void)poll(pfds, nfds, wait_ms);
+		}
+
+		uint8_t src[32];
+		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+		size_t len = 0;
+		int rc = tc_derp_recv(&cl->derp, src, buf, sizeof buf, &len);
+		if (rc == TC_ERR_TIMEOUT) {
+			if (tc_derp_idle_ms(&cl->derp) > TC_DERP_DEAD_AFTER_MS) {
+				vlogf("no keep-alive; the relay is gone");
+				if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+				                  cl->ping_len, deadline) != TC_OK) {
+					fprintf(stderr, "tailcat-c: lost the relay\n");
+					return 1;
+				}
+			}
+			continue;
+		}
+		if (rc == TC_ERR_CLOSED) {
+			if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+			                  cl->ping_len, deadline) != TC_OK) {
+				fprintf(stderr, "tailcat-c: relay: %s\n",
+				        tc_derp_error_string());
+				return 1;
+			}
+			continue;
+		}
+		if (rc != TC_OK) {
+			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
+			return 1;
+		}
+		if (memcmp(src, cl->ci.server_public, 32) != 0 || len == 0)
+			continue;
+
+		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
+		size_t inner_len = 0;
+		if (tc_wg_peer_input(&cl->peer, buf, len, inner, sizeof inner,
+		                     &inner_len, now_ms()) != TC_OK)
+			continue;
+		if (inner_len == 0)
+			continue;
+		tc_tcp_mux_input(cl->mux, inner, inner_len, now_ms());
+	}
+	return 0;
+}
+
+/* cmd_forward_or_socks runs both commands: they differ only in where the
+ * listeners come from and whether each connection negotiates its own port. */
+static int cmd_forward_or_socks(const char *addr_str, const char **specs,
+                                size_t nspecs, const char *bind_addr,
+                                bool socks, bool insecure, unsigned timeout_s,
+                                const char *derpmap_url)
+{
+	static tc_client cl;
+	uint64_t deadline = (timeout_s == 0)
+	                        ? UINT64_MAX
+	                        : now_ms() + (uint64_t)timeout_s * 1000u;
+
+	local_listener ls[TC_MAX_LISTENERS];
+	size_t nls = 0;
+	memset(ls, 0, sizeof ls);
+
+	/* Bind before dialling out: a port already in use should fail now,
+	 * cheaply, rather than after a handshake with a relay. */
+	if (socks) {
+		uint16_t want = 0;
+		if (nspecs > 0) {
+			tc_fwd_spec f;
+			if (tc_fwd_parse(&f, specs[0]) != TC_OK) {
+				fprintf(stderr, "tailcat-c: %s\n", tc_fwd_error_string());
+				return 2;
+			}
+			want = f.local_port;
+		}
+		ls[0].fd = bind_local(bind_addr, want, &ls[0].local_port);
+		if (ls[0].fd < 0)
+			return 1;
+		nls = 1;
+	} else {
+		if (nspecs == 0) {
+			fprintf(stderr, "tailcat-c: forward needs at least one mapping, "
+			                "such as 8080 or 18080:8080\n");
+			return 2;
+		}
+		for (size_t i = 0; i < nspecs && i < TC_MAX_LISTENERS; i++) {
+			tc_fwd_spec f;
+			int rc = tc_fwd_parse(&f, specs[i]);
+			if (rc != TC_OK) {
+				fprintf(stderr, "tailcat-c: %s\n", tc_fwd_error_string());
+				for (size_t j = 0; j < nls; j++)
+					(void)close(ls[j].fd);
+				return 2;
+			}
+			ls[nls].fd = bind_local(bind_addr, f.local_port,
+			                        &ls[nls].local_port);
+			if (ls[nls].fd < 0) {
+				for (size_t j = 0; j < nls; j++)
+					(void)close(ls[j].fd);
+				return 1;
+			}
+			ls[nls].remote_port = f.remote_port;
+			nls++;
+		}
+	}
+
+	for (size_t i = 0; i < nls; i++) {
+		if (socks)
+			fprintf(stderr, "# SOCKS5 proxy on %s:%u\n", bind_addr,
+			        (unsigned)ls[i].local_port);
+		else
+			fprintf(stderr, "# %s:%u -> the server's port %u\n", bind_addr,
+			        (unsigned)ls[i].local_port,
+			        (unsigned)ls[i].remote_port);
+	}
+	fflush(stderr);
+
+	int status = 1;
+	tc_proxy *proxy = NULL;
+	if (client_up(&cl, addr_str, insecure, derpmap_url,
+	              now_ms() + 60000) != TC_OK)
+		goto out;
+
+	proxy = tc_proxy_new(TC_TCP_MAX_CONNS);
+	if (proxy == NULL) {
+		fprintf(stderr, "tailcat-c: out of memory\n");
+		goto out;
+	}
+
+	status = run_listeners(&cl, ls, nls, proxy, socks, deadline);
+
 out:
-	/* The mux owns every connection it handed out. */
-	tc_tcp_mux_free(mux);
-	log_wg_summary(&peer);
-	tc_wg_peer_clear(&peer);
-	tc_derp_close(&derp);
+	/* Order matters: the proxy refers to connections the mux owns. */
+	tc_proxy_free(proxy);
+	client_down(&cl);
+	for (size_t i = 0; i < nls; i++)
+		(void)close(ls[i].fd);
 	return status;
 }
 
@@ -1531,6 +2017,10 @@ int main(int argc, char **argv)
 	/* NULL means the built-in default; --derpmap-url overrides, matching
 	 * upstream's flag of the same name. */
 	const char *derpmap_url = NULL;
+	/* Loopback by default. Listening on the network is a decision with
+	 * consequences -- anyone who can reach this machine can then reach the
+	 * server through it -- so it has to be asked for. */
+	const char *bind_addr = "127.0.0.1";
 	/* Room for a subcommand plus several port specs: upstream allows the
 	 * list to be spread over arguments, as in `serve 80,443 8000-8999`. */
 	const char *args[16];
@@ -1545,6 +2035,8 @@ int main(int argc, char **argv)
 			insecure = true;
 		} else if (strcmp(a, "--relay") == 0 && i + 1 < argc) {
 			relay = argv[++i];
+		} else if (strcmp(a, "--bind") == 0 && i + 1 < argc) {
+			bind_addr = argv[++i];
 		} else if (strcmp(a, "--derpmap-url") == 0 && i + 1 < argc) {
 			derpmap_url = argv[++i];
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
@@ -1571,7 +2063,10 @@ int main(int argc, char **argv)
 	}
 	/* Outside the port server, a deadline of zero would mean "give up at
 	 * once", which nobody asks for by typing --timeout 0. */
-	if (timeout_s == 0 && strcmp(args[0], "serve") != 0)
+	/* These three are meant to stay up, so a deadline of zero means "no
+	 * deadline" rather than "expire at once". */
+	if (timeout_s == 0 && strcmp(args[0], "serve") != 0 &&
+	    strcmp(args[0], "forward") != 0 && strcmp(args[0], "socks") != 0)
 		timeout_s = 60;
 	if (strcmp(args[0], "version") == 0) {
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);
@@ -1620,6 +2115,28 @@ int main(int argc, char **argv)
 		}
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url);
+	}
+	if (strcmp(args[0], "forward") == 0) {
+		if (nargs < 3) {
+			fprintf(stderr, "tailcat-c: forward needs an address and at "
+			                "least one mapping, such as 8080 or 18080:8080\n");
+			return 2;
+		}
+		return cmd_forward_or_socks(args[1], &args[2], nargs - 2, bind_addr,
+		                            false, insecure,
+		                            timeout_given ? timeout_s : 0,
+		                            derpmap_url);
+	}
+	if (strcmp(args[0], "socks") == 0) {
+		if (nargs < 2) {
+			fprintf(stderr, "tailcat-c: socks needs an address\n");
+			return 2;
+		}
+		return cmd_forward_or_socks(args[1], nargs >= 3 ? &args[2] : NULL,
+		                            nargs >= 3 ? nargs - 2 : 0, bind_addr,
+		                            true, insecure,
+		                            timeout_given ? timeout_s : 0,
+		                            derpmap_url);
 	}
 	if (strcmp(args[0], "parse") == 0) {
 		if (nargs < 2) {
