@@ -65,8 +65,11 @@ int tc_endpoint_format(char *out, size_t cap, const tc_endpoint *ep)
 		}
 		unsigned group =
 		    (unsigned)ep->ip[2 * i] << 8 | (unsigned)ep->ip[2 * i + 1];
-		n = snprintf(out + off, cap - off, "%s%x",
-		             (i > 0 && i != best_start + best_len) ? ":" : "", group);
+		/* The run above contributes one colon and the group after it
+		 * contributes the other, which is what makes "::". Suppressing the
+		 * separator here because a run just ended turns "2001:db8::1" into
+		 * "2001:db8:1" -- a different address, and one that still parses. */
+		n = snprintf(out + off, cap - off, "%s%x", i > 0 ? ":" : "", group);
 		if (n < 0 || (size_t)n >= cap - off)
 			return TC_ERR_NOSPACE;
 		off += (size_t)n;
@@ -149,4 +152,40 @@ bool tc_endpoint_is_candidate(const tc_endpoint *ep)
 
 	/* fd00::/8 unique-local stays, for the same reason RFC 1918 does. */
 	return true;
+}
+
+static const uint8_t kV4MappedPrefix[12] = { 0, 0, 0, 0, 0,    0,
+	                                         0, 0, 0, 0, 0xff, 0xff };
+
+void tc_endpoint_to16(const tc_endpoint *ep, uint8_t out[16])
+{
+	if (ep == NULL || out == NULL)
+		return;
+	if (ep->ip_len == 16) {
+		memcpy(out, ep->ip, 16);
+		return;
+	}
+	memcpy(out, kV4MappedPrefix, 12);
+	if (ep->ip_len == 4)
+		memcpy(out + 12, ep->ip, 4);
+	else
+		memset(out + 12, 0, 4);
+}
+
+void tc_endpoint_from16(tc_endpoint *out, const uint8_t in[16], uint16_t port)
+{
+	if (out == NULL || in == NULL)
+		return;
+	memset(out, 0, sizeof *out);
+	out->port = port;
+	/* Unmap, so that an IPv4 address that travelled in its v4-mapped costume
+	 * comes back as IPv4 and compares equal to the same address learned any
+	 * other way. Leaving it mapped would make one address look like two. */
+	if (memcmp(in, kV4MappedPrefix, 12) == 0) {
+		memcpy(out->ip, in + 12, 4);
+		out->ip_len = 4;
+		return;
+	}
+	memcpy(out->ip, in, 16);
+	out->ip_len = 16;
 }

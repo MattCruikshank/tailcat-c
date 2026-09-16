@@ -492,6 +492,18 @@ Fixed with `MSG_NOSIGNAL` per call rather than by changing the signal
 disposition of whatever program links the library, which is not a library's
 decision to make.
 
+**16. Every compressible IPv6 address formatted wrong.** *(Phase 4.3, found
+by the first disco test that printed one.)* The zero-run compressor emitted
+one colon for the run, then suppressed the separator on the group after it,
+so `2001:db8::1` came out as `2001:db8:1`. The formatter had shipped with
+exactly one IPv6 assertion covering it -- RFC 5769's STUN vector, which
+happens to have no zero groups at all -- so the entire compression path was
+dead code as far as the suite was concerned. A test vector chosen by someone
+else is only an anchor for the cases it contains. The replacement test walks
+RFC 5952's rules and then feeds our own output back through `inet_pton`,
+because a formatter checked only against a parser I also wrote proves that
+the two agree, not that either is right.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my

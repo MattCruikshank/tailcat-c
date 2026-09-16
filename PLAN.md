@@ -303,22 +303,34 @@ What remains of upstream's command set -- `recv`, `ls`, `serve ssh`,
 The big one, and the thing that makes tailcat *tailcat* rather than a relay
 client. This is the other half of the original scope question.
 
-### 4.1 UDP transport and endpoint enumeration · ~300 lines · medium risk
+### 4.1 UDP transport and endpoint enumeration ✅ · 545 lines
 
 A UDP socket alongside the DERP connection, local address enumeration, and
 sending WireGuard packets to a peer address rather than through the relay.
 
-### 4.2 STUN client · ~250 lines · low risk
+### 4.2 STUN client ✅ · 314 lines
 
 RFC 5389 binding requests to the relays' STUN ports to learn our public
 address. Small and well specified; upstream's is 450 lines of Go.
 
-### 4.3 disco protocol · ~400 lines · medium risk
+### 4.3 disco protocol ✅ · 368 lines
 
-`"TS💬"` magic, a type byte, a version byte, then a NaCl box — **and we
-already have NaCl box from M3**. For basic traversal only three of the nine
-message types matter: `Ping` (0x01), `Pong` (0x02) and `CallMeMaybe` (0x03).
-The rest are UDP-relay endpoint allocation and can wait.
+`"TS💬"` magic, a sender disco key, a nonce, then a NaCl box from M3.
+Three of the nine message types cover basic traversal: `Ping` (0x01), `Pong`
+(0x02) and `CallMeMaybe` (0x03); the rest are UDP-relay endpoint allocation
+and parse as unknown, which is what an older peer does anyway.
+
+Two decisions worth writing down. `tc_disco_open` takes the key it *expects*
+and requires the packet's own sender field to match it — opening with
+whatever key the packet names would let anyone seal a valid disco message to
+us, which is the one thing sealing is for. And a ping padded past 32 bytes is
+not read as a node key: the sender omits that field when it has none, so
+zeros there can only be MTU filler, and reading them would invent a peer
+identity out of padding.
+
+Verified against `tailscale.com/disco` in both directions — our messages
+against theirs, and their bytes through our parser — using inner payloads as
+vectors, since the outer nonce is random and cannot be compared.
 
 ### 4.4 Path discovery and upgrade · ~600 lines · **high risk**
 

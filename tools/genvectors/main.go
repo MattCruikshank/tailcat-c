@@ -29,7 +29,10 @@ import (
 	"strings"
 
 	"github.com/tailscale/wireguard-go/device"
+	"go4.org/mem"
+	"tailscale.com/disco"
 	"tailscale.com/net/stun"
+	"tailscale.com/types/key"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -597,6 +600,59 @@ func main() {
 		b.line("\t{ %q, %q, %q, %q, %d },",
 			fmt.Sprintf("resp-%d", i), h(tx[:]), h(msg),
 			h(ap.Addr().AsSlice()), int(ap.Port()))
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- disco payloads ----------------------------------------------
+	//
+	// The *inner* messages, marshalled by tailscale.com/disco. The outer
+	// wrapper is a NaCl box with a random nonce, so it cannot be compared
+	// byte for byte; the payload inside it can, and that is where every
+	// field offset lives.
+	b.line("/* disco inner payloads, via tailscale.com/disco. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *want;")
+	b.line("} kDiscoPayloadVectors[] = {")
+	{
+		var tx [12]byte
+		copy(tx[:], rb(12))
+
+		// Ping with no node key.
+		p1 := (&disco.Ping{TxID: tx}).AppendMarshal(nil)
+		b.line("\t{ %q, %q },", "ping-bare", h(p1))
+
+		// Ping with a node key.
+		var nk [32]byte
+		copy(nk[:], rb(32))
+		p2 := (&disco.Ping{
+			TxID:    tx,
+			NodeKey: key.NodePublicFromRaw32(mem.B(nk[:])),
+		}).AppendMarshal(nil)
+		b.line("\t{ %q, %q },", "ping-with-nodekey", h(p2))
+
+		// Ping with padding, which is how the path MTU gets probed.
+		p3 := (&disco.Ping{TxID: tx, Padding: 20}).AppendMarshal(nil)
+		b.line("\t{ %q, %q },", "ping-padded", h(p3))
+
+		// Pong, for both address families.
+		for i, a := range []string{"203.0.113.7:41641", "[2001:db8::1]:443"} {
+			pong := (&disco.Pong{
+				TxID: tx,
+				Src:  netip.MustParseAddrPort(a),
+			}).AppendMarshal(nil)
+			b.line("\t{ %q, %q },", fmt.Sprintf("pong-%d", i), h(pong))
+		}
+
+		// CallMeMaybe, empty and with a mix of families.
+		cm0 := (&disco.CallMeMaybe{}).AppendMarshal(nil)
+		b.line("\t{ %q, %q },", "cmm-empty", h(cm0))
+		cm1 := (&disco.CallMeMaybe{MyNumber: []netip.AddrPort{
+			netip.MustParseAddrPort("192.168.1.10:41641"),
+			netip.MustParseAddrPort("203.0.113.7:41641"),
+			netip.MustParseAddrPort("[2001:db8::1]:41641"),
+		}}).AppendMarshal(nil)
+		b.line("\t{ %q, %q },", "cmm-three", h(cm1))
 	}
 	b.line("};")
 	b.line("")

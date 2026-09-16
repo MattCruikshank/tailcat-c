@@ -167,6 +167,7 @@ LIB_SRCS := \
 	src/derp/derpmap.c \
 	src/net/stun.c \
 	src/net/udp.c \
+	src/net/disco.c \
 	src/net/tcp.c \
 	src/net/tcpmux.c \
 	src/net/proxy.c \
