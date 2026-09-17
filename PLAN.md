@@ -9,13 +9,12 @@ WireGuard tunnel, userspace TCP and UDP, and direct peer-to-peer paths with
 NAT traversal — working in both roles and verified against the real Go
 implementation.
 
-**Phases 1–4 are done. Phase 5 is partly done**, and what is left of it
-divides into three quite different things: one small piece of ordinary work
-(SOCKS5 UDP ASSOCIATE), one blocked on a licence decision (the SSH and SFTP
-servers), and one blocked on a toolchain that does not exist for
-Cosmopolitan (WebAssembly). A fourth, TLS 1.3, was attempted and turned out
-to be blocked on an Ed25519 certificate Mbed TLS cannot parse, rather than
-on effort.
+**Phases 1–4 are done. Phase 5 is mostly done**, and everything still open
+is blocked on something other than effort: the SSH and SFTP servers on a
+licence decision, WebAssembly on a toolchain that does not exist for
+Cosmopolitan, and TLS 1.3 on an Ed25519 certificate Mbed TLS cannot parse.
+The ordinary work that was left — SOCKS5 UDP ASSOCIATE, the `--allow` list,
+and an Ed25519 of our own — is done and folded into the sections below.
 
 Sizes are rough C line counts for the new code, excluding tests, which have
 run about 1:1 with implementation on this project. "Risk" is about how likely
@@ -555,10 +554,10 @@ single channel with only the `subsystem` request. No PTY, no port
 forwarding, no agent forwarding, no shell — which is most of what makes a
 general `sshd` large, and all of which a drop box should not have.
 
-The one real gap **was Ed25519**, and it is now done: `tc/ed25519.h`, about
-600 lines, checked against RFC 8032's published vectors and byte-for-byte
-against Go's `crypto/ed25519`. So `ssh-ed25519` keys need no
-`ecdsa-sha2-nistp256` fallback.
+The one real gap **was Ed25519**, and it is now done: `tc/ed25519.h`, 877
+lines, checked against RFC 8032's published vectors and byte-for-byte against
+Go's `crypto/ed25519`. So `ssh-ed25519` keys need no `ecdsa-sha2-nistp256`
+fallback.
 
 The estimate drops from ~4,000 lines to ~2,500 precisely because the scope
 is the subset rather than a general server.
@@ -627,6 +626,42 @@ does, and the direct-path work from Phase 4 has nothing to stand on — a
 browser cannot open a UDP socket at all, so a WASM build is relay-only by
 construction.
 
+### 5.7 the allow list ✅ · ~300 lines
+
+`--allow` restricts a server to named client node keys, matching upstream's
+flag. Small, and worth a note for one decision inside it: `tc_allow_permits`
+refuses the all-zero key **before** it checks whether a list exists at all.
+
+The ordering is the whole point. The natural shape is "no list configured, so
+permit everything", with the sanity check on the key somewhere after it — and
+that admits the all-zero key in exactly the permissive configuration where
+nobody is watching for it. A refusal that only applies once you have already
+opted into restriction is not a refusal.
+
+Without `--allow`, and especially with `serve exit-node`, anyone holding the
+address can reach anything the serving machine can, including loopback
+services and cloud metadata endpoints. It is off by default because that is
+upstream's default, not because it is the safe one.
+
+### 5.8 TCP hardening ✅ · ~120 lines
+
+Not planned; found. Making `tests/fuzz_tcp.c` assert its own reach turned up
+two ways a single authenticated peer could permanently exhaust the 64-entry
+connection table — a corrupt SYN leaving an unreapable connection in
+`LISTEN`, and a vanished peer leaving one in `ESTABLISHED` with no timer
+watching it. The second is fixed with keepalive probes, which detect a peer
+that does not *answer* rather than one that is merely quiet.
+
+The README has the detail as bugs 20 and 21, including the third bug the fix
+contained (a deadline the tick declined to act on, so a caller sleeping until
+it would spin) and the fourth it revealed (a zero-length keepalive probe, of
+the kind a Linux kernel sends, drew no acknowledgement at all).
+
+What it says about method is the reusable part: the fuzzer had been reporting
+the same 64 accepted connections at 20,000 iterations and at 200,000, and
+nothing was watching that number. Every harness now fails if it stops
+reaching the code it exists to exercise.
+
 ---
 
 ## Cross-cutting
@@ -638,14 +673,20 @@ These are already in the README's TODO list and do not depend on any feature.
   deliberately -- the live tests dial Tailscale's production relays, and that
   is not something to automate on every push.
 - **Test on macOS, the BSDs, and aarch64.** Two of six target operating
-  systems are covered, both x86_64. The aarch64 half of every binary is built
-  and linked but **has never been executed**. This is the largest untested
-  claim remaining.
-- **Extend fuzzing** to the DERP frame codec, the JSON parser and the TCP
-  input path.
-- **Extend mutation testing** beyond path discovery and the UDP mux, which
-  are the only two modules it has been applied to. It found gaps in both, at
-  a rate that suggests the other modules have them too.
+  systems are covered, both x86_64. The aarch64 half is no longer wholly
+  unexecuted: `make test-unsigned-char` runs the entire suite under aarch64's
+  character signedness and passes, which clears the largest *class* of risk,
+  and `make test-aarch64` runs real aarch64 instructions under qemu-user but
+  needs `qemu-user-static` installed. qemu-system and real hardware are the
+  rungs above. The four remaining operating systems are still the largest
+  untested claim.
+- **Extend fuzzing** to the DERP frame codec, which is the last of the three
+  originally listed here — the JSON parser and the TCP input path both have
+  harnesses now. The frame codec parses attacker-influenced lengths straight
+  off a socket, which is the shape that produced bugs 20 and 21.
+- **Extend mutation testing** beyond path discovery, the UDP mux and TCP,
+  which are the only three modules it has been applied to. It found gaps in
+  every one of them, at a rate that suggests the rest have them too.
 - **Constant-time audit** with actual timing measurements, rather than the
   current "written in a data-independent style".
 - **Thread-safety**: either make `tc_derp_client` safe for concurrent use or
@@ -662,12 +703,13 @@ These are already in the README's TODO list and do not depend on any feature.
 | 3 — commands | ~1,970 | ✅ done |
 | 4 — direct paths | 2,801 | ✅ done |
 | 5.1, 5.2 — datagrams, NAT64, exit nodes | ~990 | ✅ done |
+| 5.1 — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
 | 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
 | 5.4, 5.5 — SSH + SFTP (and `recv`, `ls`) | ~4,000 | ⏸ licence decision |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
-| — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
-| — `--allow` list | ~300 | ✅ done |
-| — Ed25519 (RFC 8032) | ~600 | ✅ done |
+| 5.7 — `--allow` list | ~300 | ✅ done |
+| 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
+| — Ed25519 (RFC 8032) | 877 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in
 particulars. Phase 4 came in at 2,801 against ~1,950 estimated — the extra is
@@ -677,9 +719,12 @@ because the scope turned out to be "sftp over ssh" rather than "an ssh
 server". The one that was simply wrong was 3.5 (`recv`), estimated at ~300
 lines and actually a subset of 5.5.
 
-Source today is about **22,000 lines** across `src/` and `include/`, with
-another **14,000** of tests. The 1:1 ratio predicted at the start has held
-almost exactly.
+Source today is **20,291 lines** under `src/` plus 4,087 of headers, against
+**15,709** of tests and another 2,221 of shell for the live ones. Counting
+the live scripts as tests, which is what they are, that is roughly 18,000 of
+checking against 20,000 of implementation — near enough the 1:1 ratio
+predicted at the start, and the ratio has been the useful part rather than
+the totals.
 
 Phase 2 and Phase 4 were where the real difficulty was, and both had the
 failure modes predicted for them: things that only appear under load or over
@@ -708,6 +753,17 @@ discovery were not actually being made.
    that state, exactly as on any stack that has not added a
    `tcp_fin_timeout`. Small, and the table it protects holds sixty-four
    entries.
+4. **Fuzz the DERP frame codec, and mutate the modules that have never been
+   mutated.** Both are listed under Cross-cutting, and both are cheap next to
+   what they have historically returned: every module mutated so far gave up
+   at least one assertion that was not actually being made, and the TCP
+   fuzzer found two table-exhaustion bugs within minutes of being made honest
+   about its own reach.
+5. **Make reaping automatic, or say plainly that it is not.**
+   `tc_tcp_mux_reap` has to be called or closed connections hold their slots.
+   That is now less dangerous than it was — bugs 20 and 21 removed the two
+   ways connections got stuck *unreapable* — but it is still a caller
+   obligation documented in one header and easy to miss.
 
 WebAssembly is last on purpose, and possibly never: it is a second artifact
 for a project whose premise is one file, and a browser cannot open a UDP

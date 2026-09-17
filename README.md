@@ -89,9 +89,6 @@ widening the connection key from a port pair to a four-tuple.
 - The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
   this means a second toolchain and a second build of everything — arguably
   against the premise of a project whose whole point is one fat APE.
-- **Originating UDP through the tunnel from the CLI.** The tunnel carries it
-  and an exit node forwards it; what is missing is SOCKS5 UDP ASSOCIATE,
-  which is how upstream's CLI exposes it.
 - **TLS 1.3**, which is blocked on something more interesting than effort;
   see [the note below](#tls-13-is-blocked-on-ed25519).
 
@@ -110,8 +107,8 @@ keeps debug information in sibling files rather than in the executable.)
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **1.95 MB** | 17.70 MB |
-| gzipped | **0.97 MB** | 6.85 MB |
+| binary | **1.98 MB** | 17.70 MB |
+| gzipped | **0.99 MB** | 6.85 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
 The ratio is about 9×, and **most of it is the feature gap below, not
@@ -119,19 +116,22 @@ craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
 of the rest.
 
-Where our 1.95 MB actually goes, measured with `size` on the objects:
+Where our 1.98 MB actually goes, as `size` reports text+data on the x86_64
+objects — so these are code and initialised data, not file offsets, and they
+do not sum to the binary:
 
-| | bytes |
+| | |
 |---|---:|
-| Mbed TLS | 340 KB |
+| Mbed TLS | 249 KB |
 | the compiled-in CA bundle | 181 KB |
-| **all of our own code** | **118 KB** |
+| **all of our own code** | **140 KB** |
 | Cosmopolitan libc, and two architectures of everything | the remainder |
 
-So the interesting number is not 1.95 MB. It is that one file covers every
+So the interesting number is not 1.98 MB. It is that one file covers every
 target, and that the entire protocol implementation — addresses, CBOR, JSON,
-crypto, DERP, WireGuard, TCP, UDP, STUN, disco, netcheck, path discovery —
-is smaller than the list of certificate authorities it ships with.
+crypto, DERP, WireGuard, TCP, UDP, STUN, disco, netcheck, path discovery,
+and our own Ed25519 — is still smaller than the list of certificate
+authorities it ships with.
 
 Phases 3 through 5 added about 288 KB to the binary and roughly 6,000 lines
 of source, which is the cost of everything from `serve <ports>` through
@@ -188,9 +188,8 @@ and interoperably, plus everything built on top of it: serving ports,
 forwarding, SOCKS, exit nodes, ssh and cp, and saved identities.
 
 What is left is the **SSH server** that `recv`, `ls` and `serve ssh` all sit
-behind, the browser build, and a CLI surface for originating UDP. The first
-of those is most of the remaining distance, and it is a licence question
-before it is a code question.
+behind, and the browser build. The first is most of the remaining distance,
+and it is a licence question before it is a code question.
 
 ## Build
 
@@ -232,10 +231,16 @@ Local, tiered, numbered like Starfleet diagnostics -- **1 is the one where you
 take the panels off**, 5 is the quick sweep:
 
 ```console
-$ make diag5     # ~5s    did I just break the build
-$ make diag3     # ~30s   both toolchains, sanitizers, fuzzing, crosscheck
-$ make diag1     # ~15m   the above from a clean tree, plus every live test
+$ make diag5     # ~7s     did I just break the build
+$ make diag3     # ~1m30s  both toolchains, sanitizers, fuzzing, crosscheck
+$ make diag1     # long    the above from a clean tree, plus every live test
 ```
+
+The first two are measured on this machine, warm. Level 1's duration is
+deliberately not given a number here: it grew by eight live tests when bug 19
+was fixed and by two aarch64 stages after that, and the figure that used to
+sit in this comment predates both. It prints its own total, and every stage
+inside it times itself, which is the number to trust.
 
 Level 3 runs before every push. Install the hook once:
 
@@ -306,7 +311,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-25 test binaries, ~6,500 assertions, under two toolchains. The method matters
+28 test binaries, 8,556 assertions, under two toolchains. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
 
@@ -570,7 +575,7 @@ shell, no `scp` protocol. Those are most of what makes a general `sshd` big,
 and all of them are things a drop box should *not* have.
 
 The one genuine gap **was Ed25519**, and it is now closed: `tc/ed25519.h`
-implements RFC 8032 in about 600 lines, checked against RFC 8032's published
+implements RFC 8032 in 877 lines, checked against RFC 8032's published
 vectors and byte-for-byte against Go's `crypto/ed25519`. So `ssh-ed25519`
 host and user keys are available without an `ecdsa-sha2-nistp256` fallback,
 and the "no unvendored crypto beyond Mbed TLS" property survives.
@@ -933,11 +938,14 @@ Current, and deliberate unless noted.
 
 ### TLS
 
-- **TLS 1.2 only.** TLS 1.3 in Mbed TLS 3.6 requires the PSA crypto layer,
-  which is a large amount of additional code. Tailscale's relays accept 1.2,
-  and ECDHE with AEAD suites is not a weak configuration — but it does mean
-  upstream's "fast start" optimisation is unavailable, since reading the
-  relay's key from a meta certificate requires 1.3.
+- **TLS 1.2 only**, and not for the reason this entry used to give. Enabling
+  1.3 in Mbed TLS 3.6 turned out to be easy; what blocks it is that DERP's
+  1.3-only meta certificate is **Ed25519**, which Mbed TLS cannot parse, so
+  the chain is rejected whole. See
+  [TLS 1.3 is blocked on Ed25519](#tls-13-is-blocked-on-ed25519). Tailscale's
+  relays accept 1.2 and ECDHE with AEAD suites is not a weak configuration —
+  but it does mean upstream's "fast start" optimisation is unavailable, since
+  reading the relay's key from that certificate requires 1.3.
 - **The CA bundle is a point-in-time snapshot** of Mozilla's roots, compiled
   in and refreshed only by re-running `scripts/gen-ca-bundle.py`. A root
   distrusted upstream stays trusted here until someone regenerates it.
@@ -982,12 +990,12 @@ Current, and deliberate unless noted.
 
 ### Implementation
 
-- **Writes have no timeout.** Reads are bounded by
-  `tc_derp_set_read_timeout`, and a timed-out read is recoverable rather than
-  fatal -- the TLS record layer keeps what it had, so a later read resumes
-  mid-record. Writes can still block indefinitely on a stalled relay.
-- **No reconnection.** `FRAME_RESTARTING` is parsed and ignored; a dropped
-  connection is simply an error to the caller.
+- **A read timeout is recoverable and a write timeout is not.** Both exist
+  (`tc_derp_set_read_timeout`, `tc_derp_set_write_timeout`), but they are not
+  symmetric: a timed-out read leaves the TLS record layer holding what it
+  had, so a later read resumes mid-record, whereas a timed-out write may have
+  emitted part of a frame and the stream cannot be trusted afterwards. The
+  headers say so at both declarations.
 - **A `tc_derp_client` is not safe for concurrent use.** Send and receive both
   touch the same stream with no lock, and both use thread-local scratch
   buffers of about 64KB each.
@@ -1078,12 +1086,23 @@ Roughly in the order they should be picked up.
       covered; the other four targets and the entire aarch64 half are not.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
       that callers must serialise it.
-- [ ] Revisit **TLS 1.3** *after* Ed25519 exists, not before — the blocker is
-      the Ed25519 meta certificate, not the PSA dependency.
+- [ ] Revisit **TLS 1.3**. Ed25519 now exists here, so the remaining blocker
+      is narrower than it was: Mbed TLS's X.509 parser has no hook to hand an
+      unknown signature algorithm to ours, and the certificate in question is
+      one we would then skip rather than verify. Still in service of an
+      optimisation we do not implement.
 - [ ] Refresh the **CA bundle** and decide on a cadence for it.
 - [ ] Consider making the address-parser limits runtime-configurable.
 - [ ] **Refresh the DERP map cache in the background** rather than only on a
       miss, so a long-lived process does not pay a fetch mid-session.
+- [ ] **Fuzz the DERP frame codec.** It parses attacker-influenced lengths
+      straight off a socket, which is the same shape as the TCP reassembly
+      queue, and that is where bugs 20 and 21 came from. It has vectors and
+      no fuzzer.
+- [ ] **Extend mutation testing beyond the modules that have had it.** Path
+      discovery, the UDP mux and now TCP have been mutated; the address
+      codec, CBOR, JSON, Noise and DERP have not. Every module that has been
+      mutated so far gave up at least one untested assertion.
 
 ## Roadmap
 
@@ -1102,8 +1121,8 @@ Roughly in the order they should be picked up.
       handshake, transport encryption and the 2048-bit sliding replay window.
       Verified against real wireguard-go by `make live-wg`, which completes a
       handshake and gets an encrypted IPv4 packet delivered to its TUN.
-      Rekeying and the cookie/DoS exchange are not implemented; see
-      Limitations.
+      Rekeying and the cookie/DoS exchange landed later, in phases 2.2 and
+      2.3.
 - [x] **M5 — meow bootstrap.** The introduction exchange, the disco key
       derivation a peer must advertise, and tunnel addressing. Verified
       end to end by `make live-tailcat`: a real tailcat server accepts our
@@ -1208,7 +1227,34 @@ execs the system scp, which speaks exactly that protocol.
       `-isystem` header that includes it, so editing the config rebuilt
       nothing.
 
-**Phase 4 is done and Phase 5 is partly done.** What remains of upstream's
+- [x] **Phase 5.4 — SOCKS5 UDP ASSOCIATE and `--allow`.** The two things
+      that finished the CLI's exposure of what the data plane could already
+      do. `socks` now relays datagrams (RFC 1928 §7) with an association
+      owned by its TCP control connection, so a forwarder is never left
+      running for whoever finds the port; `--allow` restricts a server by
+      client node key, as upstream's does. `tc_allow_permits` refuses the
+      all-zero key *before* the no-list shortcut, because checking after it
+      would have admitted that key in exactly the permissive case where
+      nobody is looking. `make live-socksudp` and `make live-allow` check
+      both against real clients.
+
+- [x] **Ed25519 of our own.** RFC 8032 in 877 lines — radix-2^51 field
+      arithmetic, extended Edwards coordinates, cofactorless verification and
+      the `S < L` canonicity check — against RFC 8032's published vectors and
+      byte-for-byte against Go's `crypto/ed25519`. Written because the SSH
+      subset needs `ssh-ed25519` and because vendoring a second crypto stack
+      for one curve was the wrong trade. It also narrows the TLS 1.3 blocker
+      without removing it.
+
+- [x] **TCP hardening.** Two ways an authenticated peer could permanently
+      exhaust the 64-entry connection table, both found by making the TCP
+      fuzzer assert its own reach rather than trusting it: a corrupt SYN left
+      an unreapable connection in `LISTEN`, and a peer that simply vanished
+      left one in `ESTABLISHED` with no timer watching it. Keepalive probes
+      close the second. Bugs 20 and 21 above have the detail, including the
+      third bug the fix contained and the fourth it revealed.
+
+**Phase 4 is done and Phase 5 is mostly done.** What remains of upstream's
 command set — `recv`, `ls`, `serve ssh` — needs an SSH server first, which is
 a [licence decision](#vendoring-an-ssh-server) before it is code. See
 [PLAN.md](PLAN.md) for the detail.
