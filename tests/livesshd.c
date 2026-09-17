@@ -15,9 +15,13 @@
  * the client prints what we wrote and exits zero. If any one of them is
  * wrong, it does not.
  *
- * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex>
+ * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex> [dropbox-dir]
+ *
+ * With a directory, the `sftp` subsystem is served as a write-only drop box
+ * and real `sftp` and `scp` become the clients.
  */
 
+#include "tc/dropbox.h"
 #include "tc/sshserver.h"
 
 #include <arpa/inet.h>
@@ -28,15 +32,36 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Decoded a nibble at a time rather than with sscanf("%2x").
+ *
+ * This is bug 7 in the README, reintroduced in a new file and found the same
+ * way: cosmo's sscanf does not honour that field width reliably, so a key
+ * decodes correctly under glibc and wrongly under cosmocc. The symptom was
+ * the same too -- everything up to the point where a key has to match works
+ * perfectly, because the host key is not checked by a client told not to
+ * check it, and only the authorized key fails.
+ *
+ * The lesson is that the fix for bug 7 lived inside the file that had it. */
+static int unhex1(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
 static int unhex(const char *s, uint8_t *out, size_t want)
 {
 	if (strlen(s) != want * 2)
 		return -1;
 	for (size_t i = 0; i < want; i++) {
-		unsigned v;
-		if (sscanf(s + i * 2, "%2x", &v) != 1)
+		int hi = unhex1(s[i * 2]), lo = unhex1(s[i * 2 + 1]);
+		if (hi < 0 || lo < 0)
 			return -1;
-		out[i] = (uint8_t)v;
+		out[i] = (uint8_t)(hi << 4 | lo);
 	}
 	return 0;
 }
@@ -71,10 +96,109 @@ static int sock_write(void *ctx, const uint8_t *buf, size_t len)
  * Deliberately not an echo: the client must see bytes that could only have
  * come from a server that got this far, so the script can tell "the channel
  * worked" from "the client printed its own input back at itself". */
+static const char *g_dropbox_dir;
+
+/* serve_sftp runs the drop box over the channel.
+ *
+ * The framing is the part worth care. An SFTP packet is a length followed by
+ * that many bytes, carried over a channel that is a byte stream -- so one
+ * packet may arrive across several reads and several may arrive in one. A
+ * loop that assumed a read gave it exactly one packet would work against a
+ * client that sent them slowly and corrupt the stream against one that
+ * pipelined, which is what scp does.
+ */
+static int serve_sftp(tc_ssh_server *s)
+{
+	tc_dropbox db;
+	int rc = tc_dropbox_open(&db, g_dropbox_dir);
+	if (rc != TC_OK) {
+		fprintf(stderr, "livesshd: drop box %s unusable\n", g_dropbox_dir);
+		return rc;
+	}
+
+	static uint8_t buf[TC_SFTP_MAX_PACKET * 2];
+	size_t have = 0;
+
+	for (;;) {
+		/* Process everything already buffered before reading more. */
+		for (;;) {
+			size_t total = 0;
+			int lr = tc_sftp_packet_len(buf, have, &total);
+			if (lr == TC_ERR_AGAIN)
+				break; /* not even a length yet */
+			if (lr != TC_OK) {
+				tc_dropbox_close(&db);
+				return lr;
+			}
+			if (have < total)
+				break; /* length known, body still arriving */
+
+			tc_sftp_request req;
+			uint8_t reply[TC_SFTP_MAX_PACKET];
+			size_t reply_len = 0;
+			rc = tc_sftp_parse(&req, buf, total);
+			if (rc == TC_OK)
+				rc = tc_dropbox_handle(&db, &req, reply, sizeof reply,
+				                       &reply_len);
+			if (rc != TC_OK) {
+				tc_dropbox_close(&db);
+				return rc;
+			}
+			rc = tc_ssh_server_write(s, reply, reply_len);
+			if (rc != TC_OK) {
+				tc_dropbox_close(&db);
+				return rc;
+			}
+
+			memmove(buf, buf + total, have - total);
+			have -= total;
+		}
+
+		if (have == sizeof buf) {
+			/* A packet larger than the buffer cannot arrive, because
+			 * tc_sftp_packet_len caps it well below this. Reaching here means
+			 * the accounting above is wrong, not that a client is large. */
+			tc_dropbox_close(&db);
+			return TC_ERR_TOOMANY;
+		}
+
+		size_t got = 0;
+		rc = tc_ssh_server_read(s, buf + have, sizeof buf - have, &got);
+		if (rc == TC_ERR_DONE || rc == TC_ERR_CLOSED)
+			break;
+		if (rc != TC_OK) {
+			tc_dropbox_close(&db);
+			return rc;
+		}
+		have += got;
+	}
+
+	fprintf(stderr, "livesshd: drop box received %u files, %llu bytes\n",
+	        db.files, (unsigned long long)db.bytes);
+	tc_dropbox_close(&db);
+
+	/* Without this scp reports a failure for a transfer that worked: it reads
+	 * the subsystem's exit status, and a channel that closes without one
+	 * looks like a server that died part way through. */
+	(void)tc_ssh_server_exit(s, 0);
+	return TC_OK;
+}
+
 static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
                     const char *arg)
 {
 	(void)ctx;
+
+	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0) {
+		if (g_dropbox_dir == NULL) {
+			fprintf(stderr, "livesshd: no drop box configured\n");
+			return TC_ERR_UNSUPPORTED;
+		}
+		int srv = serve_sftp(s);
+		if (srv != TC_OK)
+			fprintf(stderr, "livesshd: sftp failed: %s\n", tc_strerror(srv));
+		return srv;
+	}
 	char line[512];
 	int n = snprintf(line, sizeof line, "tailcat-c ssh subset: %s %s\n",
 	                 type == TC_SSH_REQ_SUBSYSTEM ? "subsystem" : "exec", arg);
@@ -114,11 +238,13 @@ static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 
 int main(int argc, char **argv)
 {
-	if (argc != 4) {
-		fprintf(stderr,
-		        "usage: livesshd <port> <host-seed-hex> <authorized-hex>\n");
+	if (argc != 4 && argc != 5) {
+		fprintf(stderr, "usage: livesshd <port> <host-seed-hex> "
+		                "<authorized-hex> [dropbox-dir]\n");
 		return 2;
 	}
+	if (argc == 5)
+		g_dropbox_dir = argv[4];
 	int port = atoi(argv[1]);
 	uint8_t seed[32], authorized[32];
 	if (unhex(argv[2], seed, sizeof seed) != 0 ||

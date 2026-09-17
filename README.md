@@ -83,10 +83,10 @@ widening the connection key from a port pair to a four-tuple.
 
 **Still out of scope**, in descending order of how much it would take:
 
-- The **SFTP server**, and therefore `recv`, `ls` and `serve ssh`. The SSH
-  half is now written and verified against a real OpenSSH client; what is
-  left is the file protocol on top of it. The licence question that gated
-  this is [decided](#vendoring-an-ssh-server): write the subset.
+- **The CLI surface for `recv` and `serve ssh`.** Both servers are written
+  and driven by a real OpenSSH `scp` and `sftp`; what is missing is the
+  subcommand that points them at a directory. `ls` additionally needs an
+  SFTP *client*, which is a separate choice -- see PLAN.md 5.5.
 - The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
   this means a second toolchain and a second build of everything — arguably
   against the premise of a project whose whole point is one fat APE.
@@ -171,8 +171,8 @@ direct peer-to-peer paths.
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ❌ | ✅ (in-process SFTP client) |
-| SSH *server* (`serve ssh`) | transport done, awaiting SFTP | ✅ |
-| `recv` (file drop box, receiving) | ❌ (needs SSH+SFTP) | ✅ |
+| SSH *server* (`serve ssh`) | transport and SFTP done, not yet a subcommand | ✅ |
+| `recv` (file drop box, receiving) | server done, not yet a subcommand | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
 | `browse`, `readme` | ❌ (not worth writing) | ✅ |
@@ -312,7 +312,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-33 test binaries, 9,544 assertions, under two toolchains. The method matters
+35 test binaries, 9,717 assertions, under two toolchains. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
 
@@ -326,6 +326,7 @@ something that is not ours.**
 | Ed25519 | RFC 8032's published vectors, reached by feeding its own seeds to Go's `crypto/ed25519` |
 | IPv6 formatting | our output fed back through `inet_pton` |
 | SSH | `golang.org/x/crypto/ssh` for the wire encodings and the cipher, and a **real OpenSSH 9.6 client** for the protocol itself |
+| the SFTP drop box | a real `scp` and `sftp` carrying out the attacks, with the check on the filesystem afterwards rather than on what the client printed |
 | everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
 
 Where a test passed on the first run, the response has generally been to
@@ -855,6 +856,25 @@ This is the clearest case yet for the project's own rule about anchors. The
 packet layer's vectors were produced by Go written from the same OpenSSH
 document as the C, so both sides could be -- and in this respect both were --
 wrong in the same way. Only a peer written from neither could tell.
+
+**24. Bug 7, reintroduced in a new file four years later.** *(Phase 5.5,
+found by the drop box working under host gcc and failing under cosmocc.)*
+`tests/livesshd.c` needed to turn a hex key into bytes, so it grew a small
+`unhex` using `sscanf("%2x")`. That is precisely bug 7: cosmo's `sscanf` does
+not honour that field width reliably, so the key decoded correctly under
+glibc and wrongly under cosmocc.
+
+The symptom was the same as bug 7's, and just as misleading. The entire SSH
+handshake succeeded -- key exchange, host key, cipher, service accept -- and
+authentication failed with `Permission denied (publickey)`, which points at
+the authentication code. It was not the authentication code. The host key
+survived a corrupt decode because a client told not to check host keys does
+not check it; only the authorized key has to match exactly, so only it failed.
+
+Worth recording because the first instinct was to suspect the new code. The
+fix for bug 7 lived inside the file that had it, so nothing stopped the same
+mistake being made again in a file written years later -- and the second
+toolchain caught it a second time, which is the argument for having one.
 
 **23. A rekey request was ignored, and the client hung.** *(Phase 5.4,
 found by being asked where the limitation was written down.)* The sequence

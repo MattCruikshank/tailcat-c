@@ -644,9 +644,43 @@ fallback.
 The estimate drops from ~4,000 lines to ~2,500 precisely because the scope
 is the subset rather than a general server.
 
-### 5.5 SFTP server · ~1,500 lines · medium risk
-Needed by `ls`, by the server side of `cp`, and by **`recv`**, which moved
-here from 3.5. Depends on 5.4.
+### 5.5 SFTP server ✅ · 944 lines, plus 789 of tests · **done**
+
+Serves the server side of `cp` and **`recv`**, which moved here from 3.5. The
+`ls` client is still a choice, and the reasoning for it is kept below.
+
+Two files, deliberately apart. `tc/sftp.h` is the version 3 wire format and
+has no opinions; `tc/dropbox.h` has nothing but opinions. Keeping them
+separate means a change to parsing cannot quietly become a change to
+permissions.
+
+**The guarantee is one sentence: a sender cannot choose the stored
+filename.** Everything else follows from it or guards it -- only the final
+path component is considered, which defeats every traversal at once; the
+result is sanitised and made unique; a collision picks a different name
+rather than overwriting, and the chosen name is never sent back, because
+returning it would leak the directory contents the rule protects.
+
+The sanitiser refuses more than a Unix server would need to, because this
+binary runs on Windows: the reserved device names (`nul`, `con`, `com1` and
+the rest, with or without an extension), a trailing dot or space -- which
+Windows strips before opening, so `evil. ` and `evil` are one file there and
+two names here -- and the characters Windows forbids outright. One name means
+one thing on every platform we ship to.
+
+Ten mutations, ten caught. Six live checks with a real `scp` and `sftp`, and
+the live test is the one that matters: a policy that is right against
+requests we constructed can still have a gap a real client walks through.
+Two of the ten mutations are caught by the live test as well, and one --
+refusing a read-open -- is not, because `sftp` gives up at the stat and never
+reaches the open. Two independent barriers, one tested at each level, and
+that is recorded in the script rather than left to look like a gap.
+
+**Still flat only.** No directories, so no recursive upload. Upstream offers
+that as `:wo+` and documents that it trades the guarantee away -- once a
+sender can create directories it can choose names again. If it is added it
+should be a separate mode with the trade stated, not a relaxation of this
+one.
 
 This is where the "writes attacker-named files" hazard lives. Upstream's flat
 write-only mode is the design to copy rather than improve on: the server
@@ -788,7 +822,8 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.1 — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
 | 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
 | 5.4 — SSH subset (transport, kex, auth, channels, server, rekey) | 2,648 | ✅ done |
-| 5.5 — SFTP (and `recv`, `ls`) | ~1,500 | ⏸ next |
+| 5.5 — SFTP server and the drop box | 944 | ✅ done |
+| — `ls` (needs an SFTP *client*) | ~400 | ⏸ a choice, see 5.5 |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
@@ -828,9 +863,9 @@ discovery were not actually being made.
    qemu-user and is written and waiting on `qemu-user-static` being
    installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
    APE assimilation is needed. After that: qemu-system, then hardware.
-2. **Write the SFTP subset** (5.5). The SSH side is done and verified
-   against a real OpenSSH, and `subsystem` already delivers the request, so
-   what remains is the file protocol and `recv`'s write-only discipline.
+2. **Wire the drop box into the CLI as `recv`.** The server and the policy
+   are done and driven by a real `scp`; what is left is the subcommand and
+   its argument handling, which is small.
 3. **Bound `FIN_WAIT_2`** — see below; unchanged by any of the SSH work.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is

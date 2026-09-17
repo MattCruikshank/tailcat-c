@@ -196,7 +196,9 @@ LIB_SRCS := \
 	src/ssh/kex.c \
 	src/ssh/auth.c \
 	src/ssh/channel.c \
-	src/ssh/server.c
+	src/ssh/server.c \
+	src/ssh/sftp.c \
+	src/ssh/dropbox.c
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 
@@ -205,7 +207,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-dropbox diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -437,6 +439,12 @@ $(BUILD)/livesshd: tests/livesshd.c $(LIB_OBJS)
 # whether the SSH subset speaks SSH rather than speaking to itself.
 live-sshd: $(BUILD)/livesshd
 	BUILD=$(BUILD) sh scripts/live-sshd.sh
+
+# And the drop box, driven by a real scp and sftp. The refusals are the
+# feature, so the checks are on the filesystem afterwards rather than on what
+# the client printed.
+live-dropbox: $(BUILD)/livesshd
+	BUILD=$(BUILD) sh scripts/live-dropbox.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh
