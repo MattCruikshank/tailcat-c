@@ -939,10 +939,27 @@ In rough order of what they cost:
    against our own server, because our addresses always carry a disco key; it
    was verified by forcing the condition, the way a mutation test does.
 
-   Still open from this item: plain `ping` remains relay-only, so it reports
-   `via tc301a.ipn.dev` where upstream reports `via 203.0.113.7:41641`. The
-   machinery to fix that is now wired in and one call away, but changing
-   what plain `ping` prints is a separate decision.
+   Then made the separate decision: plain `ping` uses the same stack, so it
+   reports whichever path answered, in upstream's own format --
+   `pong in 61ms via DERP(nyc)` or `pong in 65ms via 10.255.255.254:39379`.
+   The hand-rolled DERP connection it used to open is gone, and with it the
+   reason it could never see a direct path.
+
+   Measuring the two paths needs two probes, which is worth knowing: a direct
+   path has disco pings and `tc_path` already times them, so `tc_path_rtt_ms`
+   just reports the number. The relay has nothing of the kind -- WireGuard
+   offers no echo -- so the meow ping from the handshake is sent again and
+   timed, which is the only thing the far end answers without inventing a
+   protocol. `client_pump_once` notes when a meowed arrives; it would
+   otherwise be dropped as a non-WireGuard frame.
+
+   One deliberate difference left: upstream prints `33.19ms` and we print
+   `61ms`. Both our sources measure in whole milliseconds, so the decimals
+   would be invented.
+
+   `ping`'s default deadline is now ten seconds, upstream's, rather than the
+   generic sixty this program gives everything else. A reachability check is
+   a question you are waiting on.
 3. **Reaching a third address from the pipe form and `ssh -p ip:port`.**
    `forward` parses `local:ip:port` and `serve exit-node` serves it, so both
    ends exist; what is missing is accepting the syntax in two more places and

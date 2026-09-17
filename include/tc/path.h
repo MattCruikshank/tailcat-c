@@ -307,6 +307,16 @@ tc_path_kind tc_path_best(const tc_path *p, tc_endpoint *out, uint64_t now_ms);
  * decides whether a packet is genuine; this only decides which peer to ask. */
 bool tc_path_knows(const tc_path *p, const tc_endpoint *ep);
 
+/* tc_path_rtt_ms is the round trip of the path in use, or -1 when that is
+ * the relay -- which has no measurement here, because the probes that produce
+ * one only ever go to direct candidates.
+ *
+ * For `ping`, which reports the number rather than a sentence about it. The
+ * alternative was reaching into p->cands[p->best].rtt_ms from the CLI, which
+ * the tests were already doing and which makes every field of this struct
+ * part of its interface. */
+int tc_path_rtt_ms(const tc_path *p, uint64_t now_ms);
+
 /* tc_path_describe writes a one-line summary for a log. */
 int tc_path_describe(char *out, size_t cap, const tc_path *p, uint64_t now_ms);
 

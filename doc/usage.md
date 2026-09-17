@@ -120,8 +120,17 @@ Restrict who may connect, by client node key:
 
     tailcat-c parse <tc-addr>       # describe an address
     tailcat-c resolve <tc-addr>     # embed the relay, for offline use
-    tailcat-c ping <tc-addr>        # time the round trip
+    tailcat-c ping <tc-addr>                  # time the round trip
     tailcat-c ping --until-direct <tc-addr>   # and wait for a direct path
+
+Each pong says which path answered, a relay or a peer-to-peer address:
+
+    pong in 61ms via DERP(nyc)
+    pong in 2ms via 203.0.113.7:41641
+
+`--until-direct` keeps going until one is direct, and exits non-zero if none
+is before `--timeout` (ten seconds by default), so a script can use it to
+check that NAT traversal works.
     tailcat-c netcheck              # UDP, NAT type and relay latency
     tailcat-c version
 

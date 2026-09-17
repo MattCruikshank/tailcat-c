@@ -76,8 +76,8 @@ and `hello` appears on the server. Works.
 | `socks <addr> -- curl …` | ✅ |
 | `socks <addr> curl …` (no `--`) | ✅ since the walk |
 | `socks curl http://<tc-addr>:8081/` | ❌ Upstream's SOCKS proxy recognises a tailcat address used as a hostname, so the address argument is optional. Not implemented. |
-| `ping --until-direct <addr>` | ✅ brings the tunnel up and waits on path discovery; non-zero if no direct path appears |
-| `ping <addr>` | ✅ Works in both directions with the real tailcat — verified. Wording differs: ours `meowed in 68 ms (1 ping) via tc301a.ipn.dev`, upstream `pong in 220µs via 172.17.0.1:58860`. |
+| `ping --until-direct <addr>` | ✅ a pong a second until one is direct; non-zero if none is |
+| `ping <addr>` | ✅ `pong in 61ms via DERP(nyc)`, upstream's format exactly. Works in both directions with the real tailcat — verified. |
 
 One retest worth recording: upstream's `ping` first appeared to fail against
 our server with `context deadline exceeded`. That was the test's fault — a
@@ -180,7 +180,6 @@ Worth knowing if anything greps our output:
 |---|---|---|
 | startup | `# 🐈 Server listening with new address:` | `# listening with new address:` |
 | relay choice | `# Selected bootstrap relay region 302, San Francisco` | `# relay tc301a.ipn.dev` |
-| ping | `pong in 42.1ms via DERP(sfo)` | `meowed in 70 ms (1 ping) via tc301a.ipn.dev` |
 
 Ours is ASCII throughout, deliberately: the same binary starts on six
 operating systems and they do not agree about what a terminal does with the

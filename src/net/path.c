@@ -602,6 +602,13 @@ uint64_t tc_path_next_deadline(const tc_path *p, uint64_t now_ms)
 
 /* ---- reporting --------------------------------------------------------- */
 
+int tc_path_rtt_ms(const tc_path *p, uint64_t now_ms)
+{
+	if (p == NULL || tc_path_best(p, NULL, now_ms) != TC_PATH_DIRECT)
+		return -1;
+	return p->cands[p->best].rtt_ms;
+}
+
 int tc_path_describe(char *out, size_t cap, const tc_path *p, uint64_t now_ms)
 {
 	if (out == NULL || cap == 0 || p == NULL)
@@ -622,7 +629,7 @@ int tc_path_describe(char *out, size_t cap, const tc_path *p, uint64_t now_ms)
 			return TC_ERR_INVAL;
 		n = snprintf(out, cap, "direct to %s, %dms (%zu of %zu candidates "
 		                       "proven)",
-		             s, p->cands[p->best].rtt_ms, proven, p->num_cands);
+		             s, tc_path_rtt_ms(p, now_ms), proven, p->num_cands);
 	} else {
 		n = snprintf(out, cap,
 		             "via the relay (%zu of %zu candidates proven)", proven,

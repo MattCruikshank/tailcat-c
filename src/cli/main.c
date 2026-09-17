@@ -573,106 +573,18 @@ static int cmd_resolve(const char *addr_str, const char *derpmap_url,
 /* cmd_ping times the meow round trip: reach the relay, introduce ourselves,
  * and wait to be acknowledged. That is the same exchange the pipe mode does
  * first, so it measures exactly the path a real connection would take. */
-/* Defined below, after the client stack it is built on. `ping` sits up here
- * with the other address commands; the tunnel does not exist yet. */
-static int ping_until_direct(const char *addr_str, bool insecure,
-                             unsigned timeout_s, const char *derpmap_url,
-                             const char *key_spec);
+/* `ping` lives with the address commands but needs the client stack, which is
+ * defined further down. */
+static int ping_run(const char *addr_str, bool insecure, unsigned timeout_s,
+                    const char *derpmap_url, const char *key_spec,
+                    bool until_direct);
 
 static int cmd_ping(const char *addr_str, bool insecure, unsigned timeout_s,
                     const char *derpmap_url, const char *key_spec,
                     bool until_direct)
 {
-	/* A different question, answered by different machinery. The loop below
-	 * is a DERP round trip and nothing else: it proves the server is there,
-	 * and it can never report a direct path because it never looks for one.
-	 * "Can these two reach each other without the relay?" needs the whole
-	 * client stack, because finding a direct path is what that stack does. */
-	if (until_direct)
-		return ping_until_direct(addr_str, insecure, timeout_s, derpmap_url,
-		                         key_spec);
-
-	static tc_conn_info ci;
-	int rc = tc_addr_parse(&ci, addr_str, strlen(addr_str));
-	if (rc != TC_OK) {
-		fprintf(stderr, "tailcat-c: %s\n", tc_strerror(rc));
-		return 1;
-	}
-	if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
-		return 1;
-	const tc_derp_node *node = &ci.regions[0].nodes[0];
-
-	tc_wg_identity me;
-	uint8_t disco_pub[32];
-	if (tc_wg_identity_generate(&me) != TC_OK ||
-	    tc_disco_key_for_node(NULL, disco_pub, me.private_key) != TC_OK) {
-		fprintf(stderr, "tailcat-c: could not generate keys\n");
-		return 1;
-	}
-
-	tc_derp_dial_opts opts;
-	memset(&opts, 0, sizeof opts);
-	opts.hostname = node->hostname;
-	opts.dial_addr = (node->ipv4[0] != '\0') ? node->ipv4 : NULL;
-	opts.port = (node->derp_port > 0) ? (uint16_t)node->derp_port : 0;
-	opts.insecure_skip_verify = insecure || node->insecure_for_tests;
-	opts.timeout_ms = 15000;
-
-	uint64_t t_connect = now_ms();
-	tc_derp_client derp;
-	if (tc_derp_connect(&derp, &opts, me.private_key, me.public_key) != TC_OK) {
-		fprintf(stderr, "tailcat-c: relay: %s\n", tc_derp_error_string());
-		return 1;
-	}
-	uint64_t connect_ms = now_ms() - t_connect;
-	printf("relay %s: connected in %llu ms\n", node->hostname,
-	       (unsigned long long)connect_ms);
-
-	tc_derp_set_read_timeout(&derp, 200);
-
-	uint8_t ping[TC_MEOW_PING_LEN];
-	size_t ping_len = 0;
-	tc_meow_encode_ping(ping, sizeof ping, &ping_len, me.public_key, disco_pub);
-
-	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
-	uint64_t next_send = 0, t0 = 0;
-	int sent = 0, status = 1;
-
-	while (now_ms() < deadline) {
-		if (now_ms() >= next_send) {
-			t0 = now_ms();
-			if (tc_derp_send(&derp, ci.server_public, ping, ping_len) !=
-			    TC_OK) {
-				fprintf(stderr, "tailcat-c: relay send failed\n");
-				break;
-			}
-			sent++;
-			next_send = now_ms() + 1000;
-		}
-		uint8_t src[32];
-		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
-		size_t len = 0;
-		rc = tc_derp_recv(&derp, src, buf, sizeof buf, &len);
-		if (rc == TC_ERR_TIMEOUT)
-			continue;
-		if (rc != TC_OK) {
-			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
-			break;
-		}
-		if (memcmp(src, ci.server_public, 32) == 0 &&
-		    tc_meow_is_meowed(buf, len)) {
-			printf("meowed in %llu ms (%d ping%s) via %s\n",
-			       (unsigned long long)(now_ms() - t0), sent,
-			       sent == 1 ? "" : "s", node->hostname);
-			status = 0;
-			break;
-		}
-	}
-
-	if (status != 0)
-		fprintf(stderr, "tailcat-c: no answer from the server\n");
-	tc_derp_close(&derp);
-	return status;
+	return ping_run(addr_str, insecure, timeout_s, derpmap_url, key_spec,
+	                until_direct);
 }
 
 /* ---- pipe mode -------------------------------------------------------- */
@@ -696,6 +608,12 @@ typedef struct {
 	 * paths -- one carries datagrams through the tunnel, the other carries
 	 * the tunnel itself. */
 	tc_udp_mux *umux;
+	/* When the server last answered a meow ping. WireGuard has no echo and
+	 * the direct-path probes only ever go to direct candidates, so this is
+	 * the one round trip through the relay that can be measured -- which is
+	 * what `ping` reports when there is no direct path yet. */
+	uint64_t meowed_at_ms;
+
 	/* So the upgrade and the fallback each get logged once rather than on
 	 * every packet. */
 	bool was_direct;
@@ -2920,6 +2838,11 @@ static int client_pump_once(tc_client *cl, uint64_t deadline)
 		return 0;
 	if (pump_relay_disco(&cl->ctx, buf, len))
 		return 0;
+	if (tc_meow_is_meowed(buf, len)) {
+		/* Not WireGuard, so it would otherwise be dropped a line below. */
+		cl->ctx.meowed_at_ms = now_ms();
+		return 0;
+	}
 
 	static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
 	size_t inner_len = 0;
@@ -2931,77 +2854,119 @@ static int client_pump_once(tc_client *cl, uint64_t deadline)
 	return 0;
 }
 
-/* ping_until_direct waits for a direct path and reports whether it got one.
+/* ping_run is `ping`, both with and without --until-direct.
  *
- * It brings the tunnel up exactly as the pipe does -- client_up already runs
- * path discovery -- and then watches tc_path, which is the part that knows.
- * Exits non-zero when no direct path appears before the deadline, because the
- * flag exists for a script that wants the answer rather than a description.
+ * It brings the tunnel up the way every other client command does, because
+ * that is what starts path discovery: the older version of this opened a DERP
+ * connection by hand, measured one meow round trip and stopped, which meant
+ * it could never report a direct path and never notice one appearing.
+ *
+ * The output is upstream's, line for line:
+ *
+ *     pong in 42ms via DERP(sfo)
+ *     pong in 1ms via 203.0.113.7:41641
+ *
+ * with one pong a second. Without --until-direct the first pong is the last;
+ * with it, pinging continues until one arrives over a direct path, and a
+ * deadline reached without that is a non-zero exit, so a script can use it to
+ * check that NAT traversal works.
+ *
+ * Two round trips are measured by two different means, because there is no
+ * single probe that works over both paths. A direct path has its own disco
+ * ping and tc_path already times it. The relay has nothing of the sort --
+ * WireGuard offers no echo -- so the meow ping the handshake already uses is
+ * sent again and timed, which is the only thing the far end will answer
+ * without a protocol of our own.
  */
-static int ping_until_direct(const char *addr_str, bool insecure,
-                             unsigned timeout_s, const char *derpmap_url,
-                             const char *key_spec)
+static int ping_run(const char *addr_str, bool insecure, unsigned timeout_s,
+                    const char *derpmap_url, const char *key_spec,
+                    bool until_direct)
 {
 	static tc_client cl;
-	/* 0 means "no deadline" everywhere else in this program, so it means it
-	 * here too. Waiting indefinitely for a direct path is a reasonable thing
-	 * to ask for, and quietly turning it into ten seconds would be the same
-	 * class of surprise as bugs 33 and 34. */
+	/* 0 means "no deadline" everywhere else here, so it means it here too. */
 	uint64_t deadline = (timeout_s == 0)
 	                        ? UINT64_MAX
 	                        : now_ms() + (uint64_t)timeout_s * 1000u;
 
-	if (client_up(&cl, addr_str, insecure, derpmap_url, key_spec, deadline) !=
+	if (client_up(&cl, addr_str, insecure, derpmap_url, key_spec,
+	              (deadline == UINT64_MAX) ? now_ms() + 60000 : deadline) !=
 	    TC_OK)
 		return 1;
 
-	if (!cl.have_udp) {
-		/* Either the address carries no disco key or the UDP socket would
-		 * not open. Both mean no direct path is possible at all, and saying
-		 * so now beats waiting out the deadline to report the same thing. */
-		fprintf(stderr, "tailcat-c: no direct path is possible here: %s\n",
-		        cl.ci.has_disco_public
-		            ? "no UDP socket"
-		            : "the address carries no path-discovery key");
-		client_down(&cl);
-		return 1;
-	}
+	/* What upstream calls the relay: its region code if the address carries
+	 * one, otherwise the number. */
+	char via_relay[TC_REGION_CODE_MAX + 16];
+	const char *code =
+	    (cl.ci.num_regions > 0) ? cl.ci.regions[0].region_code : "";
+	if (code[0] != '\0')
+		(void)snprintf(via_relay, sizeof via_relay, "DERP(%s)", code);
+	else
+		(void)snprintf(via_relay, sizeof via_relay, "DERP(%lld)",
+		               (long long)cl.ci.region_id);
 
-	char line[160], last[160];
-	last[0] = '\0';
 	int status = 1;
+	uint64_t next_probe = 0, probe_at = 0;
+	bool awaiting = false;
 
 	while (now_ms() < deadline) {
 		if (client_pump_once(&cl, deadline) != 0)
 			break;
+		uint64_t t = now_ms();
 
-		if (tc_path_describe(line, sizeof line, &cl.path, now_ms()) != TC_OK)
-			continue;
-		/* One line per change rather than per turn: this loop runs many
-		 * times a second and the interesting events are rare. */
-		if (strcmp(line, last) != 0) {
-			printf("%s\n", line);
+		/* A direct path answers the question outright, in either mode. */
+		int rtt = tc_path_rtt_ms(&cl.path, t);
+		if (rtt >= 0) {
+			tc_endpoint ep;
+			char where[80];
+			(void)tc_path_best(&cl.path, &ep, t);
+			if (tc_endpoint_format(where, sizeof where, &ep) != TC_OK)
+				(void)snprintf(where, sizeof where, "a direct path");
+			printf("pong in %dms via %s\n", rtt, where);
 			(void)fflush(stdout);
-			(void)snprintf(last, sizeof last, "%s", line);
-		}
-		if (tc_path_best(&cl.path, NULL, now_ms()) == TC_PATH_DIRECT) {
 			status = 0;
 			break;
+		}
+
+		if (awaiting && cl.ctx.meowed_at_ms > probe_at) {
+			printf("pong in %llums via %s\n",
+			       (unsigned long long)(cl.ctx.meowed_at_ms - probe_at),
+			       via_relay);
+			(void)fflush(stdout);
+			awaiting = false;
+			if (!until_direct) {
+				status = 0;
+				break;
+			}
+		}
+
+		if (t >= next_probe) {
+			if (tc_derp_send(&cl.derp, cl.ci.server_public, cl.ping,
+			                 cl.ping_len) != TC_OK) {
+				fprintf(stderr, "tailcat-c: relay send failed\n");
+				break;
+			}
+			probe_at = t;
+			awaiting = true;
+			next_probe = t + 1000;
 		}
 	}
 
 	if (status != 0) {
-		/* The counters, because "no direct path" has more than one cause and
-		 * they look different here: no probes sent means the peer never said
-		 * where it was, probes sent with none answered means they went out
-		 * and nothing came back, which is a NAT or a firewall. */
-		tc_path_stats st;
-		tc_path_get_stats(&cl.path, &st);
-		fprintf(stderr,
-		        "tailcat-c: no direct path within %us "
-		        "(%llu probes sent, %llu answered)\n",
-		        timeout_s, (unsigned long long)st.pings_sent,
-		        (unsigned long long)st.pongs_received);
+		if (until_direct) {
+			/* The counters, because "no direct path" has more than one cause
+			 * and they look different: no probes sent means the peer never
+			 * said where it was; probes sent with none answered means they
+			 * went out and nothing came back, which is a NAT or a wall. */
+			tc_path_stats st;
+			tc_path_get_stats(&cl.path, &st);
+			fprintf(stderr,
+			        "tailcat-c: no direct path to the server after %us "
+			        "(%llu probes sent, %llu answered)\n",
+			        timeout_s, (unsigned long long)st.pings_sent,
+			        (unsigned long long)st.pongs_received);
+		} else {
+			fprintf(stderr, "tailcat-c: no answer from the server\n");
+		}
 	}
 	client_down(&cl);
 	return status;
@@ -5305,6 +5270,11 @@ int main(int argc, char **argv)
 	if (timeout_s == 0 && strcmp(args[0], "serve") != 0 &&
 	    strcmp(args[0], "forward") != 0 && strcmp(args[0], "socks") != 0)
 		timeout_s = 60;
+	/* Except ping, where upstream's default is ten seconds and the command
+	 * is a question you are waiting on the answer to. An explicit --timeout
+	 * still wins, including --timeout=0 for "wait as long as it takes". */
+	if (!timeout_given && strcmp(args[0], "ping") == 0)
+		timeout_s = 10;
 
 	if (strcmp(args[0], "version") == 0) {
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);

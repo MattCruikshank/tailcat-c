@@ -201,7 +201,7 @@ direct peer-to-peer paths.
 | `serve` | ports, ranges, `all`; many clients | full |
 | `parse` | ✅ (byte-identical JSON) | ✅ |
 | `version` | ✅ | ✅ |
-| `ping` | ✅ | ✅ |
+| `ping` (reports relay or direct path) | ✅ | ✅ |
 | `ping --until-direct` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |

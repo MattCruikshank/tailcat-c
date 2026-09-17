@@ -438,10 +438,20 @@ static void test_two_public_hosts(void)
 	tc_path_get_stats(&s.a.path, &st);
 	TCT_EQ_INT((int)st.upgrades, 1);
 	TCT_EQ_INT((int)st.downgrades, 0);
-	int rtt = s.a.path.cands[s.a.path.best].rtt_ms;
+	int rtt = tc_path_rtt_ms(&s.a.path, s.now);
 	if (rtt < 15 || rtt > 35)
 		TCT_FAILF("measured %dms on a 20ms network", rtt);
 	tct_checks++;
+
+	TCT_CASE("and the relay has no round trip to report");
+	/* -1 rather than 0: `ping` prints this, and 0ms would be a measurement
+	 * nobody made. */
+	static sim relayed;
+	wire(&relayed, NAT_SYMMETRIC, NAT_SYMMETRIC);
+	advance(&relayed, 2000);
+	TCT_TRUE(!direct(&relayed.a));
+	TCT_EQ_INT(tc_path_rtt_ms(&relayed.a.path, relayed.now), -1);
+	TCT_EQ_INT(tc_path_rtt_ms(NULL, 0), -1);
 }
 
 static void test_hole_punching(void)
