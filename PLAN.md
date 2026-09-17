@@ -531,10 +531,51 @@ observable rather than assumed, and a Makefile fix — Mbed TLS objects now
 depend on `mbedtls_config.h` explicitly, because `-MMD` stops at the
 `-isystem` header that includes it and editing the config rebuilt nothing.
 
-### 5.4 SSH server · ~2,500 lines · **high risk** · blocked on a licence choice
+### 5.4 SSH server · ~2,500 lines · **high risk** · **decided: write the subset**
 
-The largest single item, and the one decision in this plan that is not
-technical. Full detail and a recommendation are in the README under
+The largest single item. The licence question that gated it has been
+answered -- write the subset, with TinySSH as reference rather than
+dependency -- so what follows is now a work plan rather than a decision.
+
+**The layers, bottom up.** Each is finished and verified before the next
+starts, because a bug in a lower one surfaces in a higher one as "the hash
+does not match" and nothing more specific.
+
+- [x] **5.4.1 wire format** · 415 lines, plus 532 of tests · `tc/sshwire.h`.
+      RFC 4251 section 5: byte, boolean, uint32, uint64, string, mpint,
+      name-list. Anchored byte-for-byte against `golang.org/x/crypto/ssh` by
+      `tools/genssh`, including the `ssh-ed25519` key and signature blobs.
+      Eight mutations applied, eight caught -- one of them by ASan rather
+      than by an assertion, which is how the `max` argument to
+      `tc_ssh_get_string` turned out to be the only thing standing between a
+      hostile length field and a stack buffer in `tc_ssh_get_cstring`.
+
+      The design decision worth carrying upward is the **sticky error**: the
+      reader latches a failure and every later call becomes a no-op, so a
+      caller parses a whole packet and asks once at the end. Returning a
+      status per call is a design where exactly one call site eventually goes
+      unchecked, and there are a dozen per packet.
+- [ ] **5.4.2 binary packet protocol** · ~400 lines.
+      Version exchange, packet framing with padding, sequence numbers, and
+      `chacha20-poly1305@openssh.com` -- which is not the RFC 8439 AEAD but
+      OpenSSH's own construction: two keys, the length field encrypted
+      separately so it can be read before the payload is authenticated, and
+      the Poly1305 key taken from block zero of the payload keystream.
+      Getting the length-field key wrong yields a connection that works
+      until a packet crosses a 4KB boundary.
+- [ ] **5.4.3 key exchange** · ~500 lines.
+      KEXINIT and algorithm negotiation, `curve25519-sha256`, the exchange
+      hash, `ssh-ed25519` host key signing, and key derivation. The one
+      place where our order of preference must decide and not the peer's.
+- [ ] **5.4.4 userauth** · ~300 lines · publickey only (RFC 4252), verified
+      against an authorized-keys list. No passwords, no keyboard-interactive,
+      no `none` that succeeds.
+- [ ] **5.4.5 connection layer** · ~400 lines · one channel, window
+      management, and only the `subsystem` request -- which is what carries
+      sftp.
+
+The decision and its alternatives remain recorded below, because a decision
+whose reasoning is thrown away is one that gets relitigated. Full detail is in the README under
 [Vendoring an SSH server](README.md#vendoring-an-ssh-server); the summary:
 
 | | Licence | Verdict |

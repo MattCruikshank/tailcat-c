@@ -190,7 +190,8 @@ LIB_SRCS := \
 	src/net/proxy.c \
 	src/net/http.c \
 	src/net/tls.c \
-	src/net/ca_bundle.c
+	src/net/ca_bundle.c \
+	src/ssh/wire.c
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 

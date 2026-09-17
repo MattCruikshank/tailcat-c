@@ -142,6 +142,21 @@ if [ "$LEVEL" -eq 1 ]; then
 			exit 1
 		fi'
 
+	# The SSH vectors are wholly reproducible -- Ed25519 is deterministic and
+	# the seeds are fixed -- so this one needs no exclusions, unlike the block
+	# above. That is worth keeping true: a generator with a random input is a
+	# freshness check that can never pass, which is what bug 19 was.
+	stage "generated SSH vectors are current" '
+		cp tests/ssh_vectors.h /tmp/ssh_vectors.before &&
+		(cd tools/genssh && GOFLAGS=-mod=mod go run . -o ../../tests/ssh_vectors.h) &&
+		if diff -q /tmp/ssh_vectors.before tests/ssh_vectors.h >/dev/null; then
+			echo "    tests/ssh_vectors.h matches its generator"
+		else
+			cp /tmp/ssh_vectors.before tests/ssh_vectors.h
+			echo "    tests/ssh_vectors.h is STALE -- commit the regenerated file" >&2
+			exit 1
+		fi'
+
 	# Live interop. These dial Tailscale production relays and run a real
 	# tailcat, which is exactly why they are not in any faster level: a robot
 	# pointed at someone else'"'"'s infrastructure on every push is rude, and
