@@ -6,15 +6,19 @@ doing it.
 
 Today tailcat-c has the **whole data path** — address codec, DERP relay,
 WireGuard tunnel, userspace TCP and UDP, and direct peer-to-peer paths with
-NAT traversal — working in both roles and verified against the real Go
-implementation.
+NAT traversal — plus the SSH and SFTP subset that `recv` and `ls` sit on,
+working in both roles and verified against the real Go implementation and
+against a real OpenSSH.
 
-**Phases 1–4 are done. Phase 5 is mostly done**, and everything still open
-is blocked on something other than effort: the SSH and SFTP servers on a
-licence decision, WebAssembly on a toolchain that does not exist for
-Cosmopolitan, and TLS 1.3 on an Ed25519 certificate Mbed TLS cannot parse.
-The ordinary work that was left — SOCKS5 UDP ASSOCIATE, the `--allow` list,
-and an Ed25519 of our own — is done and folded into the sections below.
+**Phases 1–5 are done**, apart from two things that are blocked on something
+other than effort: WebAssembly, on a toolchain that does not exist for
+Cosmopolitan, and TLS 1.3, on an Ed25519 certificate Mbed TLS cannot parse.
+
+What is left of upstream's surface is deliberate rather than pending:
+`serve ssh` as a general shell server, and the read-write and recursive file
+modes. Both are recorded in 5.5 with the reasoning, because a drop box that
+can run commands or let a sender choose names is not the thing this
+implements.
 
 Sizes are rough C line counts for the new code, excluding tests, which have
 run about 1:1 with implementation on this project. "Risk" is about how likely
@@ -823,12 +827,11 @@ These are already in the README's TODO list and do not depend on any feature.
 | 2 — robust | ~1,390 | ✅ done |
 | 3 — commands | ~1,970 | ✅ done |
 | 4 — direct paths | 2,801 | ✅ done |
-| 5.1, 5.2 — datagrams, NAT64, exit nodes | ~990 | ✅ done |
-| 5.1 — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
-| 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
-| 5.4 — SSH subset (transport, kex, auth, channels, server, rekey) | 2,648 | ✅ done |
-| 5.5 — SFTP server and the drop box | 944 | ✅ done |
-| — `recv` wired into the CLI | ~250 | ✅ done |
+| 5.1 — datagrams, and SOCKS5 UDP ASSOCIATE | ~870 | ✅ done |
+| 5.2 — NAT64 and exit nodes | ~830 | ✅ done |
+| 5.3 — TLS 1.3 | — | ❌ blocked on Mbed TLS’s X.509 parser |
+| 5.4 — the SSH subset, server and rekey | 2,648 | ✅ done |
+| 5.5 — SFTP, the drop box, and `recv` | 1,194 | ✅ done |
 | 5.5 — `ls`, with SSH and SFTP clients | 1,100 | ✅ done |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
@@ -843,12 +846,12 @@ because the scope turned out to be "sftp over ssh" rather than "an ssh
 server". The one that was simply wrong was 3.5 (`recv`), estimated at ~300
 lines and actually a subset of 5.5.
 
-Source today is **20,291 lines** under `src/` plus 4,087 of headers, against
-**15,709** of tests and another 2,221 of shell for the live ones. Counting
-the live scripts as tests, which is what they are, that is roughly 18,000 of
-checking against 20,000 of implementation — near enough the 1:1 ratio
-predicted at the start, and the ratio has been the useful part rather than
-the totals.
+Source today is **25,436 lines** under `src/` plus 5,502 of headers, against
+**19,517** of tests and another 2,892 of shell for the live ones. Counting
+the live scripts as tests, which is what they are, that is roughly 22,000 of
+checking against 25,000 of implementation. The 1:1 ratio predicted at the
+start has held to within about ten per cent for the whole project, and the
+ratio has been the useful number rather than either total.
 
 Phase 2 and Phase 4 were where the real difficulty was, and both had the
 failure modes predicted for them: things that only appear under load or over
@@ -864,16 +867,18 @@ discovery were not actually being made.
 
 1. **Run the aarch64 half**, which is now half done. `make
    test-unsigned-char` passes: `char` really is signed on cosmo x86_64 and
-   unsigned on cosmo aarch64, and all 28 test binaries pass under the other
+   unsigned on cosmo aarch64, and all 35 test binaries pass under the other
    signedness. `make test-aarch64` runs the real aarch64 instructions under
    qemu-user and is written and waiting on `qemu-user-static` being
    installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
    APE assimilation is needed. After that: qemu-system, then hardware.
+
+   This is now the largest untested claim in the project by some way: four
+   of six target operating systems and half of every binary.
 2. **Upstream's other file modes**, if they are wanted: `:rw` and the
    recursive write-only `:wo+`. The second trades away the drop box
    guarantee by design and should be a separate mode with the trade stated,
    not a relaxation of the flat one.
-3. **Bound `FIN_WAIT_2`** — see below; unchanged by any of the SSH work.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is
    alive, answers every probe, and simply never sends its FIN: nothing bounds

@@ -6,7 +6,8 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: relay and direct paths both work, on two operating systems.**
+**Status: upstream's command set is implemented, bar a browser build.**
+Relay and direct paths both work, on two operating systems.
 `tailcat-c` serves and connects, interoperates with the real Go tailcat in
 both roles, finds a direct peer-to-peer path when one exists and falls back
 to the relay when it stops working, and the *same fat binary* does it on
@@ -68,6 +69,12 @@ has to reimplement, at minimum:
 | `gvisor` netstack | 100,000+ | userspace TCP, since tailcat touches no routing tables |
 | `gliderssh` + `x/crypto/ssh` + `sftp` | ~20,000 | only the SSH/SFTP features |
 
+The last row turned out to be the one where the estimate was most wrong, and
+in our favour: the SSH and SFTP subset `recv` and `ls` need — transport, key
+exchange, publickey auth, one channel, and a version 3 file protocol in both
+directions — came to about 2,900 lines rather than 20,000, because a drop box
+and a listing need almost none of what makes a general `sshd` big.
+
 ## Scope
 
 The original scope was the **DERP-relay-only interop core** — wire compatible
@@ -94,8 +101,8 @@ widening the connection key from a port pair to a four-tuple.
 - **TLS 1.3**, which is blocked on something more interesting than effort;
   see [the note below](#tls-13-is-blocked-on-ed25519).
 
-`forward`, `socks`, `ssh`/`cp` as clients, exit nodes and saved identities
-are all here.
+`forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes and
+saved identities are all here.
 
 ## How it compares
 
@@ -109,31 +116,31 @@ keeps debug information in sibling files rather than in the executable.)
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **1.98 MB** | 17.70 MB |
-| gzipped | **0.99 MB** | 6.85 MB |
+| binary | **2.18 MB** | 17.70 MB |
+| gzipped | **1.09 MB** | 6.85 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
-The ratio is about 9×, and **most of it is the feature gap below, not
+The ratio is about 8×, and **most of it is the feature gap below, not
 craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
 of the rest.
 
-Where our 1.98 MB actually goes, as `size` reports text+data on the x86_64
+Where our 2.18 MB actually goes, as `size` reports text+data on the x86_64
 objects — so these are code and initialised data, not file offsets, and they
 do not sum to the binary:
 
 | | |
 |---|---:|
 | Mbed TLS | 249 KB |
+| **all of our own code** | **183 KB** |
 | the compiled-in CA bundle | 181 KB |
-| **all of our own code** | **140 KB** |
 | Cosmopolitan libc, and two architectures of everything | the remainder |
 
-So the interesting number is not 1.98 MB. It is that one file covers every
-target, and that the entire protocol implementation — addresses, CBOR, JSON,
-crypto, DERP, WireGuard, TCP, UDP, STUN, disco, netcheck, path discovery,
-and our own Ed25519 — is still smaller than the list of certificate
-authorities it ships with.
+Everything we wrote — addresses, CBOR, JSON, crypto, DERP, WireGuard, TCP,
+UDP, STUN, disco, netcheck, path discovery, Ed25519, and an SSH and SFTP
+client and server — now comes to 183 KB. For most of this project's life
+that number was smaller than the list of certificate authorities the binary
+ships with; the SSH subset added 42 KB and overtook it, by two kilobytes.
 
 Phases 3 through 5 added about 288 KB to the binary and roughly 6,000 lines
 of source, which is the cost of everything from `serve <ports>` through
@@ -187,11 +194,13 @@ direct peer-to-peer paths.
 So: tailcat-c does the **whole data path** — address, relay, tunnel, TCP,
 UDP, and the direct peer-to-peer path with its NAT traversal — in both roles
 and interoperably, plus everything built on top of it: serving ports,
-forwarding, SOCKS, exit nodes, ssh and cp, and saved identities.
+forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and the SSH
+and SFTP subset behind `recv` and `ls`.
 
-What is left is the **SSH server** that `recv`, `ls` and `serve ssh` all sit
-behind, and the browser build. The first is most of the remaining distance,
-and it is a licence question before it is a code question.
+What is left is the **browser build**, which Cosmopolitan cannot target, and
+two deliberate omissions: `serve ssh` as a general shell server, and
+upstream's read-write and recursive file modes. A drop box that can run
+commands is not a drop box.
 
 ## Build
 
@@ -233,12 +242,14 @@ Local, tiered, numbered like Starfleet diagnostics -- **1 is the one where you
 take the panels off**, 5 is the quick sweep:
 
 ```console
-$ make diag5     # ~7s     did I just break the build
-$ make diag3     # ~1m30s  both toolchains, sanitizers, fuzzing, crosscheck
+$ make diag5     # ~6s     did I just break the build
+$ make diag3     # ~1m     both toolchains, sanitizers, fuzzing, crosscheck
 $ make diag1     # long    the above from a clean tree, plus every live test
 ```
 
-The first two are measured on this machine, warm. Level 1's duration is
+The first two are measured on this machine, warm; level 3 varies from about
+forty seconds to a minute and a half depending on how much needs rebuilding.
+Level 1's duration is
 deliberately not given a number here: it grew by eight live tests when bug 19
 was fixed and by two aarch64 stages after that, and the figure that used to
 sit in this comment predates both. It prints its own total, and every stage
@@ -341,8 +352,27 @@ on, because no scenario had one-way reachability. Of eleven to the UDP mux,
 two had to be *rewritten* before they were the right mutations: one was a
 false catch that merely failed to compile, and one modelled the wrong bug.
 
-A surviving mutation is a gap in the tests. A caught one only counts if it
-was the right mutation.
+The SSH work added about sixty more, across the wire format, the packet
+layer, key exchange, userauth, channels and the drop box, and produced three
+results worth separating:
+
+- **Caught, and by something stronger than an assertion.** Removing the
+  length bound in `tc_ssh_get_string` does not fail a check, it aborts under
+  ASan -- that argument turned out to be the only thing between a hostile
+  length field and a stack buffer.
+- **Survived, and the mutation was right.** Deleting the `has_signature`
+  check from publickey auth changed no test result, because a parsed query
+  form has an all-zero signature that fails verification anyway. The test
+  asserted the outcome without exercising the guard meant to produce it,
+  which is bug 13's shape exactly. Now closed.
+- **Survived, and the mutation was wrong.** Deleting the empty-list early
+  return from the same function is *equivalent*: with no keys the search loop
+  finds nothing and denies regardless. Recorded as equivalent rather than
+  papered over with a test that would prove nothing.
+
+A surviving mutation is a gap in the tests, unless it is equivalent. A caught
+one only counts if it was the right mutation. Both halves of that have now
+been paid for.
 
 The address layer specifically is checked three ways:
 
@@ -542,11 +572,16 @@ optimisation we do not implement. Worth revisiting; not worth rushing.
 
 ## Vendoring an SSH server
 
-`recv`, `ls` and `serve ssh` all sit behind an SSH server, and it is the
-largest single thing left. PLAN.md's original note said "realistically:
-vendor an existing implementation rather than write one", which is sound
-advice that turns out to have a licence attached, so the decision belongs
-here rather than buried in a plan.
+**Decided and done:** the subset was written, not vendored. It is kept here
+because a decision whose reasoning is thrown away is one that gets
+relitigated, and because the licence analysis is the part that would have to
+be redone first.
+
+`recv` and `ls` both sit behind SSH, and it was the largest single thing
+left. PLAN.md's original note said "realistically: vendor an existing
+implementation rather than write one", which is sound advice that turns out
+to have a licence attached, so the decision belonged here rather than buried
+in a plan.
 
 This project is **BSD-3-Clause**, matching upstream tailcat, and it links
 everything statically into one executable. That makes the licence of anything
@@ -563,12 +598,12 @@ vendored a licence question about the *whole binary*, not about a file.
 | **wolfSSH** | GPLv3 or commercial | yes | GPLv3 would relicense this project. |
 | **libssh2** | BSD-3 | **no** | Client only. Listed because it is the one people suggest first and it cannot do this. |
 
-### The recommendation
+### The decision
 
 **Write the subset, and take TinySSH as the reference rather than the
-dependency.**
+dependency.** That is what happened; see Phases 5.4 and 5.5 in the roadmap.
 
-The reasoning is that we do not need an SSH server. We need `sftp` reachable
+The reasoning was that we do not need an SSH server. We need `sftp` reachable
 over SSH with publickey authentication, which is a much smaller thing:
 
 - transport and key exchange (RFC 4253) — `curve25519-sha256`, which is
@@ -587,9 +622,15 @@ vectors and byte-for-byte against Go's `crypto/ed25519`. So `ssh-ed25519`
 host and user keys are available without an `ecdsa-sha2-nistp256` fallback,
 and the "no unvendored crypto beyond Mbed TLS" property survives.
 
-Estimate with the crypto in hand: **~2,500 lines for the SSH subset, ~1,500
-for SFTP**, against ~30k for vendoring Dropbear and then carrying a second
-crypto stack forever.
+Estimate with the crypto in hand was **~2,500 lines for the SSH subset and
+~1,500 for SFTP**, against ~30k for vendoring Dropbear and then carrying a
+second crypto stack forever.
+
+It came to about 2,900 for both, plus another 1,100 for the client halves
+that `ls` needed and the estimate had not counted — so the estimate was close
+for what it covered and forgot that a client is a separate thing from a
+server. Vendoring would have needed a port of comparable size, as the note
+below predicted, and a second crypto stack for ever.
 
 ### If you would rather vendor
 
@@ -861,70 +902,6 @@ packet layer's vectors were produced by Go written from the same OpenSSH
 document as the C, so both sides could be -- and in this respect both were --
 wrong in the same way. Only a peer written from neither could tell.
 
-**26. Our SSH server replied to a channel request only after doing the
-work.** *(Phase 5.5, found by our own SSH client.)* `on_start` ran the entire
-application -- the whole SFTP session -- and the `CHANNEL_SUCCESS` for the
-request that started it went out afterwards. RFC 4254 section 4 has the
-requester wait for that reply before using the channel, so a client that
-waits deadlocks: ours sent the subsystem request and blocked, the server sat
-inside the application waiting for data that would never come.
-
-It had worked against every real client tried, because OpenSSH does not wait
--- it sends optimistically. The bug was invisible until something that
-follows the specification more strictly connected, and the first thing that
-did was our own client on the day it was written. Fixed by splitting the
-decision from the work: `tc_ssh_accept_fn` answers, and only then does
-`tc_ssh_start_fn` run.
-
-**27. The SFTP client insisted on our own server's handle length.** *(Phase
-5.5, found by `make live-ls` against a real Go server.)* A file handle is
-opaque and entirely the server's to choose -- ours are eight bytes, Go's
-`pkg/sftp` uses its own, OpenSSH uses four. The client-side parser required
-exactly eight, so it interoperated with itself and nothing else. It got as
-far as a successful `stat` before failing on the first `opendir`, which is
-the most misleading place for it to stop: everything up to the point where a
-server-chosen value comes back works perfectly.
-
-Both of these are the same lesson in two directions. A protocol has two ends,
-and writing both from one reading gives two implementations that agree with
-each other. Bug 26 needed a stricter *client* than the one we had been
-testing with; bug 27 needed a server that was not ours.
-
-**25. `recv` refused every connection it existed to accept.** *(Found by
-the first run over a real tunnel.)* Connections are admitted by an accept
-filter that consults the served port set, and `recv` serves no local ports at
-all -- so the SYN for port 22, where its own SSH server listens, was refused
-before the accept loop that would have recognised it. The feature could not
-work at all, and everything it is built from was passing.
-
-Nothing offline could have found it. The SFTP policy, the SSH server and the
-drop box are each driven by a real OpenSSH over a socket, and all of that was
-green; the filter only exists on the tunnel path, and a tunnel needs a relay.
-It took one deliberate live run, which is what live-recv-serve now is.
-
-The shape is worth noting: every component was tested and the wiring between
-two of them was not, because the wiring is the part that only exists in the
-whole. That is the same reason `make live-cli` exists at all.
-
-**24. Bug 7, reintroduced in a new file four years later.** *(Phase 5.5,
-found by the drop box working under host gcc and failing under cosmocc.)*
-`tests/livesshd.c` needed to turn a hex key into bytes, so it grew a small
-`unhex` using `sscanf("%2x")`. That is precisely bug 7: cosmo's `sscanf` does
-not honour that field width reliably, so the key decoded correctly under
-glibc and wrongly under cosmocc.
-
-The symptom was the same as bug 7's, and just as misleading. The entire SSH
-handshake succeeded -- key exchange, host key, cipher, service accept -- and
-authentication failed with `Permission denied (publickey)`, which points at
-the authentication code. It was not the authentication code. The host key
-survived a corrupt decode because a client told not to check host keys does
-not check it; only the authorized key has to match exactly, so only it failed.
-
-Worth recording because the first instinct was to suspect the new code. The
-fix for bug 7 lived inside the file that had it, so nothing stopped the same
-mistake being made again in a file written years later -- and the second
-toolchain caught it a second time, which is the argument for having one.
-
 **23. A rekey request was ignored, and the client hung.** *(Phase 5.4,
 found by being asked where the limitation was written down.)* The sequence
 number is the cipher nonce, so it must never wrap, and the server stopped at
@@ -955,6 +932,70 @@ The test is written accordingly: it fails if the transfer is corrupted, if
 `ssh` hangs, *and* if no rekey actually took place -- because a client that
 ignored `RekeyLimit` would otherwise pass it, which is the same shape of
 mistake as a fuzzer that stopped reaching the code it was aimed at.
+**24. Bug 7, reintroduced in a new file four years later.** *(Phase 5.5,
+found by the drop box working under host gcc and failing under cosmocc.)*
+`tests/livesshd.c` needed to turn a hex key into bytes, so it grew a small
+`unhex` using `sscanf("%2x")`. That is precisely bug 7: cosmo's `sscanf` does
+not honour that field width reliably, so the key decoded correctly under
+glibc and wrongly under cosmocc.
+
+The symptom was the same as bug 7's, and just as misleading. The entire SSH
+handshake succeeded -- key exchange, host key, cipher, service accept -- and
+authentication failed with `Permission denied (publickey)`, which points at
+the authentication code. It was not the authentication code. The host key
+survived a corrupt decode because a client told not to check host keys does
+not check it; only the authorized key has to match exactly, so only it failed.
+
+Worth recording because the first instinct was to suspect the new code. The
+fix for bug 7 lived inside the file that had it, so nothing stopped the same
+mistake being made again in a file written years later -- and the second
+toolchain caught it a second time, which is the argument for having one.
+
+**25. `recv` refused every connection it existed to accept.** *(Found by
+the first run over a real tunnel.)* Connections are admitted by an accept
+filter that consults the served port set, and `recv` serves no local ports at
+all -- so the SYN for port 22, where its own SSH server listens, was refused
+before the accept loop that would have recognised it. The feature could not
+work at all, and everything it is built from was passing.
+
+Nothing offline could have found it. The SFTP policy, the SSH server and the
+drop box are each driven by a real OpenSSH over a socket, and all of that was
+green; the filter only exists on the tunnel path, and a tunnel needs a relay.
+It took one deliberate live run, which is what live-recv-serve now is.
+
+The shape is worth noting: every component was tested and the wiring between
+two of them was not, because the wiring is the part that only exists in the
+whole. That is the same reason `make live-cli` exists at all.
+
+**26. Our SSH server replied to a channel request only after doing the
+work.** *(Phase 5.5, found by our own SSH client.)* `on_start` ran the entire
+application -- the whole SFTP session -- and the `CHANNEL_SUCCESS` for the
+request that started it went out afterwards. RFC 4254 section 4 has the
+requester wait for that reply before using the channel, so a client that
+waits deadlocks: ours sent the subsystem request and blocked, the server sat
+inside the application waiting for data that would never come.
+
+It had worked against every real client tried, because OpenSSH does not wait
+-- it sends optimistically. The bug was invisible until something that
+follows the specification more strictly connected, and the first thing that
+did was our own client on the day it was written. Fixed by splitting the
+decision from the work: `tc_ssh_accept_fn` answers, and only then does
+`tc_ssh_start_fn` run.
+
+**27. The SFTP client insisted on our own server's handle length.** *(Phase
+5.5, found by `make live-ls` against a real Go server.)* A file handle is
+opaque and entirely the server's to choose -- ours are eight bytes, Go's
+`pkg/sftp` uses its own, OpenSSH uses four. The client-side parser required
+exactly eight, so it interoperated with itself and nothing else. It got as
+far as a successful `stat` before failing on the first `opendir`, which is
+the most misleading place for it to stop: everything up to the point where a
+server-chosen value comes back works perfectly.
+
+Both of these are the same lesson in two directions. A protocol has two ends,
+and writing both from one reading gives two implementations that agree with
+each other. Bug 26 needed a stricter *client* than the one we had been
+testing with; bug 27 needed a server that was not ours.
+
 
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
@@ -1002,12 +1043,17 @@ Current, and deliberate unless noted.
   which is upstream's surface for it too -- `forward` is TCP-only in both
   implementations. Fragmented SOCKS datagrams (`FRAG` non-zero) are dropped,
   which RFC 1928 permits and every implementation does.
-- **No SSH or SFTP *server*, and no WASM build.** `ssh` and `cp` work as
-  clients, because they exec the system ssh and scp with us as a
-  `ProxyCommand` — which is exactly what upstream does for those two as
-  well. Serving SSH would mean implementing it; see
-  [Vendoring an SSH server](#vendoring-an-ssh-server) for what that would
-  take and which licence it would cost.
+- **The SSH server serves sftp and nothing else.** No shell, no PTY, no
+  port or agent forwarding, no `exec` for `recv` — every one of those is a
+  way to reach something other than the directory being served, and a drop
+  box needs none of them. `ssh` and `cp` remain *clients* that exec the
+  system ssh and scp with us as a `ProxyCommand`, which is exactly what
+  upstream does for those two as well.
+- **No rekeying as the initiator.** A peer may start a key exchange at any
+  point and we complete it, keeping the session id; we never start one. The
+  sequence number is the cipher nonce and must not wrap, so a session stops
+  at 2^32 packets — unreachable against any peer that rekeys at all.
+- **No WASM build.** Cosmopolitan does not target it.
 - **`ls` is in-process, as upstream's is.** Upstream's `ls` is the one file
   command it does *not* shell out for: it links `golang.org/x/crypto/ssh`
   and `github.com/pkg/sftp` and drives them over its own tunnel. Ours does
@@ -1189,7 +1235,7 @@ Roughly in the order they should be picked up.
             `base64url.c` and `http.c` are full of character handling that
             *mostly* uses `uint8_t`. "Mostly" was the word hiding it.
 
-            All 28 test binaries pass under the other signedness, so the
+            All 35 test binaries pass under the other signedness, so the
             arithmetic is clean. That removes the largest *class* of aarch64
             risk without an emulator.
       - [x] **qemu-user** — `make test-aarch64`, which needs
@@ -1209,9 +1255,14 @@ Roughly in the order they should be picked up.
             host kernel, so it tests our code and not Cosmopolitan's.
       - [ ] **Real hardware** beats all of the above if any is to hand.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
-      covered; the other four targets and the entire aarch64 half are not.
+      covered; the other four targets are not, and the aarch64 half is
+      verified only for its arithmetic. With the feature work done this is
+      now the largest untested claim in the project.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
-      that callers must serialise it.
+      that callers must serialise it. Nothing here is threaded today — the
+      SSH server and client are blocking state machines driven by an event
+      loop, which is why their reads pump rather than wait — so this is about
+      what a future caller may assume, not about a bug.
 - [ ] Revisit **TLS 1.3**. Ed25519 now exists here, so the remaining blocker
       is narrower than it was: Mbed TLS's X.509 parser has no hook to hand an
       unknown signature algorithm to ours, and the certificate in question is
@@ -1234,9 +1285,11 @@ Roughly in the order they should be picked up.
       queue, and that is where bugs 20 and 21 came from. It has vectors and
       no fuzzer.
 - [ ] **Extend mutation testing beyond the modules that have had it.** Path
-      discovery, the UDP mux and now TCP have been mutated; the address
-      codec, CBOR, JSON, Noise and DERP have not. Every module that has been
-      mutated so far gave up at least one untested assertion.
+      discovery, the UDP mux, TCP, the SSH wire format, the packet layer, key
+      exchange, userauth, channels and the drop box have all been mutated;
+      the address codec, CBOR, JSON, Noise and DERP have not. Every module
+      that has been mutated so far gave up at least one untested assertion,
+      and two of them gave up a real bug.
 
 ## Roadmap
 
@@ -1331,10 +1384,11 @@ Roughly in the order they should be picked up.
 
 **Phases 1, 2 and 3 are done.** `recv` turned out not to belong to Phase 3 at
 all: it is `serve --files <dir>:wo files`, and the `files` service is SFTP
-over SSH, so the *server* half needs PLAN.md's 5.4 and 5.5 rather than the
-~300 lines that entry estimated. The *client* half already works — `make
-live-recv` delivers a file into a real `tailcat recv` drop box — because `cp`
-execs the system scp, which speaks exactly that protocol.
+over SSH, so the *server* half needed an SSH server — Phases 5.4 and 5.5,
+rather than the ~300 lines that entry estimated. Its *client* half worked
+from the start, because `cp` execs the system scp, which speaks exactly that
+protocol; `make live-recv` has been delivering a file into a real `tailcat
+recv` drop box since then.
 
 - [x] **Phase 4 — direct peer-to-peer paths.** A UDP transport, a STUN
       client, netcheck, the disco protocol, and the path discovery and
@@ -1361,7 +1415,7 @@ execs the system scp, which speaks exactly that protocol.
       `-isystem` header that includes it, so editing the config rebuilt
       nothing.
 
-- [x] **Phase 5.4 — SOCKS5 UDP ASSOCIATE and `--allow`.** The two things
+- [x] **Phase 5.1 and 5.7 — SOCKS5 UDP ASSOCIATE and `--allow`.** The two things
       that finished the CLI's exposure of what the data plane could already
       do. `socks` now relays datagrams (RFC 1928 §7) with an association
       owned by its TCP control connection, so a forwarder is never left
@@ -1388,10 +1442,35 @@ execs the system scp, which speaks exactly that protocol.
       close the second. Bugs 20 and 21 above have the detail, including the
       third bug the fix contained and the fourth it revealed.
 
-**Phase 4 is done and Phase 5 is mostly done.** What remains of upstream's
-command set — `recv`, `ls`, `serve ssh` — needs an SSH server first, which is
-a [licence decision](#vendoring-an-ssh-server) before it is code. See
-[PLAN.md](PLAN.md) for the detail.
+- [x] **Phase 5.4 — an SSH subset.** The licence question was
+      [decided](#vendoring-an-ssh-server) rather than deferred: write the
+      subset, with TinySSH as a reference and not a dependency. RFC 4251's
+      wire types, the binary packet protocol with
+      `chacha20-poly1305@openssh.com`, `curve25519-sha256`, `ssh-ed25519`
+      host keys, publickey authentication, one channel, and rekeying as a
+      responder — server and client both, in 2,900 lines against the ~20,000
+      of Go a general implementation takes. `make live-sshd` puts a real
+      OpenSSH 9.6 client against our server and `make live-sshloop` runs our
+      own two halves against each other.
+
+- [x] **Phase 5.5 — SFTP, the drop box, and `recv`.** A version 3 codec, a
+      write-only drop box whose central rule is that *the server chooses
+      every stored filename*, and the `recv` subcommand that serves it on
+      port 22 of the tunnel. `make live-dropbox` carries out the attacks with
+      a real `scp` and `sftp` and checks the filesystem afterwards rather
+      than what the client printed; `make live-recv-serve` does it through a
+      real relay.
+
+- [x] **`ls`, in-process.** Upstream's `ls` is the one file command it does
+      not shell out for, so ours does not either: an SSH client and an SFTP
+      client over our own tunnel, printing what upstream prints. `make
+      live-ls` lists a directory served by a real Go tailcat.
+
+**Phases 1 through 5 are done**, apart from the browser build, which
+Cosmopolitan cannot target, and TLS 1.3, which is blocked on Mbed TLS's X.509
+parser rather than on effort. What is left of upstream's surface is two
+deliberate omissions: `serve ssh` as a general shell server, and the
+read-write and recursive file modes. See [PLAN.md](PLAN.md) for the detail.
 
 ## Licence
 
