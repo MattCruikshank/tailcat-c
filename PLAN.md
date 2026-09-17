@@ -1033,6 +1033,42 @@ flaky network into a refusal would be worse than no net.
 dials one, so a lookup there would be a query nobody asked for. Upstream's
 does not resolve either.
 
+### 6.4 Fuzzing and mutating the DERP frame codec ✅ · ~380 lines
+
+The last of the three parsers listed for fuzzing since Phase 2 -- the JSON
+reader and the TCP input path already had harnesses. This one reads bytes off
+the relay socket: a length field chosen by the far end and used to size a
+read, which is the shape that produced bugs 20 and 21.
+
+`tests/fuzz_derp.c` checks four properties rather than only "does not crash":
+an accepted header re-encodes to the same five bytes and carries a length
+inside the codec's own bound; an accepted RECV_PACKET yields a body that lies
+entirely within the payload, which matters because `*pkt` points into the
+caller's buffer; an accepted greeting really did carry the key it returned;
+and a SERVER_INFO box is never opened by chance. It counts what it reached
+and fails if the corpus stops reaching the parsers, which is bug 20's lesson
+made structural.
+
+Clean at a million iterations. The interesting result came from mutation
+testing, which is the second half of the same job: **eleven mutations, ten
+killed, and the survivor was real.**
+
+`tc_derp_parse_recv_packet` bounds the packet at `TC_DERP_MAX_PACKET_SIZE`,
+64KB. Deleting that check changed no test result and no fuzz result. It is
+not dead code: a *frame* may be `TC_DERP_MAX_FRAME_LEN`, a megabyte, so a
+relay sending one oversized frame would -- without the check -- hand a
+megabyte to the WireGuard layer as a packet. Nothing reached it because the
+unit tests used small packets and the fuzzer's buffer is a kilobyte, which is
+the right size for finding parser bugs and the wrong size for finding this
+one. `tests/test_derp.c` now covers the boundary from both sides, and the
+mutation dies.
+
+Two things worth keeping from that. The fuzzer and the mutation sweep answer
+different questions -- "does it crash" and "would we notice if it were
+wrong" -- and only the second found this. And a harness has a *shape*, not
+just a size: a kilobyte buffer cannot express the input that matters here, so
+no number of iterations would have helped.
+
 ---
 
 ## Cross-cutting
@@ -1055,14 +1091,13 @@ These are already in the README's TODO list and do not depend on any feature.
   covered. With aarch64 executing, what is left is the operating systems,
   and that is now the largest untested claim -- and the one an emulator and
   a package cannot close.
-- **Extend fuzzing** to the DERP frame codec, which is the last of the three
-  originally listed here — the JSON parser and the TCP input path both have
-  harnesses now. The frame codec parses attacker-influenced lengths straight
-  off a socket, which is the shape that produced bugs 20 and 21.
+- ~~**Extend fuzzing** to the DERP frame codec~~: done, 6.4. All three
+  parsers originally listed now have harnesses.
 - **Extend mutation testing** beyond path discovery, the UDP mux, TCP, the
-  SSH subset and the browser opener, which are the only modules it has been
-  applied to. It found gaps in every one of them, at a rate that suggests the
-  rest have them too.
+  SSH subset, the browser opener and the DERP frame codec. It has found a gap
+  in every single module it has been applied to, including the one that had
+  just been fuzzed -- which is the argument for doing the rest: addresses and
+  CBOR, JSON, Noise, SFTP and the drop box.
 - **`config_dir` is decided at compile time and should not be.** It picks
   `~/Library/Application Support` under `#ifdef __APPLE__` and `~/.config`
   otherwise, which is a question about the compiler. cosmocc does not define
@@ -1100,6 +1135,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.10 — `browse` and `--open-browser` | ~700 | ✅ done |
 | 6.1 — walking upstream’s README | ~450 | ✅ done |
 | 6.3 — DNS names and the safety probe | ~560 | ✅ done |
+| 6.4 — fuzzing and mutating the DERP codec | ~380 | ✅ done |
 | 6.2 — the gaps it found | ? | ⏸ not started |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 
@@ -1131,16 +1167,16 @@ discovery were not actually being made.
 
 ### What to do next
 
-1. **Run the aarch64 half**, which is now half done. `make
-   test-unsigned-char` passes: `char` really is signed on cosmo x86_64 and
-   unsigned on cosmo aarch64, and all 35 test binaries pass under the other
-   signedness. `make test-aarch64` runs the real aarch64 instructions under
-   qemu-user and is written and waiting on `qemu-user-static` being
-   installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
-   APE assimilation is needed. After that: qemu-system, then hardware.
+1. **Test on macOS and the BSDs.** Both architectures now execute their own
+   instructions -- `make test-aarch64` runs the whole suite on real aarch64
+   under qemu-user and passes -- so what is left is the *operating systems*,
+   two of six. Unlike the aarch64 half, no package closes this one: it needs
+   the machines. It is now the largest untested claim in the project.
 
-   This is now the largest untested claim in the project by some way: four
-   of six target operating systems and half of every binary.
+   `config_dir` is the known defect waiting on the same thing: it picks its
+   directory with `#ifdef __APPLE__`, which cosmocc never defines, so the
+   shipped binary uses `~/.config` on the one platform that branch exists
+   for. `tc_host_os` is the fix and needs a Mac to prove.
 2. **Upstream's other file modes**, if they are wanted: `:rw` and the
    recursive write-only `:wo+`. The second trades away the drop box
    guarantee by design and should be a separate mode with the trade stated,
@@ -1151,12 +1187,11 @@ discovery were not actually being made.
    that state, exactly as on any stack that has not added a
    `tcp_fin_timeout`. Small, and the table it protects holds sixty-four
    entries.
-4. **Fuzz the DERP frame codec, and mutate the modules that have never been
-   mutated.** Both are listed under Cross-cutting, and both are cheap next to
-   what they have historically returned: every module mutated so far gave up
-   at least one assertion that was not actually being made, and the TCP
-   fuzzer found two table-exhaustion bugs within minutes of being made honest
-   about its own reach.
+4. ~~**Fuzz the DERP frame codec**~~: done, and it held at a million
+   iterations across five seeds. **Mutating the modules that have never been
+   mutated** is still open and still the cheapest work here -- see 6.4 for
+   what the DERP sweep turned up, which is the same answer every sweep has
+   given: an assertion nobody was making.
 5. **Make reaping automatic, or say plainly that it is not.**
    `tc_tcp_mux_reap` has to be called or closed connections hold their slots.
    That is now less dangerous than it was — bugs 20 and 21 removed the two

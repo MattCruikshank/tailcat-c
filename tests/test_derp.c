@@ -232,6 +232,38 @@ static void test_packet_frames(void)
 	           TC_OK);
 	TCT_EQ_INT(body_len, 0);
 
+	TCT_CASE("a relayed packet larger than the packet bound is refused");
+	/* Found by mutation testing: deleting this check changed no test result
+	 * and no fuzz result, because nothing reached it. It is not unreachable
+	 * code. A frame may be up to TC_DERP_MAX_FRAME_LEN, which is a megabyte,
+	 * while a relayed *packet* is bounded at 64KB -- so a relay sending one
+	 * oversized frame would, without the check, hand a megabyte to the
+	 * WireGuard layer as though it were a packet. The fuzzer cannot get
+	 * here: its buffer is a kilobyte, which is the right size for finding
+	 * parser bugs and the wrong size for finding this one.
+	 *
+	 * Heap rather than stack: 64KB of automatic storage is more than some
+	 * thread stacks have. */
+	{
+		size_t big_len = TC_DERP_KEY_LEN + TC_DERP_MAX_PACKET_SIZE + 1;
+		uint8_t *big = calloc(1, big_len);
+		TCT_TRUE(big != NULL);
+		if (big != NULL) {
+			TCT_EQ_INT(tc_derp_parse_recv_packet(src, &body, &body_len, big,
+			                                     big_len),
+			           TC_ERR_TOOMANY);
+
+			TCT_CASE("and one of exactly the bound is allowed");
+			/* The boundary in both directions, so an off-by-one in either
+			 * the check or this test is visible. */
+			TCT_EQ_INT(tc_derp_parse_recv_packet(src, &body, &body_len, big,
+			                                     big_len - 1),
+			           TC_OK);
+			TCT_EQ_INT((int)(body_len == TC_DERP_MAX_PACKET_SIZE), 1);
+			free(big);
+		}
+	}
+
 	TCT_CASE("a recv-packet with no room for a source key is refused");
 	TCT_EQ_INT(tc_derp_parse_recv_packet(src, &body, &body_len, out,
 	                                     TC_DERP_KEY_LEN - 1),

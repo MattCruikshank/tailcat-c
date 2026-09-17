@@ -409,6 +409,16 @@ results worth separating:
   finds nothing and denies regardless. Recorded as equivalent rather than
   papered over with a test that would prove nothing.
 
+The DERP frame codec added eleven, ten killed, and the survivor is the
+clearest case yet for doing this at all: `tc_derp_parse_recv_packet` bounds a
+relayed packet at 64KB, and deleting that bound changed no test result and no
+*fuzz* result, on a module that had just been fuzzed for a million
+iterations. It is not dead code -- a frame may be a megabyte, so without the
+check one oversized frame becomes a megabyte handed to the WireGuard layer as
+a packet. Nothing reached it because the tests used small packets and the
+fuzzer's buffer is a kilobyte. **A harness has a shape as well as a size**,
+and no number of iterations fixes the wrong shape.
+
 `browse` added twenty-five more, and a fourth result: **survived because
 something else on the machine did the job.** Three mutations to the
 browser-opening code -- ignoring `$BROWSER` entirely, trying only its first
