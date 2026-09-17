@@ -8,10 +8,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A flow, keyed by everything that distinguishes one.
+ *
+ * The remote *address* is part of the key because a destination beyond the
+ * peer is possible: one local port may be talking to several, and without the
+ * address their replies would be indistinguishable -- the same lesson tcpmux
+ * learned when its port-pair key started colliding. remote_ip all zeroes
+ * means the peer itself, which is the ordinary case. */
 typedef struct {
 	bool used;
 	uint16_t local_port;
 	uint16_t remote_port;
+	uint8_t remote_ip[TC_IPV6_ADDR_LEN];
+	bool has_remote_ip;
 	uint64_t last_used_ms;
 } binding;
 
@@ -183,14 +192,55 @@ static bool listening(const tc_udp_mux *m, uint16_t port)
 
 /* ---- bindings ---------------------------------------------------------- */
 
-static binding *find_binding(tc_udp_mux *m, uint16_t local, uint16_t remote)
+/* remote_ip NULL means "the peer itself". */
+static binding *find_binding(tc_udp_mux *m, uint16_t local, uint16_t remote,
+                             const uint8_t remote_ip[TC_IPV6_ADDR_LEN])
 {
 	for (size_t i = 0; i < TC_UDPMUX_MAX_BINDINGS; i++) {
-		if (m->bindings[i].used && m->bindings[i].local_port == local &&
-		    m->bindings[i].remote_port == remote)
-			return &m->bindings[i];
+		binding *b = &m->bindings[i];
+		if (!b->used || b->local_port != local || b->remote_port != remote)
+			continue;
+		if (remote_ip == NULL) {
+			if (b->has_remote_ip)
+				continue;
+		} else {
+			if (!b->has_remote_ip ||
+			    memcmp(b->remote_ip, remote_ip, TC_IPV6_ADDR_LEN) != 0)
+				continue;
+		}
+		return b;
 	}
 	return NULL;
+}
+
+/* remember records a flow so its replies can be routed back, creating one if
+ * this is the first datagram. */
+static void remember(tc_udp_mux *m, uint16_t local, uint16_t remote,
+                     const uint8_t remote_ip[TC_IPV6_ADDR_LEN],
+                     uint64_t now_ms)
+{
+	binding *b = find_binding(m, local, remote, remote_ip);
+	if (b != NULL) {
+		touch(b, now_ms);
+		return;
+	}
+	for (size_t i = 0; i < TC_UDPMUX_MAX_BINDINGS; i++) {
+		if (m->bindings[i].used)
+			continue;
+		b = &m->bindings[i];
+		memset(b, 0, sizeof *b);
+		b->used = true;
+		b->local_port = local;
+		b->remote_port = remote;
+		if (remote_ip != NULL) {
+			memcpy(b->remote_ip, remote_ip, TC_IPV6_ADDR_LEN);
+			b->has_remote_ip = true;
+		}
+		b->last_used_ms = now_ms;
+		return;
+	}
+	/* Full. The datagram still goes out; only the reply path is lost, which
+	 * is the same outcome as a NAT that has run out of table. */
 }
 
 static bool local_port_taken(const tc_udp_mux *m, uint16_t port)
@@ -217,7 +267,8 @@ int tc_udp_mux_bind(tc_udp_mux *m, uint16_t remote_port, uint64_t now_ms,
 	 * is what a socket does and because a new port each time would exhaust
 	 * the range in a few thousand queries. */
 	for (size_t i = 0; i < TC_UDPMUX_MAX_BINDINGS; i++) {
-		if (m->bindings[i].used && m->bindings[i].remote_port == remote_port) {
+		if (m->bindings[i].used && !m->bindings[i].has_remote_ip &&
+		    m->bindings[i].remote_port == remote_port) {
 			touch(&m->bindings[i], now_ms);
 			*out_local_port = m->bindings[i].local_port;
 			return TC_OK;
@@ -321,9 +372,13 @@ static int send_one(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
 		ck = 0xffff;
 	wr16(uh + 6, ck);
 
-	/* A binding refreshed on every send, so a flow that is talking does not
-	 * expire underneath itself. */
-	touch(find_binding(m, local_port, remote_port), now_ms);
+	/* Recorded on every send, so a flow that is talking does not expire
+	 * underneath itself -- and so a reply from somewhere beyond the peer has
+	 * something to match against. */
+	remember(m, local_port, remote_port,
+	         (memcmp(dst_ip, m->remote_ip, TC_IPV6_ADDR_LEN) == 0) ? NULL
+	                                                              : dst_ip,
+	         now_ms);
 
 	m->stats.dgrams_sent++;
 	m->stats.bytes_sent += len;
@@ -348,6 +403,49 @@ int tc_udp_mux_send_to(tc_udp_mux *m, uint16_t local_port,
 	return send_one(m, local_port, dst->port, dst->ip, data, len, now_ms);
 }
 
+int tc_udp_mux_send_as(tc_udp_mux *m, const tc_endpoint *src,
+                       uint16_t dst_port, const void *data, size_t len,
+                       uint64_t now_ms)
+{
+	if (m == NULL || src == NULL || src->ip_len != 16 || dst_port == 0)
+		return TC_ERR_INVAL;
+	if (src->port == 0)
+		return TC_ERR_INVAL;
+	if (len > TC_UDP_MAX_DGRAM)
+		return TC_ERR_TOOMANY;
+
+	/* Built by hand rather than through send_one, because this is the one
+	 * path where the source is not us. */
+	uint8_t pkt[TC_IPV6_HEADER_LEN + TC_UDP_HEADER_LEN + TC_UDP_MAX_DGRAM];
+	size_t udp_len = TC_UDP_HEADER_LEN + len;
+
+	memset(pkt, 0, TC_IPV6_HEADER_LEN + TC_UDP_HEADER_LEN);
+	pkt[0] = 0x60;
+	wr16(pkt + 4, (uint16_t)udp_len);
+	pkt[6] = 17;
+	pkt[7] = 64;
+	memcpy(pkt + 8, src->ip, TC_IPV6_ADDR_LEN);
+	memcpy(pkt + 24, m->remote_ip, TC_IPV6_ADDR_LEN);
+
+	uint8_t *uh = pkt + TC_IPV6_HEADER_LEN;
+	wr16(uh + 0, src->port);
+	wr16(uh + 2, dst_port);
+	wr16(uh + 4, (uint16_t)udp_len);
+	wr16(uh + 6, 0);
+	if (len > 0)
+		memcpy(uh + TC_UDP_HEADER_LEN, data, len);
+
+	uint16_t ck = udp_checksum(src->ip, m->remote_ip, uh, udp_len);
+	if (ck == 0)
+		ck = 0xffff;
+	wr16(uh + 6, ck);
+
+	(void)now_ms;
+	m->stats.dgrams_sent++;
+	m->stats.bytes_sent += len;
+	return m->out(m->out_ctx, pkt, TC_IPV6_HEADER_LEN + udp_len);
+}
+
 /* ---- receiving --------------------------------------------------------- */
 
 bool tc_udp_mux_is_udp(const uint8_t *pkt, size_t len)
@@ -370,19 +468,19 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 		return TC_ERR_INVAL;
 	}
 
-	/* The source must be our peer: this mux serves one tunnel, and a
-	 * datagram claiming another source is either a bug at the far end or an
-	 * attempt to have one peer's traffic treated as another's.
+	/* Everything reaching here arrived over an authenticated WireGuard
+	 * session with exactly one peer, so the addresses are flow identifiers
+	 * rather than credentials. What they decide is what a datagram *means*.
 	 *
-	 * The destination must be us, unless we are an exit node -- in which
-	 * case the peer may name somewhere else, and that address travels with
-	 * the datagram because UDP has no connection to hang it on. */
-	if (memcmp(pkt + 8, m->remote_ip, TC_IPV6_ADDR_LEN) != 0) {
-		m->stats.dropped_malformed++;
-		return TC_ERR_INVAL;
-	}
+	 * From the peer to us is the ordinary case. From the peer to somewhere
+	 * else means it is asking us to forward, which only an exit node does.
+	 * From somewhere else to us is the answer to something we forwarded
+	 * through the peer -- and that is only believed if a flow we opened is
+	 * waiting for it. */
+	const uint8_t *src_ip = pkt + 8;
+	bool from_peer = memcmp(src_ip, m->remote_ip, TC_IPV6_ADDR_LEN) == 0;
 	bool to_us = memcmp(pkt + 24, m->local_ip, TC_IPV6_ADDR_LEN) == 0;
-	if (!to_us && !m->exit_node) {
+	if (!to_us && !(from_peer && m->exit_node)) {
 		m->stats.dropped_malformed++;
 		return TC_ERR_INVAL;
 	}
@@ -434,10 +532,16 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 	/* A datagram addressed beyond us needs no listener: the port belongs to
 	 * the destination the peer named, not to anything of ours. That is what
 	 * being an exit node means, and why it is off by default. */
-	binding *b = to_us ? find_binding(m, dst_port, src_port) : NULL;
-	if (to_us && b == NULL && !listening(m, dst_port)) {
-		m->stats.dropped_no_listener++;
-		return TC_ERR_INVAL;
+	binding *b = NULL;
+	if (to_us) {
+		b = find_binding(m, dst_port, src_port, from_peer ? NULL : src_ip);
+		/* A foreign source has to match a flow we opened. A listener is not
+		 * enough: it would mean anything the peer cares to spoof a source
+		 * for could be delivered as though we had asked for it. */
+		if (b == NULL && (!from_peer || !listening(m, dst_port))) {
+			m->stats.dropped_no_listener++;
+			return TC_ERR_INVAL;
+		}
 	}
 	touch(b, now_ms);
 
@@ -459,9 +563,17 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 	slot->remote_port = src_port;
 	memset(&slot->dst, 0, sizeof slot->dst);
 	if (!to_us) {
+		/* Where the peer asked us to send it. */
 		memcpy(slot->dst.ip, pkt + 24, TC_IPV6_ADDR_LEN);
 		slot->dst.ip_len = 16;
 		slot->dst.port = dst_port;
+	} else if (!from_peer) {
+		/* Where it came from, which for a forwarded reply is the thing the
+		 * caller actually needs: one local port may have several
+		 * destinations in flight and nothing else tells them apart. */
+		memcpy(slot->dst.ip, src_ip, TC_IPV6_ADDR_LEN);
+		slot->dst.ip_len = 16;
+		slot->dst.port = src_port;
 	}
 	slot->len = data_len;
 	if (data_len != 0)

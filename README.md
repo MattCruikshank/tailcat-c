@@ -153,8 +153,9 @@ direct peer-to-peer paths.
 | Region choice by latency | ✅ (netcheck) | ✅ (netcheck) |
 | Multiple concurrent connections | ✅ | ✅ |
 | Multiple concurrent clients | ✅ (8) | ✅ |
-| UDP forwarding | tunnel + exit node; no CLI surface | ✅ |
+| UDP forwarding | ✅ (SOCKS5 UDP ASSOCIATE) | ✅ |
 | Exit node (forward to any address) | ✅ | ✅ |
+| Client allow list (`--allow`) | ✅ | ✅ |
 | IPv4 into the tunnel via NAT64 | ✅ | ✅ |
 | TLS to the relay | 1.2 ([why](#tls-13-is-blocked-on-ed25519)) | 1.2 + 1.3 |
 | **Commands** | | |
@@ -165,7 +166,7 @@ direct peer-to-peer paths.
 | `ping` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
-| `socks` (SOCKS5 proxy) | ✅ CONNECT, one server | ✅ CONNECT + UDP ASSOCIATE |
+| `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, one server | ✅ (many servers) |
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ❌ | ✅ (in-process SFTP client) |
@@ -275,6 +276,8 @@ $ tailcat-c parse <tc-address>             # describe an address
 $ tailcat-c netcheck                       # UDP, NAT type, relay latency
 $ tailcat-c serve exit-node,22             # forward anywhere this machine can reach
 $ tailcat-c forward <addr> 13306:192.168.1.10:3306
+$ tailcat-c serve --allow nodekey:...      # only that client may connect
+$ tailcat-c socks <addr> 1080             # CONNECT and UDP ASSOCIATE
 ```
 
 The address must be self-contained; run `tailcat resolve` on a short one,
@@ -762,9 +765,10 @@ Current, and deliberate unless noted.
   Two peers that both sit behind symmetric NATs will stay on the relay, which
   is the correct answer rather than a limitation -- but upstream has a UDP
   relay for that case and we do not.
-- **No UDP from the command line.** The tunnel carries datagrams and an exit
-  node forwards them, but nothing in the CLI originates one. Upstream's
-  surface for that is SOCKS5 UDP ASSOCIATE, and ours does CONNECT only.
+- **UDP is reachable only through SOCKS.** `socks` implements UDP ASSOCIATE,
+  which is upstream's surface for it too -- `forward` is TCP-only in both
+  implementations. Fragmented SOCKS datagrams (`FRAG` non-zero) are dropped,
+  which RFC 1928 permits and every implementation does.
 - **No SSH or SFTP *server*, and no WASM build.** `ssh` and `cp` work as
   clients, because they exec the system ssh and scp with us as a
   `ProxyCommand` — which is exactly what upstream does for those two as
@@ -783,16 +787,25 @@ Current, and deliberate unless noted.
   address already authenticates the server: reaching it required the
   pre-shared key and the server's public key. A `known_hosts` entry keyed on a
   synthetic name would add a prompt and no security.
-- **`socks` reaches one server**, the one in its address, and ignores the
-  destination host in each CONNECT request -- only the port is used. Upstream
-  routes by hostname across several servers at once.
+- **`socks` reaches one server**, the one in its address. Upstream can route
+  across several at once by giving each a `tc...` hostname; we take only the
+  one from the command line.
 
-  The original reason for this was that we had no way to reach a destination
-  beyond the server. That stopped being true when exit nodes landed, so the
-  honest statement now is that it simply has not been wired up: `forward`
-  gained a destination and `socks` did not. It should, and when it does the
-  destination in a CONNECT request is exactly what to pass to
-  `tc_tcp_mux_connect_to`.
+  Destinations *are* honoured now, following upstream's rule: the hostname
+  `server.tailcat` (or an empty host) means the server itself, and anything
+  else is a destination to reach **through** it, which needs `serve
+  exit-node`. **This changed in Phase 5**: `socks` used to ignore the
+  destination host entirely and use only the port, because there was no way
+  to reach anything else. A client that relied on that needs to say
+  `server.tailcat` now -- which is also what it would have to say to
+  upstream.
+
+  Hostnames are resolved **on the client's machine**, as upstream resolves
+  them. SOCKS5 exists partly so a proxy can resolve names, and one that
+  refused them would break every ordinary client -- but the consequence is
+  real: the query is visible to whoever sees this machine's DNS, and a name
+  that means something different on the far side of the tunnel resolves to
+  the wrong thing.
 - **netcheck does not probe hairpinning or port mapping.** A relay is chosen
   by STUN round trip as upstream's netcheck does, and the NAT mapping is
   classified as stable or destination-dependent. What is missing is whether
@@ -803,13 +816,15 @@ Current, and deliberate unless noted.
   exits -- it writes to one stdout, so a second client would have nowhere to
   go. That is upstream's behaviour too. `serve <ports>` has no such limit and
   takes up to 8 clients and 64 connections at once.
-- **No `--allow` list.** Anyone holding the address can connect. Upstream can
-  restrict by client public key; we cannot, so the address is the only
-  credential. This matters most for `serve exit-node`: anyone with the
-  address can then reach anything the serving machine can, including its own
-  loopback services and its cloud metadata endpoint. Upstream has the same
-  property and the same warning; the difference is that upstream can at least
-  narrow *who* by public key.
+- **The address is a bearer credential.** Anyone holding it can connect, so
+  it is exactly as secret as the least careful place it has been pasted, and
+  it cannot be narrowed after the fact. It is the only
+  credential -- *unless* `--allow` is given, which restricts by client node
+  key exactly as upstream's does. Without it, and especially with `serve
+  exit-node`, anyone holding the address can reach anything the serving
+  machine can, including its own loopback services and its cloud metadata
+  endpoint. `--allow` is the answer and it is off by default, which is
+  upstream's default too.
 
 ### TLS
 
@@ -938,16 +953,8 @@ Roughly in the order they should be picked up.
       - [ ] **Real hardware** beats all of the above if any is to hand.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
       covered; the other four targets and the entire aarch64 half are not.
-- [ ] **An `--allow` list.** Anyone holding the address can connect, and with
-      `serve exit-node` that means reaching anything the serving machine can.
-      Upstream can restrict by client public key. This is now the largest
-      gap between our security posture and upstream's.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
       that callers must serialise it.
-- [ ] **SOCKS5 UDP ASSOCIATE**, the only missing piece of UDP through the
-      tunnel. The tunnel carries datagrams and an exit node forwards them;
-      nothing in the CLI originates one, because upstream's surface for that
-      is UDP ASSOCIATE and ours does CONNECT only.
 - [ ] **Ed25519.** Needed by the SSH server, and it would also unblock TLS
       1.3; see both sections above. ~400 lines on top of the field
       arithmetic X25519 already uses.

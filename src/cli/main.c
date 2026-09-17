@@ -40,13 +40,16 @@
 #include "tc/portset.h"
 #include "tc/shquote.h"
 #include "tc/proxy.h"
+#include "tc/socks.h"
 #include "tc/tcpmux.h"
+#include "tc/udpmux.h"
 #include "tc/tls.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdarg.h>
@@ -528,6 +531,11 @@ typedef struct {
 	 * has not been proven. */
 	tc_udp *udp;
 	tc_path *path;
+	/* The tunnel's datagram stack, when the caller has one. Distinct from
+	 * `udp` above, which is the socket the *transport* uses for direct
+	 * paths -- one carries datagrams through the tunnel, the other carries
+	 * the tunnel itself. */
+	tc_udp_mux *umux;
 	/* So the upgrade and the fallback each get logged once rather than on
 	 * every packet. */
 	bool was_direct;
@@ -589,6 +597,24 @@ static int path_relay_out(void *vctx, const uint8_t *pkt, size_t len)
 	return tc_derp_send(p->derp, p->server_key, pkt, len);
 }
 
+/* deliver_inner hands a decrypted tunnel packet to whichever stack owns it.
+ *
+ * One branch, on the IPv6 next-header byte. Feeding a UDP datagram to the TCP
+ * stack would not be an error -- it would be silently discarded, and UDP
+ * forwarding would simply never work, which is the kind of failure that takes
+ * an afternoon to find. */
+static void deliver_inner(tc_tcp_mux *tmux, tc_udp_mux *umux,
+                          const uint8_t *inner, size_t len)
+{
+	if (tc_udp_mux_is_udp(inner, len)) {
+		if (umux != NULL)
+			(void)tc_udp_mux_input(umux, inner, len, now_ms());
+		return;
+	}
+	if (tmux != NULL)
+		(void)tc_tcp_mux_input(tmux, inner, len, now_ms());
+}
+
 /* pump_log_path reports an upgrade or a fallback once, rather than on every
  * packet. It is the only outward sign any of this is happening. */
 static void pump_log_path(pump *p)
@@ -643,8 +669,7 @@ static void pump_service_udp(pump *p, tc_tcp_mux *mux)
 		 * spraying noise at it. */
 		if (inner_len > 0) {
 			tc_path_note_recv(p->path, &src, now_ms());
-			if (mux != NULL)
-				tc_tcp_mux_input(mux, inner, inner_len, now_ms());
+			deliver_inner(mux, p->umux, inner, inner_len);
 		}
 	}
 
@@ -1079,7 +1104,7 @@ static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
 			continue;
 		if (inner_len == 0)
 			continue; /* a handshake, a keepalive, or something rejected */
-		tc_tcp_mux_input(mux, inner, inner_len, now_ms());
+		deliver_inner(mux, (pm != NULL) ? pm->umux : NULL, inner, inner_len);
 	}
 
 	return 1;
@@ -1229,6 +1254,7 @@ typedef struct {
 	uint8_t disco[TC_DISCO_KEY_LEN]; /* from the meow; how disco is demuxed */
 	tc_wg_peer peer;
 	tc_tcp_mux *mux;
+	tc_udp_mux *umux;
 	pump ctx; /* per client: wg_out has to address this peer's node key */
 	tc_path path;
 	bool has_path;
@@ -1295,6 +1321,7 @@ static void drop_client(serve_state *st, serve_client *sc)
 			tc_proxy_forget(st->proxy, tc_tcp_mux_at(sc->mux, i));
 	}
 	tc_tcp_mux_free(sc->mux);
+	tc_udp_mux_free(sc->umux);
 	tc_wg_peer_clear(&sc->peer);
 	memset(sc, 0, sizeof *sc);
 }
@@ -1332,6 +1359,8 @@ static serve_client *add_client(serve_state *st, const uint8_t key[32],
 	tc_tunnel_addr_for_key(their_ip, key);
 
 	sc->mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &sc->ctx);
+	sc->umux = tc_udp_mux_new(our_ip, their_ip, tcp_out, &sc->ctx);
+	sc->ctx.umux = sc->umux;
 	if (sc->mux == NULL) {
 		tc_wg_peer_clear(&sc->peer);
 		memset(sc, 0, sizeof *sc);
@@ -1340,6 +1369,12 @@ static serve_client *add_client(serve_state *st, const uint8_t key[32],
 	tc_tcp_mux_set_accept_filter(sc->mux, port_is_served,
 	                             (void *)(uintptr_t)st->ports);
 	tc_tcp_mux_set_exit_node(sc->mux, st->exit_node);
+	/* The same two decisions for datagrams. Without the filter the mux has
+	 * no listeners at all and drops everything addressed to us, which looks
+	 * exactly like a tunnel that is not carrying UDP. */
+	tc_udp_mux_set_accept_filter(sc->umux, port_is_served,
+	                             (void *)(uintptr_t)st->ports);
+	tc_udp_mux_set_exit_node(sc->umux, st->exit_node);
 
 	if (st->have_udp)
 		sc->has_path =
@@ -1456,7 +1491,7 @@ static void serve_service_udp(serve_state *st)
 			if (inner_len > 0) {
 				tc_path_note_recv(&sc->path, &src, now_ms());
 				sc->last_seen_ms = now_ms();
-				tc_tcp_mux_input(sc->mux, inner, inner_len, now_ms());
+				deliver_inner(sc->mux, sc->umux, inner, inner_len);
 			}
 			break;
 		}
@@ -1467,6 +1502,182 @@ static void serve_service_udp(serve_state *st)
 		if (sc->used && sc->has_path) {
 			(void)tc_path_tick(&sc->path, now_ms());
 			pump_log_path(&sc->ctx);
+		}
+	}
+}
+
+/* ---- serving datagrams -------------------------------------------------- */
+
+/* One forwarded UDP flow: a socket to the destination, remembered so the
+ * answer can be sent back to the client that asked. */
+typedef struct {
+	bool used;
+	int fd;
+	uint16_t client_port; /* the client's port inside the tunnel */
+	tc_endpoint dst;      /* where it is talking to, unwrapped */
+	uint64_t last_ms;
+} udp_flow;
+
+#ifndef TC_SERVE_MAX_UDP_FLOWS
+#define TC_SERVE_MAX_UDP_FLOWS 32
+#endif
+
+/* Idle flows are closed. RFC 4787 REQ-5's two minutes is the floor for a
+ * mapping, and this is the socket behind one. */
+#define TC_SERVE_UDP_IDLE_MS (2u * 60u * 1000u)
+
+static udp_flow g_udp_flows[TC_SERVE_MAX_UDP_FLOWS];
+
+static void udp_flow_close(udp_flow *f)
+{
+	if (!f->used)
+		return;
+	if (f->fd >= 0)
+		(void)close(f->fd);
+	memset(f, 0, sizeof *f);
+	f->fd = -1;
+}
+
+/* udp_flow_for finds or opens the socket for one (client port, destination)
+ * pair. A socket per pair, so replies come back on the one that asked and a
+ * destination cannot answer for another. */
+static udp_flow *udp_flow_for(uint16_t client_port, const tc_endpoint *dst,
+                              uint64_t now)
+{
+	udp_flow *free_slot = NULL;
+	for (size_t i = 0; i < TC_SERVE_MAX_UDP_FLOWS; i++) {
+		udp_flow *f = &g_udp_flows[i];
+		if (!f->used) {
+			if (free_slot == NULL)
+				free_slot = f;
+			continue;
+		}
+		if (now >= f->last_ms + TC_SERVE_UDP_IDLE_MS) {
+			udp_flow_close(f);
+			if (free_slot == NULL)
+				free_slot = f;
+			continue;
+		}
+		if (f->client_port == client_port && tc_endpoint_equal(&f->dst, dst)) {
+			f->last_ms = now;
+			return f;
+		}
+	}
+	if (free_slot == NULL)
+		return NULL;
+
+	int fd = socket(dst->ip_len == 4 ? AF_INET : AF_INET6, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return NULL;
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0)
+		(void)fcntl(fd, F_SETFL, (int)((unsigned)fl | (unsigned)O_NONBLOCK));
+
+	/* Connected, so the kernel refuses datagrams from anywhere but the
+	 * destination -- which is the same rule the tunnel side enforces, and
+	 * one fewer place to enforce it by hand. */
+	if (dst->ip_len == 4) {
+		struct sockaddr_in a;
+		memset(&a, 0, sizeof a);
+		a.sin_family = (uint16_t)AF_INET;
+		a.sin_port = htons(dst->port);
+		memcpy(&a.sin_addr, dst->ip, 4);
+		if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+			(void)close(fd);
+			return NULL;
+		}
+	} else {
+		struct sockaddr_in6 a;
+		memset(&a, 0, sizeof a);
+		a.sin6_family = (uint16_t)AF_INET6;
+		a.sin6_port = htons(dst->port);
+		memcpy(&a.sin6_addr, dst->ip, 16);
+		if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+			(void)close(fd);
+			return NULL;
+		}
+	}
+
+	memset(free_slot, 0, sizeof *free_slot);
+	free_slot->used = true;
+	free_slot->fd = fd;
+	free_slot->client_port = client_port;
+	free_slot->dst = *dst;
+	free_slot->last_ms = now;
+	return free_slot;
+}
+
+/* serve_datagrams moves one client's tunnel datagrams to wherever they are
+ * addressed, and brings the answers back. */
+static void serve_datagrams(serve_state *st, serve_client *sc, uint64_t now)
+{
+	if (sc->umux == NULL)
+		return;
+
+	for (int i = 0; i < 64; i++) {
+		tc_udp_addrs ad;
+		static uint8_t buf[2048];
+		size_t n = 0;
+		if (tc_udp_mux_recv_addrs(sc->umux, &ad, buf, sizeof buf, &n) != TC_OK)
+			break;
+		sc->last_seen_ms = now;
+
+		tc_endpoint dst;
+		if (ad.dst.ip_len == 0) {
+			/* Addressed to us, so it belongs to a local service -- the same
+			 * rule `serve <ports>` applies to TCP. */
+			if (st->ports == NULL || !tc_portset_has(st->ports, ad.local_port))
+				continue;
+			memset(&dst, 0, sizeof dst);
+			dst.ip[0] = 127;
+			dst.ip[3] = 1;
+			dst.ip_len = 4;
+			dst.port = ad.local_port;
+		} else {
+			/* Addressed beyond us, which only an exit node forwards. The mux
+			 * already refused it if we are not one; this is belt and
+			 * braces for the one decision worth checking twice. */
+			if (!st->exit_node)
+				continue;
+			tc_endpoint v4;
+			dst = (tc_nat64_unwrap(&v4, &ad.dst) == TC_OK) ? v4 : ad.dst;
+		}
+
+		udp_flow *f = udp_flow_for(ad.remote_port, &dst, now);
+		if (f == NULL)
+			continue;
+		(void)send(f->fd, buf, n, MSG_NOSIGNAL);
+	}
+
+	/* And the answers. */
+	for (size_t i = 0; i < TC_SERVE_MAX_UDP_FLOWS; i++) {
+		udp_flow *f = &g_udp_flows[i];
+		if (!f->used)
+			continue;
+		for (int k = 0; k < 16; k++) {
+			static uint8_t buf[2048];
+			ssize_t got = recv(f->fd, buf, sizeof buf, 0);
+			if (got < 0)
+				break;
+			f->last_ms = now;
+
+			/* A local service answers as the server itself; a forwarded
+			 * destination answers as itself, so the client can tell which of
+			 * several it was. */
+			tc_endpoint wrapped;
+			if (f->dst.ip_len == 4 && f->dst.ip[0] == 127) {
+				(void)tc_udp_mux_send(sc->umux, f->dst.port, f->client_port,
+				                      buf, (size_t)got, now);
+				continue;
+			}
+			if (f->dst.ip_len == 4) {
+				if (tc_nat64_wrap(&wrapped, &f->dst) != TC_OK)
+					continue;
+			} else {
+				wrapped = f->dst;
+			}
+			(void)tc_udp_mux_send_as(sc->umux, &wrapped, f->client_port, buf,
+			                         (size_t)got, now);
 		}
 	}
 }
@@ -1531,6 +1742,9 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 				continue;
 			tc_wg_peer_tick(&sc->peer, t);
 			tc_tcp_mux_tick(sc->mux, t);
+			if (sc->umux != NULL)
+				tc_udp_mux_tick(sc->umux, t);
+			serve_datagrams(st, sc, t);
 
 			tc_tcp_conn *c;
 			while ((c = tc_tcp_mux_accept(sc->mux)) != NULL) {
@@ -1694,7 +1908,7 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 			continue;
 		if (inner_len == 0)
 			continue;
-		tc_tcp_mux_input(sc->mux, inner, inner_len, now_ms());
+		deliver_inner(sc->mux, sc->umux, inner, inner_len);
 	}
 	return 0;
 }
@@ -2026,6 +2240,7 @@ typedef struct {
 	tc_wg_peer peer;
 	pump ctx;
 	tc_tcp_mux *mux;
+	tc_udp_mux *umux;
 	tc_udp udp;
 	tc_path path;
 	bool have_udp;
@@ -2042,6 +2257,9 @@ static void client_down(tc_client *cl)
 		return;
 	tc_tcp_mux_free(cl->mux);
 	cl->mux = NULL;
+	tc_udp_mux_free(cl->umux);
+	cl->umux = NULL;
+	cl->ctx.umux = NULL;
 	if (cl->up)
 		log_wg_summary(&cl->peer);
 	tc_wg_peer_clear(&cl->peer);
@@ -2222,6 +2440,12 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 	tc_tunnel_addr_for_key(their_ip, cl->ci.server_public);
 
 	cl->mux = tc_tcp_mux_new(our_ip, their_ip, tcp_out, &cl->ctx);
+	/* The datagram stack shares the tunnel and the same output path; only
+	 * the next-header byte tells them apart on the way back in. A failure
+	 * here is not fatal: everything except SOCKS UDP ASSOCIATE works
+	 * without it. */
+	cl->umux = tc_udp_mux_new(our_ip, their_ip, tcp_out, &cl->ctx);
+	cl->ctx.umux = cl->umux;
 	if (cl->mux == NULL) {
 		fprintf(stderr, "tailcat-c: out of memory\n");
 		goto fail;
@@ -2344,6 +2568,7 @@ static int bind_local(const char *bind_addr, uint16_t port, uint16_t *bound)
 
 #define SOCKS_VERSION 5
 #define SOCKS_CMD_CONNECT 1
+#define SOCKS_CMD_UDP_ASSOCIATE 3
 #define SOCKS_ATYP_IPV4 1
 #define SOCKS_ATYP_NAME 3
 #define SOCKS_ATYP_IPV6 4
@@ -2396,10 +2621,96 @@ static bool socks_write(int fd, const uint8_t *buf, size_t n, uint64_t until)
 /* socks_handshake negotiates and reports the port the client asked for.
  * Returns TC_OK having replied "succeeded", or an error having replied with
  * the appropriate refusal. */
-static int socks_handshake(int fd, uint16_t *out_port)
+/* resolve_for_socks turns a hostname into a destination beyond the server.
+ *
+ * IPv4 is preferred when both are offered, as upstream does: an exit node is
+ * far more likely to have a route to a v4 address than a v6 one, and a
+ * destination that cannot be reached is worse than one that is merely older. */
+static int resolve_for_socks(tc_socks_target *out, const char *host,
+                             uint16_t port)
+{
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	struct addrinfo *res = NULL;
+	if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+		return TC_ERR_INVAL;
+
+	int rc = TC_ERR_INVAL;
+	memset(out, 0, sizeof *out);
+	for (struct addrinfo *a = res; a != NULL; a = a->ai_next) {
+		if (a->ai_family == AF_INET &&
+		    a->ai_addrlen >= sizeof(struct sockaddr_in)) {
+			const struct sockaddr_in *s4 =
+			    (const struct sockaddr_in *)a->ai_addr;
+			memset(&out->dst, 0, sizeof out->dst);
+			memcpy(out->dst.ip, &s4->sin_addr, 4);
+			out->dst.ip_len = 4;
+			out->dst.port = port;
+			rc = TC_OK;
+			break; /* v4 wins outright */
+		}
+		if (rc != TC_OK && a->ai_family == AF_INET6 &&
+		    a->ai_addrlen >= sizeof(struct sockaddr_in6)) {
+			const struct sockaddr_in6 *s6 =
+			    (const struct sockaddr_in6 *)a->ai_addr;
+			uint8_t raw[16];
+			memcpy(raw, &s6->sin6_addr, 16);
+			tc_endpoint_from16(&out->dst, raw, port);
+			rc = TC_OK;
+			/* Kept looking, in case a v4 answer comes later in the list. */
+		}
+	}
+	freeaddrinfo(res);
+	if (rc == TC_OK) {
+		out->kind = TC_SOCKS_TO_ADDRESS;
+		out->port = port;
+	}
+	return rc;
+}
+
+/* What a SOCKS request turned out to be asking for. */
+typedef struct {
+	bool udp;               /* UDP ASSOCIATE rather than CONNECT */
+	tc_socks_target target; /* where it points */
+} socks_request;
+
+/* socks_reply answers a request. rep is 0 for success; bnd is the address to
+ * report as bound, which matters only for UDP ASSOCIATE -- it is where the
+ * client must send its datagrams. */
+static bool socks_reply(int fd, uint8_t rep, const tc_endpoint *bnd,
+                        uint64_t until)
+{
+	uint8_t out[22];
+	size_t n = 0;
+	out[n++] = SOCKS_VERSION;
+	out[n++] = rep;
+	out[n++] = 0;
+	if (bnd != NULL && bnd->ip_len == 16) {
+		out[n++] = SOCKS_ATYP_IPV6;
+		memcpy(out + n, bnd->ip, 16);
+		n += 16;
+	} else {
+		out[n++] = SOCKS_ATYP_IPV4;
+		if (bnd != NULL && bnd->ip_len == 4)
+			memcpy(out + n, bnd->ip, 4);
+		else
+			memset(out + n, 0, 4);
+		n += 4;
+	}
+	uint16_t port = (bnd != NULL) ? bnd->port : 0;
+	out[n++] = (uint8_t)(port >> 8);
+	out[n++] = (uint8_t)port;
+	return socks_write(fd, out, n, until);
+}
+
+static int socks_handshake(int fd, socks_request *out_req)
 {
 	uint64_t until = now_ms() + 10000;
 	uint8_t b[262];
+	memset(out_req, 0, sizeof *out_req);
 
 	/* Greeting: version, count, methods. */
 	if (!socks_read(fd, b, 2, until) || b[0] != SOCKS_VERSION)
@@ -2434,46 +2745,292 @@ static int socks_handshake(int fd, uint16_t *out_port)
 		addr_len = b[0];
 		break;
 	default:
-		break;
+		(void)socks_reply(fd, 0x08, NULL, until); /* address not supported */
+		return TC_ERR_UNSUPPORTED;
 	}
-	if (addr_len == 0 && atyp != SOCKS_ATYP_NAME) {
-		uint8_t no[10] = { SOCKS_VERSION, 0x08, 0, SOCKS_ATYP_IPV4 };
-		(void)socks_write(fd, no, sizeof no, until);
-		return TC_ERR_UNSUPPORTED; /* address type not supported */
-	}
-	/* The destination host is read and discarded: there is exactly one place
-	 * this proxy can go, which is the server at the far end of the tunnel.
-	 * Routing by hostname is what upstream's socks does with several servers;
-	 * with one, only the port means anything. */
 	if (addr_len > 0 && !socks_read(fd, b, addr_len, until))
 		return TC_ERR_INVAL;
-	if (!socks_read(fd, b, 2, until))
-		return TC_ERR_INVAL;
-	uint16_t port = (uint16_t)((uint16_t)b[0] << 8 | b[1]);
 
-	if (cmd != SOCKS_CMD_CONNECT || port == 0) {
-		uint8_t no[10] = { SOCKS_VERSION, 0x07, 0, SOCKS_ATYP_IPV4 };
-		(void)socks_write(fd, no, sizeof no, until);
-		return TC_ERR_UNSUPPORTED; /* command not supported */
+	uint8_t portbuf[2];
+	if (!socks_read(fd, portbuf, 2, until))
+		return TC_ERR_INVAL;
+	uint16_t port = (uint16_t)((uint16_t)portbuf[0] << 8 | portbuf[1]);
+
+	if (cmd != SOCKS_CMD_CONNECT && cmd != SOCKS_CMD_UDP_ASSOCIATE) {
+		(void)socks_reply(fd, 0x07, NULL, until); /* command not supported */
+		return TC_ERR_UNSUPPORTED;
+	}
+	out_req->udp = (cmd == SOCKS_CMD_UDP_ASSOCIATE);
+
+	/* A UDP ASSOCIATE request names the address the *client* will send from,
+	 * not a destination -- and clients overwhelmingly send 0.0.0.0:0 because
+	 * they do not know it yet. The destination of each datagram travels in
+	 * the datagram. So there is nothing to classify here. */
+	if (out_req->udp)
+		return TC_OK;
+
+	int rc = tc_socks_classify(&out_req->target, atyp, b, addr_len, port);
+	if (rc == TC_ERR_UNSUPPORTED && atyp == SOCKS_ATYP_NAME) {
+		/* A hostname that is not the server's, resolved here as upstream
+		 * resolves it.
+		 *
+		 * The consequence is worth knowing: the name is looked up on *this*
+		 * machine, so the query is visible to whoever sees this machine's
+		 * DNS, and a name that means something different on the far side of
+		 * the tunnel resolves to the wrong thing. SOCKS5 exists partly so
+		 * the proxy can resolve names, and a proxy that refused them would
+		 * break every ordinary client -- so this matches upstream rather
+		 * than being clever. */
+		if (addr_len == 0 || addr_len >= 256)
+			return TC_ERR_INVAL;
+		char host[256];
+		memcpy(host, b, addr_len);
+		host[addr_len] = '\0';
+		if (resolve_for_socks(&out_req->target, host, port) != TC_OK) {
+			(void)socks_reply(fd, 0x04, NULL, until); /* host unreachable */
+			return TC_ERR_INVAL;
+		}
+		rc = TC_OK;
+	}
+	if (rc == TC_ERR_UNSUPPORTED) {
+		(void)socks_reply(fd, 0x08, NULL, until); /* address not supported */
+		return TC_ERR_UNSUPPORTED;
+	}
+	if (rc != TC_OK) {
+		(void)socks_reply(fd, 0x01, NULL, until); /* general failure */
+		return rc;
 	}
 
-	/* "Succeeded", with a zero bound address: the client has no use for it
-	 * and inventing one would be a fiction. */
-	uint8_t ok[10] = { SOCKS_VERSION, 0x00, 0, SOCKS_ATYP_IPV4 };
-	if (!socks_write(fd, ok, sizeof ok, until))
+	/* "Succeeded", with a zero bound address: a CONNECT client has no use
+	 * for it and inventing one would be a fiction. */
+	if (!socks_reply(fd, 0x00, NULL, until))
 		return TC_ERR_INVAL;
-
-	*out_port = port;
 	return TC_OK;
 }
 
 /* ---- the shared listen-and-dial loop ----------------------------------- */
 
+/* ---- SOCKS5 UDP associations ------------------------------------------- */
+
+#ifndef TC_SOCKS_MAX_ASSOC
+#define TC_SOCKS_MAX_ASSOC 8
+#endif
+
+/* One UDP ASSOCIATE, RFC 1928 section 7.
+ *
+ * The association is owned by the TCP control connection that asked for it:
+ * when that closes, the association ends. That is the RFC's rule and it is
+ * also the only thing keeping a relay from outliving the client it was opened
+ * for -- a UDP socket bound on the user's machine, forwarding datagrams for
+ * whoever finds it, is not a thing to leave lying around.
+ */
+typedef struct {
+	bool used;
+	int ctrl_fd; /* the SOCKS TCP connection; its EOF ends this */
+	int udp_fd;  /* where the client sends its datagrams */
+
+	/* Where to send replies. Learned from the first datagram rather than
+	 * from the request, because a client that does not yet know its own
+	 * source port sends 0.0.0.0:0 -- and almost all of them do. */
+	struct sockaddr_storage peer;
+	socklen_t peer_len;
+	bool have_peer;
+
+	/* Our port inside the tunnel. One per association, so a reply can be
+	 * routed back to the client that asked for it. */
+	uint16_t tunnel_port;
+} udp_assoc;
+
+/* assoc_open binds the relay socket and reserves a tunnel port. */
+static int assoc_open(tc_client *cl, udp_assoc *a, const char *bind_addr,
+                      int ctrl_fd)
+{
+	memset(a, 0, sizeof *a);
+	a->ctrl_fd = ctrl_fd;
+	a->udp_fd = -1;
+
+	/* The control connection is only ever peeked at, to notice when it
+	 * closes -- and a blocking peek on a connection that is simply quiet
+	 * would stop the whole loop, relaying nothing until the client gave up.
+	 * An accepted socket does not inherit O_NONBLOCK from its listener on
+	 * Linux, so it has to be set here. */
+	int cfl = fcntl(ctrl_fd, F_GETFL, 0);
+	if (cfl >= 0)
+		(void)fcntl(ctrl_fd, F_SETFL,
+		            (int)((unsigned)cfl | (unsigned)O_NONBLOCK));
+
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sin_family = (uint16_t)AF_INET;
+	sa.sin_port = 0;
+	if (inet_pton(AF_INET, bind_addr, &sa.sin_addr) != 1)
+		return TC_ERR_INVAL;
+
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return TC_ERR_INVAL;
+	if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+		(void)close(fd);
+		return TC_ERR_INVAL;
+	}
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0)
+		(void)fcntl(fd, F_SETFL, (int)((unsigned)fl | (unsigned)O_NONBLOCK));
+
+	/* A port inside the tunnel that nothing else is using, and a listener on
+	 * it so replies are accepted whatever port they come from -- one
+	 * association may be talking to many destinations. */
+	uint16_t tp = 0;
+	for (unsigned k = 0; k < 4096; k++) {
+		uint16_t cand = (uint16_t)(TC_UDP_EPHEMERAL_LO +
+		                           (unsigned)(now_ms() + k) % 16384u);
+		if (tc_udp_mux_listen(cl->umux, cand) == TC_OK) {
+			tp = cand;
+			break;
+		}
+	}
+	if (tp == 0) {
+		(void)close(fd);
+		return TC_ERR_TOOMANY;
+	}
+
+	a->udp_fd = fd;
+	a->tunnel_port = tp;
+	a->used = true;
+	return TC_OK;
+}
+
+static void assoc_close(udp_assoc *a)
+{
+	if (!a->used)
+		return;
+	if (a->udp_fd >= 0)
+		(void)close(a->udp_fd);
+	if (a->ctrl_fd >= 0)
+		(void)close(a->ctrl_fd);
+	memset(a, 0, sizeof *a);
+	a->udp_fd = -1;
+	a->ctrl_fd = -1;
+}
+
+/* assoc_local reports the address to tell the client to send datagrams to. */
+static int assoc_local(const udp_assoc *a, tc_endpoint *out)
+{
+	struct sockaddr_in sa;
+	socklen_t len = sizeof sa;
+	if (getsockname(a->udp_fd, (struct sockaddr *)&sa, &len) != 0)
+		return TC_ERR_INVAL;
+	memset(out, 0, sizeof *out);
+	memcpy(out->ip, &sa.sin_addr, 4);
+	out->ip_len = 4;
+	out->port = ntohs(sa.sin_port);
+	return TC_OK;
+}
+
+/* assoc_from_client moves whatever the client has sent into the tunnel. */
+static void assoc_from_client(tc_client *cl, udp_assoc *a)
+{
+	for (int i = 0; i < 32; i++) {
+		static uint8_t buf[2048];
+		struct sockaddr_storage from;
+		socklen_t flen = sizeof from;
+		ssize_t got = recvfrom(a->udp_fd, buf, sizeof buf, 0,
+		                       (struct sockaddr *)&from, &flen);
+		if (got <= 0)
+			break;
+
+		/* The first datagram is what tells us where replies go. Later ones
+		 * from a different address are ignored rather than taken as a move:
+		 * the association belongs to one client, and following a new source
+		 * would let anyone who guesses the port redirect its traffic. */
+		if (!a->have_peer) {
+			memcpy(&a->peer, &from, sizeof a->peer);
+			a->peer_len = flen;
+			a->have_peer = true;
+		} else if (flen != a->peer_len ||
+		           memcmp(&a->peer, &from, flen) != 0) {
+			continue;
+		}
+
+		tc_socks_target t;
+		const uint8_t *data = NULL;
+		size_t dlen = 0;
+		if (tc_socks_udp_parse(buf, (size_t)got, &t, &data, &dlen) != TC_OK)
+			continue;
+
+		if (t.kind == TC_SOCKS_TO_SERVER) {
+			(void)tc_udp_mux_send(cl->umux, a->tunnel_port, t.port, data,
+			                      dlen, now_ms());
+			continue;
+		}
+
+		/* Somewhere beyond the server, which needs it to be an exit node.
+		 * An IPv4 destination travels wrapped; see nat64.h. */
+		tc_endpoint dst = t.dst;
+		if (dst.ip_len == 4 && tc_nat64_wrap(&dst, &t.dst) != TC_OK)
+			continue;
+		(void)tc_udp_mux_send_to(cl->umux, a->tunnel_port, &dst, data, dlen,
+		                         now_ms());
+	}
+}
+
+/* assoc_to_client drains the tunnel and hands each datagram to whichever
+ * association its port belongs to. */
+static void assoc_to_client(tc_client *cl, udp_assoc *as, size_t nas)
+{
+	if (cl->umux == NULL)
+		return;
+	for (int i = 0; i < 64; i++) {
+		tc_udp_addrs ad;
+		static uint8_t buf[2048];
+		size_t n = 0;
+		if (tc_udp_mux_recv_addrs(cl->umux, &ad, buf, sizeof buf, &n) != TC_OK)
+			break;
+
+		udp_assoc *a = NULL;
+		for (size_t k = 0; k < nas; k++) {
+			if (as[k].used && as[k].tunnel_port == ad.local_port)
+				a = &as[k];
+		}
+		if (a == NULL || !a->have_peer)
+			continue;
+
+		/* The client is told where the answer came from. A reply with no
+		 * destination recorded came from the server itself, so that is what
+		 * it is told -- and an exit-node reply names the address it came
+		 * from, unwrapped back to IPv4 if that is what it was. */
+		tc_endpoint src;
+		if (ad.dst.ip_len != 0) {
+			tc_endpoint v4;
+			src = (tc_nat64_unwrap(&v4, &ad.dst) == TC_OK) ? v4 : ad.dst;
+		} else {
+			memset(&src, 0, sizeof src);
+			src.ip_len = 4; /* the server, which has no address of its own
+			                 * that means anything to the client */
+			src.port = ad.remote_port;
+		}
+
+		static uint8_t out[2048 + TC_SOCKS_UDP_HEADER_MAX];
+		size_t olen = 0;
+		if (tc_socks_udp_build(out, sizeof out, &olen, &src, buf, n) != TC_OK)
+			continue;
+		(void)sendto(a->udp_fd, out, olen, MSG_NOSIGNAL,
+		             (struct sockaddr *)&a->peer, a->peer_len);
+	}
+}
+
 static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
                          tc_proxy *proxy, bool socks, pid_t child,
-                         uint64_t deadline)
+                         const char *bind_addr, uint64_t deadline)
 {
 	tc_derp_set_read_timeout(&cl->derp, 20);
+
+	static udp_assoc assocs[TC_SOCKS_MAX_ASSOC];
+	memset(assocs, 0, sizeof assocs);
+	for (size_t i = 0; i < TC_SOCKS_MAX_ASSOC; i++) {
+		assocs[i].udp_fd = -1;
+		assocs[i].ctrl_fd = -1;
+	}
 
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
@@ -2505,6 +3062,29 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 
 		tc_wg_peer_tick(&cl->peer, t);
 		tc_tcp_mux_tick(cl->mux, t);
+		if (cl->umux != NULL)
+			tc_udp_mux_tick(cl->umux, t);
+
+		/* Datagrams in both directions, and associations whose control
+		 * connection has gone. */
+		for (size_t i = 0; i < TC_SOCKS_MAX_ASSOC; i++) {
+			if (!assocs[i].used)
+				continue;
+			char probe;
+			ssize_t r = recv(assocs[i].ctrl_fd, &probe, 1, MSG_PEEK);
+			if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+			               errno != EINTR)) {
+				/* RFC 1928: the association lives as long as the TCP
+				 * connection that asked for it. Leaving a relay socket open
+				 * afterwards would be leaving a forwarder on the user's
+				 * machine for whoever finds the port. */
+				vlogf("UDP association closed");
+				assoc_close(&assocs[i]);
+				continue;
+			}
+			assoc_from_client(cl, &assocs[i]);
+		}
+		assoc_to_client(cl, assocs, TC_SOCKS_MAX_ASSOC);
 
 		/* Accept whatever is waiting on each local listener. */
 		for (size_t i = 0; i < nls; i++) {
@@ -2514,15 +3094,70 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 					break;
 
 				uint16_t want = ls[i].remote_port;
-				if (socks && socks_handshake(fd, &want) != TC_OK) {
-					vlogf("SOCKS negotiation failed");
-					(void)close(fd);
-					continue;
+				socks_request req;
+				memset(&req, 0, sizeof req);
+				if (socks) {
+					if (socks_handshake(fd, &req) != TC_OK) {
+						vlogf("SOCKS negotiation failed");
+						(void)close(fd);
+						continue;
+					}
+					if (req.udp) {
+						/* An association, not a connection: no TCP flows
+						 * through the tunnel for this, and the control
+						 * connection stays open only to bound its lifetime. */
+						udp_assoc *slot = NULL;
+						for (size_t k = 0; k < TC_SOCKS_MAX_ASSOC; k++) {
+							if (!assocs[k].used)
+								slot = &assocs[k];
+						}
+						tc_endpoint bnd;
+						if (cl->umux == NULL || slot == NULL ||
+						    assoc_open(cl, slot, bind_addr, fd) != TC_OK ||
+						    assoc_local(slot, &bnd) != TC_OK) {
+							vlogf("cannot open a UDP association");
+							(void)socks_reply(fd, 0x01, NULL,
+							                  now_ms() + 5000);
+							if (slot != NULL && slot->used) {
+								slot->ctrl_fd = -1; /* closed below */
+								assoc_close(slot);
+							}
+							(void)close(fd);
+							continue;
+						}
+						if (!socks_reply(fd, 0x00, &bnd, now_ms() + 5000)) {
+							assoc_close(slot);
+							continue;
+						}
+						char where[80];
+						(void)tc_endpoint_format(where, sizeof where, &bnd);
+						vlogf("UDP association relaying at %s", where);
+						continue;
+					}
+					/* CONNECT. The destination decides whether this goes to
+					 * the server or through it. */
+					want = req.target.port;
+				}
+
+				/* Where this connection is bound for: a `forward` mapping
+				 * fixes it per listener, a SOCKS CONNECT names it per
+				 * request. */
+				tc_endpoint beyond;
+				memset(&beyond, 0, sizeof beyond);
+				if (socks && req.target.kind == TC_SOCKS_TO_ADDRESS) {
+					if (req.target.dst.ip_len == 4) {
+						if (tc_nat64_wrap(&beyond, &req.target.dst) != TC_OK)
+							beyond.ip_len = 0;
+					} else {
+						beyond = req.target.dst;
+					}
+				} else if (!socks) {
+					beyond = ls[i].dst;
 				}
 
 				tc_tcp_conn *c = NULL;
-				int crc = (ls[i].dst.ip_len == 16)
-				              ? tc_tcp_mux_connect_to(cl->mux, ls[i].dst.ip,
+				int crc = (beyond.ip_len == 16)
+				              ? tc_tcp_mux_connect_to(cl->mux, beyond.ip,
 				                                      want, t, &c)
 				              : tc_tcp_mux_connect(cl->mux, want, t, &c);
 				if (crc != TC_OK) {
@@ -2536,10 +3171,12 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 					tc_tcp_mux_close(cl->mux, c, t);
 					continue;
 				}
-				if (ls[i].dst.ip_len == 16) {
+				if (beyond.ip_len == 16) {
 					char where[80];
-					(void)tc_endpoint_format(where, sizeof where,
-					                         &ls[i].dst);
+					tc_endpoint shown = beyond, v4;
+					if (tc_nat64_unwrap(&v4, &shown) == TC_OK)
+						shown = v4;
+					(void)tc_endpoint_format(where, sizeof where, &shown);
 					vlogf("forwarding a connection through the server to %s",
 					      where);
 				} else {
@@ -2644,7 +3281,7 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 			continue;
 		if (inner_len == 0)
 			continue;
-		tc_tcp_mux_input(cl->mux, inner, inner_len, now_ms());
+		deliver_inner(cl->mux, cl->umux, inner, inner_len);
 	}
 	return 0;
 }
@@ -2789,7 +3426,8 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 		}
 	}
 
-	status = run_listeners(&cl, ls, nls, proxy, socks, child, deadline);
+	status = run_listeners(&cl, ls, nls, proxy, socks, child, bind_addr,
+	                       deadline);
 
 	if (child > 0) {
 		/* If the loop ended for its own reasons, the child outlives its

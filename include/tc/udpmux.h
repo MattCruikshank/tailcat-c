@@ -162,6 +162,24 @@ int tc_udp_mux_send_to(tc_udp_mux *m, uint16_t local_port,
                        const tc_endpoint *dst, const void *data, size_t len,
                        uint64_t now_ms);
 
+/* tc_udp_mux_send_as transmits a datagram that appears to come from somewhere
+ * other than us.
+ *
+ * This is the exit node's return path, and the reason it has to exist: when a
+ * server forwards a datagram to a destination and an answer comes back, the
+ * client needs to know *which* destination answered. One client port may be
+ * talking to many, and a datagram carries no other clue -- so the reply is
+ * sent with the destination as its source, and the client matches it against
+ * the flow it opened.
+ *
+ * src is the address being spoken for, already in its sixteen-byte form. Only
+ * a server that was asked to be an exit node should ever call this: it is
+ * saying "this came from over there", and nothing but the caller's own
+ * bookkeeping makes that true. */
+int tc_udp_mux_send_as(tc_udp_mux *m, const tc_endpoint *src,
+                       uint16_t dst_port, const void *data, size_t len,
+                       uint64_t now_ms);
+
 /* tc_udp_mux_set_exit_node decides whether datagrams addressed to somewhere
  * other than our own tunnel address are accepted and reported.
  *

@@ -685,7 +685,73 @@ static void test_udp_exit_node(void)
 			TCT_TRUE(tc_endpoint_equal(&a.dst, &other));
 	}
 
+	TCT_CASE("a forwarded reply comes back naming where it came from");
+	/* The exit node's return path. One client port may have several
+	 * destinations in flight, and a datagram carries no other clue about
+	 * which answered -- so the server sends the reply with the destination
+	 * as its source, and the client matches it against the flow it opened. */
+	tc_udp_mux *cl2 = tc_udp_mux_new(kLocal, kRemote, capture, NULL);
+	tc_udp_mux *srv2 = tc_udp_mux_new(kRemote, kLocal, capture, NULL);
+	tc_udp_mux_set_exit_node(srv2, true);
+
+	tc_endpoint d1, d2;
+	ep6(&d1, "2001:db8::10", 53);
+	ep6(&d2, "2001:db8::11", 53);
+	TCT_EQ_INT(tc_udp_mux_send_to(cl2, 49152, &d1, "q1", 2, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv2, g_sent, g_sent_len, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_send_to(cl2, 49152, &d2, "q2", 2, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv2, g_sent, g_sent_len, 1000), TC_OK);
+
+	/* Both answers arrive on the same client port, from different places. */
+	TCT_EQ_INT(tc_udp_mux_send_as(srv2, &d2, 49152, "a2", 2, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(cl2, g_sent, g_sent_len, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_send_as(srv2, &d1, 49152, "a1", 2, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(cl2, g_sent, g_sent_len, 1000), TC_OK);
+
+	tc_udp_addrs r;
+	uint8_t rb[64];
+	size_t rn = 0;
+	TCT_EQ_INT(tc_udp_mux_recv_addrs(cl2, &r, rb, sizeof rb, &rn), TC_OK);
+	TCT_EQ_INT((int)rn, 2);
+	TCT_TRUE(memcmp(rb, "a2", 2) == 0);
+	TCT_TRUE(tc_endpoint_equal(&r.dst, &d2));
+	TCT_EQ_INT(tc_udp_mux_recv_addrs(cl2, &r, rb, sizeof rb, &rn), TC_OK);
+	TCT_TRUE(memcmp(rb, "a1", 2) == 0);
+	TCT_TRUE(tc_endpoint_equal(&r.dst, &d1));
+
+	TCT_CASE("a reply from somewhere we never sent to is refused");
+	/* Without this, a peer could deliver anything it liked as though it
+	 * were the answer to a request we made -- which for DNS over an exit
+	 * node is the whole attack. */
+	tc_endpoint never;
+	ep6(&never, "2001:db8::99", 53);
+	TCT_EQ_INT(tc_udp_mux_send_as(srv2, &never, 49152, "forged", 6, 1000),
+	           TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(cl2, g_sent, g_sent_len, 1000), TC_ERR_INVAL);
+
+	TCT_CASE("and one to a port we never sent from is refused");
+	TCT_EQ_INT(tc_udp_mux_send_as(srv2, &d1, 49153, "wrongport", 9, 1000),
+	           TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(cl2, g_sent, g_sent_len, 1000), TC_ERR_INVAL);
+
+	TCT_CASE("a listener does not open the door to a foreign source");
+	/* A listener says "I accept datagrams to this port from the peer". It
+	 * must not also mean "from anywhere the peer cares to name". */
+	TCT_EQ_INT(tc_udp_mux_listen(cl2, 7777), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_send_as(srv2, &never, 7777, "nope", 4, 1000),
+	           TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(cl2, g_sent, g_sent_len, 1000), TC_ERR_INVAL);
+	/* But the peer itself still reaches that listener. */
+	TCT_EQ_INT(tc_udp_mux_send(srv2, 5353, 7777, "yes", 3, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(cl2, g_sent, g_sent_len, 1000), TC_OK);
+
+	tc_udp_mux_free(cl2);
+	tc_udp_mux_free(srv2);
+
 	TCT_CASE("null arguments");
+	TCT_EQ_INT(tc_udp_mux_send_as(NULL, &beyond, 1, "x", 1, 0), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_udp_mux_send_as(cl, NULL, 1, "x", 1, 0), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_udp_mux_send_as(cl, &beyond, 0, "x", 1, 0), TC_ERR_INVAL);
 	TCT_EQ_INT(tc_udp_mux_send_to(NULL, 1, &beyond, "x", 1, 0), TC_ERR_INVAL);
 	TCT_EQ_INT(tc_udp_mux_send_to(cl, 1, NULL, "x", 1, 0), TC_ERR_INVAL);
 	tc_endpoint v4;

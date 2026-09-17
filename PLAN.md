@@ -458,11 +458,22 @@ no connection to hang a destination on, it travels with each datagram and
 and the header says so: there is no handshake, so one forged datagram is a
 complete request, and plenty of UDP services act on a single one.
 
-**Still to do:** nothing in the CLI originates UDP through the tunnel.
-Upstream's surface for that is **SOCKS5 UDP ASSOCIATE** (RFC 1928 §7) —
-`forward` is TCP-only upstream too — and our SOCKS implementation currently
-handles CONNECT only. That is the remaining piece: UDP ASSOCIATE, plus the
-server pumping datagrams to the destination each one names.
+**SOCKS5 UDP ASSOCIATE** (RFC 1928 §7) closes this. `socks` now opens a
+relay socket per association, carries each datagram to whatever it names, and
+brings the answer back with a header saying where it came from — which is
+what lets one association talk to several destinations at once and tell the
+replies apart.
+
+The association is owned by its TCP control connection, as the RFC requires:
+when that closes the relay socket goes. A UDP forwarder left running on a
+user's machine for whoever finds the port is not a thing to leave behind.
+
+Getting there needed one more change to `udpmux`, and it was the same lesson
+`tcpmux` taught in 5.2: the binding key had to grow to the full tuple. A
+reply forwarded by an exit node arrives *from the destination*, not from the
+peer, and without the remote address in the key there was no way to tell a
+genuine answer from anything the peer cared to invent. `tc_udp_mux_send_as`
+is the other half — the server speaking as the destination it contacted.
 
 ### 5.2 NAT64 and exit nodes ✅ · 830 lines
 
@@ -653,7 +664,8 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
 | 5.4, 5.5 — SSH + SFTP (and `recv`, `ls`) | ~4,000 | ⏸ licence decision |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
-| — SOCKS5 UDP ASSOCIATE | ~350 | the next ordinary piece of work |
+| — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
+| — `--allow` list | ~300 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in
 particulars. Phase 4 came in at 2,801 against ~1,950 estimated — the extra is
@@ -684,13 +696,11 @@ discovery were not actually being made.
    every binary has never been executed at all. Cheapest first: build x86_64
    with `-funsigned-char` and run the suite, then qemu-user, then
    qemu-system, then real hardware.
-2. **SOCKS5 UDP ASSOCIATE**, which closes 5.1 and is the last piece of
-   ordinary work in the plan.
-3. **Ed25519**, which unblocks both the SSH server and TLS 1.3.
-4. **Decide the SSH licence question** (see 5.4) and then write the subset.
-5. An **`--allow` list**, which is now the largest gap between our security
-   posture and upstream's — especially with `serve exit-node`, where anyone
-   holding the address can reach anything the serving machine can.
+2. **Ed25519**, which unblocks both the SSH server and TLS 1.3.
+3. **Decide the SSH licence question** (see 5.4) and then write the subset.
+4. **TCP keepalive / idle timeout**, now the oldest thing on the list. A
+   direct path notices silence and falls back, but that is the path, not the
+   connection: a relayed connection to a peer that vanished still hangs.
 
 WebAssembly is last on purpose, and possibly never: it is a second artifact
 for a project whose premise is one file, and a browser cannot open a UDP

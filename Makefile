@@ -175,6 +175,7 @@ LIB_SRCS := \
 	src/net/tcpmux.c \
 	src/net/udpmux.c \
 	src/net/nat64.c \
+	src/net/socks.c \
 	src/net/proxy.c \
 	src/net/http.c \
 	src/net/tls.c \
@@ -187,7 +188,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -335,6 +336,10 @@ live-exitnode: $(CLI)
 # one that is, through a real relay.
 live-allow: $(CLI)
 	CLI=$(CLI) sh scripts/live-allow.sh
+
+# SOCKS5 UDP ASSOCIATE carrying datagrams to two services at once.
+live-socksudp: $(CLI)
+	CLI=$(CLI) sh scripts/live-socksudp.sh
 
 live-cli: $(CLI)
 	CLI=$(CLI) sh scripts/live-cli.sh

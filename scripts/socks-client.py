@@ -49,7 +49,10 @@ def main():
         sys.stderr.write("greeting refused: %r\n" % got)
         sys.exit(4)
 
-    name = b"ignored.invalid"
+    # Upstream's name for the far end of the tunnel. Anything else is a
+    # destination to reach *through* the server, which needs it to be an exit
+    # node -- so a proxy client that wants the server itself has to say so.
+    name = b"server.tailcat"
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name +
               struct.pack("!H", dest_port))
     rep = s.recv(10)
