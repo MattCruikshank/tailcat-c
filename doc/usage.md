@@ -76,6 +76,17 @@ Forward a local port through the tunnel:
     tailcat-c forward <tc-addr> 18080:80
     tailcat-c forward <tc-addr> 13306:192.168.1.10:3306   # via an exit node
 
+Open a browser on a web server at the far end. A free local port is chosen,
+forwarded to the server's port 80, and a browser is pointed at it:
+
+    tailcat-c browse <tc-addr>
+    tailcat-c forward --open-browser <tc-addr> 0:8080     # any other port
+
+$BROWSER is honoured if it is set: a colon-separated list, each entry a
+command with optional arguments and an optional %s where the URL goes.
+Otherwise it is xdg-open, open, or the Windows default handler. On a headless
+machine or over ssh, the URL is printed instead of guessed at.
+
 A SOCKS5 proxy, optionally running a command with `all_proxy` set:
 
     tailcat-c socks <tc-addr> 1080
@@ -116,6 +127,7 @@ Restrict who may connect, by client node key:
     --relay HOST        serve through this relay instead of choosing one
     --full-address      embed the relay in the address, so clients need no map
     --bind ADDR         listen address for forward and socks (default 127.0.0.1)
+    --open-browser      for forward: open a browser at the local listener
     --timeout SEC       give up after SEC seconds (0 = never)
     --derpmap-url URL   where to fetch the relay list
     --insecure          skip TLS verification of the relay

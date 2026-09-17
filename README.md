@@ -6,7 +6,8 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: upstream's command set is implemented, bar a browser build.**
+**Status: upstream's command set is implemented, bar the WebAssembly
+build.**
 Relay and direct paths both work, on two operating systems.
 `tailcat-c` serves and connects, interoperates with the real Go tailcat in
 both roles, finds a direct peer-to-peer path when one exists and falls back
@@ -102,7 +103,7 @@ widening the connection key from a port pair to a four-tuple.
   see [the note below](#tls-13-is-blocked-on-ed25519).
 
 `forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes, saved
-identities and `readme` are all here.
+identities, `browse` and `readme` are all here.
 
 ## How it compares
 
@@ -116,7 +117,7 @@ keeps debug information in sibling files rather than in the executable.)
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **2.20 MB** | 17.70 MB |
+| binary | **2.21 MB** | 17.70 MB |
 | gzipped | **1.10 MB** | 6.85 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
@@ -125,23 +126,24 @@ craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
 of the rest.
 
-Where our 2.20 MB actually goes, as `size` reports text+data on the x86_64
+Where our 2.21 MB actually goes, as `size` reports text+data on the x86_64
 objects — so these are code and initialised data, not file offsets, and they
 do not sum to the binary:
 
 | | |
 |---|---:|
 | Mbed TLS | 249 KB |
-| **all of our own code** | **183 KB** |
+| **all of our own code** | **187 KB** |
 | the compiled-in CA bundle | 181 KB |
-| the embedded usage text (`readme`) | 4.5 KB |
+| the embedded usage text (`readme`) | 5.1 KB |
 | Cosmopolitan libc, and two architectures of everything | the remainder |
 
 Everything we wrote — addresses, CBOR, JSON, crypto, DERP, WireGuard, TCP,
 UDP, STUN, disco, netcheck, path discovery, Ed25519, and an SSH and SFTP
-client and server — now comes to 183 KB. For most of this project's life
+client and server — now comes to 187 KB. For most of this project's life
 that number was smaller than the list of certificate authorities the binary
-ships with; the SSH subset added 42 KB and overtook it, by two kilobytes.
+ships with; the SSH subset added 42 KB and overtook it, and it now leads by
+six.
 
 Phases 3 through 5 added about 288 KB to the binary and roughly 6,000 lines
 of source, which is the cost of everything from `serve <ports>` through
@@ -185,7 +187,7 @@ direct peer-to-peer paths.
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
 | `readme` | ✅ (embeds doc/usage.md, not this file) | ✅ (embeds README.md) |
-| `browse` | ❌ (it is `forward 0:80` plus opening a URL) | ✅ |
+| `browse`, `forward --open-browser` | ✅ | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
@@ -200,10 +202,9 @@ forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and the SSH
 and SFTP subset behind `recv` and `ls`.
 
 What is left is the **browser build**, which Cosmopolitan cannot target, and
-three deliberate omissions: `serve ssh` as a general shell server,
-upstream's read-write and recursive file modes, and `browse`, which is
-`forward 0:80` plus opening a URL. A drop box that can run commands is not a
-drop box.
+two deliberate omissions: `serve ssh` as a general shell server, and
+upstream's read-write and recursive file modes. A drop box that can run
+commands is not a drop box.
 
 ## Build
 
@@ -329,7 +330,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-35 test binaries, 9,817 assertions, under two toolchains. The method matters
+36 test binaries, 9,979 assertions, under two toolchains. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
 
@@ -345,6 +346,7 @@ something that is not ours.**
 | SSH | `golang.org/x/crypto/ssh` for the wire encodings and the cipher, and a **real OpenSSH 9.6 client** for the protocol itself |
 | the SFTP drop box | a real `scp` and `sftp` carrying out the attacks, with the check on the filesystem afterwards rather than on what the client printed |
 | the SSH and SFTP *clients* | a real Go tailcat file server, via `golang.org/x/crypto/ssh` and `github.com/pkg/sftp` |
+| opening a browser | the real `rundll32 url.dll,FileProtocolHandler`, checked by watching a loopback listener for the request a browser actually made |
 | everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
 
 Where a test passed on the first run, the response has generally been to
@@ -373,9 +375,24 @@ results worth separating:
   finds nothing and denies regardless. Recorded as equivalent rather than
   papered over with a test that would prove nothing.
 
-A surviving mutation is a gap in the tests, unless it is equivalent. A caught
-one only counts if it was the right mutation. Both halves of that have now
-been paid for.
+`browse` added twenty-five more, and a fourth result: **survived because
+something else on the machine did the job.** Three mutations to the
+browser-opening code -- ignoring `$BROWSER` entirely, trying only its first
+entry, and forking once where it forks twice -- all passed a suite that was
+watching the right thing. The reason is that `xdg-open` implements the same
+`$BROWSER` convention we do, so a build that skipped our handling still ended
+up running the recorder, by a longer route. The test now empties `$PATH`
+first, which makes every opener that has to be *found* unavailable, so what
+reaches the recorder can only have come from the code under test. With that
+one change all twenty-five die.
+
+That is the general shape and worth naming: a test that passes because the
+environment supplied the behaviour is not testing the code, and the way to
+find out is to take the environment away.
+
+A surviving mutation is a gap in the tests, unless it is equivalent -- or
+unless the environment is quietly standing in for the code. A caught one only
+counts if it was the right mutation.
 
 The address layer specifically is checked three ways:
 
@@ -998,6 +1015,16 @@ Both of these are the same lesson in two directions. A protocol has two ends,
 and writing both from one reading gives two implementations that agree with
 each other. Bug 26 needed a stricter *client* than the one we had been
 testing with; bug 27 needed a server that was not ours.
+
+**28. A bare `make` stopped building anything.** *(Phase 5.9, found while
+measuring the binary for 5.10 and wondering why it had not changed.)* The
+rule that regenerates `src/usage_text.c` was written just above `all:`, and
+make takes the **first non-special target in the file** as its default goal.
+So `make` regenerated a documentation file, printed one line, exited 0, and
+built nothing. Every diagnostic level kept passing, because each of them
+names its targets. It was found by a number that refused to move: the binary
+was the same size after a change that should have grown it. The rule now
+sits below `all`, with a comment saying why it has to.
 
 
 The pattern is hard to miss: **four of the first six came from running the

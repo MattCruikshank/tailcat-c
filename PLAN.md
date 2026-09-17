@@ -291,9 +291,11 @@ tests round-trip those exact files. The derived fields (public key, disco key)
 are recomputed and compared rather than trusted, since a file naming different
 ones would produce an address nobody can reach.
 
-**`browse` is deliberately not done.** It is `forward 0:80` plus opening a
-URL, which is the only part of upstream's command set that does nothing a user
-cannot do in one line.
+**`browse` was deliberately not done here**, and was done later as 5.10. The
+reasoning below -- that it is `forward 0:80` plus opening a URL, and so does
+nothing a user cannot do in one line -- was right about the forwarding and
+wrong about the other half. See 5.10 for what "opening a URL" turned out to
+cost, and why.
 
 This is also where `serve` was found to be advertising the wrong address form
 -- embedding the relay where upstream names a region by number -- so the same
@@ -818,6 +820,50 @@ Two decisions inside it are worth keeping:
   Every other byte this program emits is ASCII; the check makes that true by
   construction rather than by remembering.
 
+### 5.10 `browse` ✅ · ~700 lines, half of them tests
+
+The last command, and the one PLAN had called "the only part of upstream's
+command set that does nothing a user cannot do in one line". That was true of
+the *forwarding*, which is `forward 0:80`, and it quietly assumed the other
+half -- pointing a browser at the result -- was a call to `system()`. It is
+not, for three reasons, and the reasons are the content of `src/browser.c`:
+
+- **There is no shell.** The conventional Windows incantation is
+  `cmd /c start <url>`, which hands a URL to a command interpreter; the Go
+  package upstream uses carries an `&` -> `^&` escape that exists only
+  because of it. `rundll32 url.dll,FileProtocolHandler` takes an argv, so it
+  is tried first. Every opener is exec'd from an argv array, and the URL is
+  built in one function out of four numbers and a port, which refuses
+  anything that is not a dotted quad rather than guessing.
+- **The opener depends on the operating system, which a fat APE does not
+  know until it runs.** `#ifdef __APPLE__` is a question about the compiler,
+  and the same binary starts on six systems. `tc_host_os` asks Cosmopolitan
+  at runtime through `IsWindows()` and friends, and falls back to
+  compile-time detection under a host compiler, where the question really is
+  settled at build time. (`config_dir` in the CLI still has the compile-time
+  form, and is wrong on macOS for exactly this reason -- noted under
+  Cross-cutting.)
+- **Not every machine should be asked.** A headless Linux box and an ssh
+  session both have no screen to put a window on. Upstream's package checks
+  `$DISPLAY`; this also accepts `$WAYLAND_DISPLAY`, because the question is
+  about screens rather than about X11. `$BROWSER` overrides all of it, which
+  is the one deliberate difference from upstream: someone who has named a
+  text browser on a headless machine has already answered.
+
+`forward` gained `--open-browser`, as upstream's has, and it is refused with
+more than one mapping because there is one browser.
+
+The browser is opened **after** the tunnel is up rather than when the
+listener binds, which is where upstream does it. Opening a window on
+someone's desktop is a visible act, and the file already had the same rule
+for the child process `socks -- cmd` starts: do it once there is something
+behind the address.
+
+Twenty-five mutations, all killed -- but only after the tests stopped
+borrowing the environment. See the README: three of them survived because
+`xdg-open` implements the same `$BROWSER` convention we do, so a build that
+ignored ours still ran the recorder by a longer route.
+
 ---
 
 ## Cross-cutting
@@ -840,9 +886,19 @@ These are already in the README's TODO list and do not depend on any feature.
   originally listed here — the JSON parser and the TCP input path both have
   harnesses now. The frame codec parses attacker-influenced lengths straight
   off a socket, which is the shape that produced bugs 20 and 21.
-- **Extend mutation testing** beyond path discovery, the UDP mux and TCP,
-  which are the only three modules it has been applied to. It found gaps in
-  every one of them, at a rate that suggests the rest have them too.
+- **Extend mutation testing** beyond path discovery, the UDP mux, TCP, the
+  SSH subset and the browser opener, which are the only modules it has been
+  applied to. It found gaps in every one of them, at a rate that suggests the
+  rest have them too.
+- **`config_dir` is decided at compile time and should not be.** It picks
+  `~/Library/Application Support` under `#ifdef __APPLE__` and `~/.config`
+  otherwise, which is a question about the compiler. cosmocc does not define
+  `__APPLE__`, so the shipped binary takes the `~/.config` branch *on macOS*
+  -- and the comment above it says it exists precisely so that a key saved by
+  upstream's Go tailcat is found by ours. It is not, on a Mac. `tc_host_os`
+  (added for `browse`, PLAN 5.10) answers the question at runtime and is the
+  fix; it is small, and it needs a Mac to verify, which is the same thing
+  blocking the line above.
 - **Constant-time audit** with actual timing measurements, rather than the
   current "written in a data-independent style".
 - **Thread-safety**: either make `tc_derp_client` safe for concurrent use or
@@ -868,6 +924,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.7 — `--allow` list | ~300 | ✅ done |
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
 | 5.9 — `readme` and `doc/usage.md` | ~175 | ✅ done |
+| 5.10 — `browse` and `--open-browser` | ~700 | ✅ done |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in
@@ -878,13 +935,13 @@ because the scope turned out to be "sftp over ssh" rather than "an ssh
 server". The one that was simply wrong was 3.5 (`recv`), estimated at ~300
 lines and actually a subset of 5.5.
 
-Source today is **25,611 lines** under `src/` plus 5,512 of headers, against
-**19,517** of tests and another 2,909 of shell for the live ones. (165 of
-that `src/` figure are generated: `doc/usage.md` as a C string literal.) Counting
-the live scripts as tests, which is what they are, that is roughly 22,000 of
-checking against 25,000 of implementation. The 1:1 ratio predicted at the
-start has held to within about ten per cent for the whole project, and the
-ratio has been the useful number rather than either total.
+Source today is **26,132 lines** under `src/` plus 5,644 of headers, against
+**19,995** of tests and another 3,095 of shell for the live ones. (177 of
+that `src/` figure are generated: `doc/usage.md` as a C string literal.)
+Counting the live scripts as tests, which is what they are, that is roughly
+23,000 of checking against 26,000 of implementation. The 1:1 ratio predicted
+at the start has held to within about ten per cent for the whole project,
+and the ratio has been the useful number rather than either total.
 
 Phase 2 and Phase 4 were where the real difficulty was, and both had the
 failure modes predicted for them: things that only appear under load or over

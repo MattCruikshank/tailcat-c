@@ -26,6 +26,7 @@
 
 #include "tc/addr.h"
 #include "tc/allowlist.h"
+#include "tc/browser.h"
 #include "tc/dropbox.h"
 #include "tc/sshclient.h"
 #include "tc/crypto.h"
@@ -114,6 +115,9 @@ static void usage(FILE *f)
 	        "e.g. 8080, 18080:8080,\n"
 	        "                                          or "
 	        "13306:192.168.1.10:3306 via an exit node\n"
+	        "  tailcat-c browse <tc-addr>              forward a free port to "
+	        "the server's port 80\n"
+	        "                                          and open a browser there\n"
 	        "  tailcat-c socks <tc-addr> [port] [-- cmd...]\n"
 	        "                                          SOCKS5 proxy; with a "
 	        "command, runs it with\n"
@@ -145,6 +149,8 @@ static void usage(FILE *f)
 	        "clients need no map\n"
 	        "      --allow KEYS      comma-separated client nodekey: list "
 	        "for serve, or \"none\"\n"
+	        "      --open-browser    for forward: open a browser at the "
+	        "local listener, as browse does\n"
 	        "      --bind ADDR       listen address for forward and socks "
 	        "(default 127.0.0.1)\n"
 	        "  -p, PORT              server port for ssh and cp (default 22)\n"
@@ -4032,7 +4038,8 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
                                 size_t nspecs, const char *bind_addr,
                                 bool socks, const char *const *child_argv,
                                 bool insecure, unsigned timeout_s,
-                                const char *derpmap_url, const char *key_spec)
+                                const char *derpmap_url, const char *key_spec,
+                                bool open_browser)
 {
 	static tc_client cl;
 	uint64_t deadline = (timeout_s == 0)
@@ -4126,6 +4133,22 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	if (proxy == NULL) {
 		fprintf(stderr, "tailcat-c: out of memory\n");
 		goto out;
+	}
+
+	/* Same reasoning as the child below, and the reason this happens here
+	 * rather than at bind time as upstream does it: a browser pointed at a
+	 * listener whose tunnel has not come up gets to stare at a connection
+	 * that will never be answered, and if the address was wrong it stares
+	 * for good. Opening a window on someone's desktop is a visible act, so
+	 * it waits until there is something behind the URL. */
+	if (open_browser && nls > 0) {
+		char url[TC_BROWSER_BUF];
+		if (tc_browser_url(url, sizeof url, bind_addr, ls[0].local_port) ==
+		    TC_OK)
+			(void)tc_browser_open(url);
+		else
+			fprintf(stderr, "tailcat-c: cannot point a browser at %s\n",
+			        bind_addr);
 	}
 
 	/* The child starts only once the tunnel is up, so it cannot race ahead
@@ -4782,6 +4805,7 @@ int main(int argc, char **argv)
 	 * consequences -- anyone who can reach this machine can then reach the
 	 * server through it -- so it has to be asked for. */
 	const char *bind_addr = "127.0.0.1";
+	bool open_browser = false;
 	/* The server port ssh and cp reach through the tunnel. */
 	const char *ssh_port = "22";
 	/* An empty --key means "the saved default if there is one", which is how
@@ -4852,6 +4876,8 @@ int main(int argc, char **argv)
 			gk_psk = false;
 		} else if (strcmp(a, "--bind") == 0 && i + 1 < argc) {
 			bind_addr = argv[++i];
+		} else if (strcmp(a, "--open-browser") == 0) {
+			open_browser = true;
 		} else if (strcmp(a, "--derpmap-url") == 0 && i + 1 < argc) {
 			derpmap_url = argv[++i];
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
@@ -4999,10 +5025,33 @@ int main(int argc, char **argv)
 			                "least one mapping, such as 8080 or 18080:8080\n");
 			return 2;
 		}
+		if (open_browser && nargs > 3) {
+			fprintf(stderr, "tailcat-c: --open-browser needs exactly one "
+			                "mapping; there is only one browser\n");
+			return 2;
+		}
 		return cmd_forward_or_socks(args[1], &args[2], nargs - 2, bind_addr,
 		                            false, NULL, insecure,
 		                            timeout_given ? timeout_s : 0,
-		                            derpmap_url, key_spec);
+		                            derpmap_url, key_spec, open_browser);
+	}
+	if (strcmp(args[0], "browse") == 0) {
+		/* Upstream's alias, spelled the same way: forward a
+		 * kernel-chosen local port to the server's port 80 and open a
+		 * browser at the local end. Upstream hardcodes 127.0.0.1 here and
+		 * ignores --bind; we pass it through, which defaults to the same
+		 * thing and does something sensible rather than nothing when it
+		 * was given on purpose. */
+		if (nargs != 2) {
+			fprintf(stderr, "tailcat-c: browse takes exactly one address\n");
+			return 2;
+		}
+		static const char *const browse_map[] = {"0:80"};
+		return cmd_forward_or_socks(args[1], (const char **)(uintptr_t)
+		                                         browse_map,
+		                            1, bind_addr, false, NULL, insecure,
+		                            timeout_given ? timeout_s : 0,
+		                            derpmap_url, key_spec, true);
 	}
 	if (strcmp(args[0], "socks") == 0) {
 		if (nargs < 2) {
@@ -5013,7 +5062,7 @@ int main(int argc, char **argv)
 		                            nargs >= 3 ? nargs - 2 : 0, bind_addr,
 		                            true, child_argv, insecure,
 		                            timeout_given ? timeout_s : 0,
-		                            derpmap_url, key_spec);
+		                            derpmap_url, key_spec, false);
 	}
 	if (strcmp(args[0], "genkey") == 0) {
 		return cmd_genkey(key_spec, gk_client, gk_force, gk_delete, gk_list,
