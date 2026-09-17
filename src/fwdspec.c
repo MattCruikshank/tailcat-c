@@ -49,6 +49,62 @@ static int parse_port(const char *s, const char *end, bool allow_zero,
 	return TC_OK;
 }
 
+/* parse_dest reads the `host:port` tail of a mapping that names a destination
+ * beyond the server.
+ *
+ * host may be an IPv4 literal or a bracketed IPv6 one. Unbracketed IPv6 is
+ * refused rather than guessed at: "::1:80" has no unambiguous reading, and
+ * RFC 3986 settled this argument for URLs long ago in favour of brackets. */
+static int parse_dest(const char *host, const char *last_colon, const char *end,
+                      tc_fwd_spec *out)
+{
+	size_t hlen = (size_t)(last_colon - host);
+	if (hlen == 0) {
+		FAILF("no host before the port");
+		return TC_ERR_INVAL;
+	}
+
+	char buf[64];
+	bool bracketed = (host[0] == '[');
+	if (bracketed) {
+		if (host[hlen - 1] != ']') {
+			FAILF("an IPv6 destination must be written in brackets, as "
+			      "[2001:db8::1]:443");
+			return TC_ERR_INVAL;
+		}
+		host++;
+		hlen -= 2;
+	} else if (memchr(host, ':', hlen) != NULL) {
+		FAILF("an IPv6 destination must be written in brackets, as "
+		      "[2001:db8::1]:443");
+		return TC_ERR_INVAL;
+	}
+	if (hlen == 0 || hlen >= sizeof buf) {
+		FAILF("the destination address is not usable");
+		return TC_ERR_INVAL;
+	}
+	memcpy(buf, host, hlen);
+	buf[hlen] = '\0';
+
+	uint16_t port = 0;
+	int rc = parse_port(last_colon + 1, end, false, &port);
+	if (rc != TC_OK)
+		return rc;
+
+	if (tc_endpoint_parse(&out->dst, buf, port) != TC_OK) {
+		/* No DNS on purpose: a name resolved here would be resolved on the
+		 * wrong machine. */
+		FAILF("\"%.60s\" is not a literal IP address", buf);
+		return TC_ERR_INVAL;
+	}
+	if (bracketed && out->dst.ip_len != 16) {
+		FAILF("\"%.60s\" is in brackets but is not an IPv6 address", buf);
+		return TC_ERR_INVAL;
+	}
+	out->remote_port = port;
+	return TC_OK;
+}
+
 int tc_fwd_parse(tc_fwd_spec *out, const char *spec)
 {
 	if (out == NULL || spec == NULL)
@@ -84,14 +140,18 @@ int tc_fwd_parse(tc_fwd_spec *out, const char *spec)
 		return rc;
 	}
 
-	/* A second colon means the remote side is an address rather than a port,
-	 * which only an exit node can serve. Saying so beats "not a port
-	 * number": the syntax is right, the feature is missing. */
-	if (memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL) {
-		FAILF("forwarding to \"%s\" needs the server to be an exit node, "
-		      "which is not implemented here",
-		      colon + 1);
-		return TC_ERR_UNSUPPORTED;
+	/* A second colon means the remote side names an address as well as a
+	 * port, which only an exit node can serve. */
+	const char *last = NULL;
+	for (const char *q = colon + 1; q < end; q++) {
+		if (*q == ':')
+			last = q;
+	}
+	if (last != NULL) {
+		int rc2 = parse_dest(colon + 1, last, end, out);
+		if (rc2 != TC_OK)
+			return rc2;
+		return TC_OK;
 	}
 
 	rc = parse_port(colon + 1, end, false, &out->remote_port);

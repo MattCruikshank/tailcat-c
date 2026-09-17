@@ -450,9 +450,31 @@ port specs, and a local UDP socket pumped in both directions. The tunnel
 plumbing (routing an arriving IP packet to the TCP or the UDP mux by its next
 header) is one branch, since `tc_udp_mux_is_udp` exists for it.
 
-### 5.2 NAT64 for IPv4 · ~100 lines · low risk
-Map IPv4 destinations into the NAT64 prefix, as upstream does, so IPv4
-targets work over the IPv6-only tunnel.
+### 5.2 NAT64 and exit nodes ✅ · 830 lines
+
+These turned out to be one feature. Upstream's `serve <ports>` is TCP only;
+UDP and arbitrary destinations both reach a tailcat server through exit-node
+mode, and NAT64 is how an IPv4 destination gets there over a tunnel that
+carries nothing but IPv6.
+
+`nat64` implements the RFC 6052 well-known prefix `64:ff9b::/96` —
+deliberately *not* `::ffff:0:0/96`, which already means "this IPv4 address
+written as sixteen bytes" here and is unmapped on sight, so an address
+translated into it would come back out as IPv4 at a layer that had no idea
+translation was happening. Anchored against RFC 6052 §2.4's published
+example and against `inet_pton`, which will do the embedding itself.
+
+`tcpmux` gained exit-node mode, off unless asked for. The change that
+mattered was the connection key: once a destination beyond the peer is
+possible, the port pair stops being unique, because every exit-node flow goes
+to port 443 of somewhere different. Two would collide, and the symptom is not
+an error — it is one connection quietly receiving the other's bytes.
+
+`serve exit-node` and `forward <local>:<host>:<port>` expose it, with
+`live-exitnode` checking both that a client reaches a third address *and*
+that a server which was not asked to forward refuses. The second half is the
+one worth having: a default that quietly allowed forwarding would be the most
+dangerous kind of bug here, one that only shows up as a feature.
 
 ### 5.3 TLS 1.3 · ~50 lines config · low risk
 Enable `MBEDTLS_SSL_PROTO_TLS1_3`, which needs the PSA crypto layer

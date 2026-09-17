@@ -32,6 +32,7 @@
 #include "tc/tailcat.h"
 #include "tc/fwdspec.h"
 #include "tc/keyfile.h"
+#include "tc/nat64.h"
 #include "tc/netcheck.h"
 #include "tc/path.h"
 #include "tc/udp.h"
@@ -93,9 +94,13 @@ static void usage(FILE *f)
 	        "  tailcat-c serve                         accept one connection, "
 	        "pipe it to stdout\n"
 	        "  tailcat-c serve <ports>                 serve local ports, e.g. "
-	        "22,80,8000-8999 or all\n"
+	        "22,80,8000-8999 or all;\n"
+	        "                                          add exit-node to "
+	        "forward anywhere this machine can reach\n"
 	        "  tailcat-c forward <tc-addr> <maps>      forward local ports, "
-	        "e.g. 8080 or 18080:8080\n"
+	        "e.g. 8080, 18080:8080,\n"
+	        "                                          or "
+	        "13306:192.168.1.10:3306 via an exit node\n"
 	        "  tailcat-c socks <tc-addr> [port] [-- cmd...]\n"
 	        "                                          SOCKS5 proxy; with a "
 	        "command, runs it with\n"
@@ -1109,6 +1114,49 @@ static void log_wg_summary(const tc_wg_peer *peer)
  * The connect is blocking, which is safe only because loopback either
  * succeeds or is refused immediately -- there is no network in between to
  * time out on. */
+/* dial_endpoint opens a TCP connection to a literal address, which is what an
+ * exit node does with the destination its peer named.
+ *
+ * Nothing here decides *whether* to dial it. That judgement belongs to
+ * whoever turned exit-node mode on, and it is a large judgement: a peer can
+ * name this machine's own loopback, the rest of its LAN, or a cloud metadata
+ * endpoint, and they will all work. */
+static int dial_endpoint(const tc_endpoint *ep)
+{
+	if (ep == NULL || ep->port == 0)
+		return -1;
+
+	if (ep->ip_len == 4) {
+		struct sockaddr_in a;
+		memset(&a, 0, sizeof a);
+		a.sin_family = (uint16_t)AF_INET;
+		a.sin_port = htons(ep->port);
+		memcpy(&a.sin_addr, ep->ip, 4);
+		int fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (fd < 0)
+			return -1;
+		if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0)
+			return fd;
+		(void)close(fd);
+		return -1;
+	}
+	if (ep->ip_len != 16)
+		return -1;
+
+	struct sockaddr_in6 a;
+	memset(&a, 0, sizeof a);
+	a.sin6_family = (uint16_t)AF_INET6;
+	a.sin6_port = htons(ep->port);
+	memcpy(&a.sin6_addr, ep->ip, 16);
+	int fd = socket(AF_INET6, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0)
+		return fd;
+	(void)close(fd);
+	return -1;
+}
+
 static int dial_localhost(uint16_t port)
 {
 	struct sockaddr_in v4;
@@ -1197,6 +1245,10 @@ typedef struct {
 	 * mapping shared by all peers is both fewer holes to keep open and the
 	 * only way the address we advertise means the same thing to each of
 	 * them. */
+	/* Set by `serve exit-node`. See tc_tcp_mux_set_exit_node for what it
+	 * means to turn this on. */
+	bool exit_node;
+
 	tc_udp udp;
 	bool have_udp;
 	uint8_t disco_priv[32], disco_pub[32];
@@ -1278,6 +1330,7 @@ static serve_client *add_client(serve_state *st, const uint8_t key[32],
 	}
 	tc_tcp_mux_set_accept_filter(sc->mux, port_is_served,
 	                             (void *)(uintptr_t)st->ports);
+	tc_tcp_mux_set_exit_node(sc->mux, st->exit_node);
 
 	if (st->have_udp)
 		sc->has_path =
@@ -1462,12 +1515,41 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 			tc_tcp_conn *c;
 			while ((c = tc_tcp_mux_accept(sc->mux)) != NULL) {
 				uint16_t port = tc_tcp_local_port(c);
-				int fd = dial_localhost(port);
+
+				/* Where the client addressed the connection decides where it
+				 * goes. Our own tunnel address means a local service; any
+				 * other address means the client asked us to forward, which
+				 * only happens at all because exit-node mode is on. */
+				uint8_t want[TC_IPV6_ADDR_LEN];
+				tc_tcp_local_addr(c, want);
+				uint8_t ours[TC_TUNNEL_ADDR_LEN];
+				tc_tunnel_addr_for_key(ours, st->me.public_key);
+
+				int fd;
+				if (memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
+					fd = dial_localhost(port);
+				} else {
+					tc_endpoint dst;
+					memset(&dst, 0, sizeof dst);
+					memcpy(dst.ip, want, 16);
+					dst.ip_len = 16;
+					dst.port = port;
+					/* An IPv4 destination arrived wrapped in the NAT64
+					 * prefix, because the tunnel carries nothing else. */
+					tc_endpoint v4;
+					if (tc_nat64_unwrap(&v4, &dst) == TC_OK)
+						dst = v4;
+					char where[80];
+					(void)tc_endpoint_format(where, sizeof where, &dst);
+					fd = dial_endpoint(&dst);
+					vlogf("exit node: %s %s", fd < 0 ? "could not reach" :
+					                                   "forwarding to",
+					      where);
+				}
 				if (fd < 0) {
-					/* Nothing is listening locally. Resetting says so at
+					/* Nothing is listening there. Resetting says so at
 					 * once rather than leaving the client to time out. */
-					vlogf("no local service on port %u; refusing",
-					      (unsigned)port);
+					vlogf("no service on port %u; refusing", (unsigned)port);
 					tc_tcp_mux_close(sc->mux, c, t);
 					continue;
 				}
@@ -2179,6 +2261,10 @@ typedef struct {
 	int fd;
 	uint16_t local_port;  /* as bound, so an OS-chosen port is reported */
 	uint16_t remote_port; /* 0 for socks: each connection negotiates its own */
+	/* Where the traffic goes once through the tunnel. ip_len 0 is the
+	 * server itself; anything else asks it to act as an exit node. Already
+	 * wrapped for the tunnel, so the dial site needs no special case. */
+	tc_endpoint dst;
 } local_listener;
 
 /* bind_local opens a listening socket. bind_addr is a literal address --
@@ -2414,7 +2500,11 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				}
 
 				tc_tcp_conn *c = NULL;
-				if (tc_tcp_mux_connect(cl->mux, want, t, &c) != TC_OK) {
+				int crc = (ls[i].dst.ip_len == 16)
+				              ? tc_tcp_mux_connect_to(cl->mux, ls[i].dst.ip,
+				                                      want, t, &c)
+				              : tc_tcp_mux_connect(cl->mux, want, t, &c);
+				if (crc != TC_OK) {
 					vlogf("no room for another connection");
 					(void)close(fd);
 					continue;
@@ -2425,8 +2515,16 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 					tc_tcp_mux_close(cl->mux, c, t);
 					continue;
 				}
-				vlogf("forwarding a connection to the server's port %u",
-				      (unsigned)want);
+				if (ls[i].dst.ip_len == 16) {
+					char where[80];
+					(void)tc_endpoint_format(where, sizeof where,
+					                         &ls[i].dst);
+					vlogf("forwarding a connection through the server to %s",
+					      where);
+				} else {
+					vlogf("forwarding a connection to the server's port %u",
+					      (unsigned)want);
+				}
 			}
 		}
 
@@ -2614,6 +2712,15 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 				return 1;
 			}
 			ls[nls].remote_port = f.remote_port;
+			/* Wrapped here rather than at the dial site: an IPv4 destination
+			 * has to travel inside an IPv6 address because that is all the
+			 * tunnel carries, and doing it once means the rest of the code
+			 * sees one kind of destination instead of two. */
+			memset(&ls[nls].dst, 0, sizeof ls[nls].dst);
+			if (f.dst.ip_len == 4)
+				(void)tc_nat64_wrap(&ls[nls].dst, &f.dst);
+			else if (f.dst.ip_len == 16)
+				ls[nls].dst = f.dst;
 			nls++;
 		}
 	}
@@ -2622,7 +2729,16 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 		if (socks)
 			fprintf(stderr, "# SOCKS5 proxy on %s:%u\n", bind_addr,
 			        (unsigned)ls[i].local_port);
-		else
+		else if (ls[i].dst.ip_len == 16) {
+			/* Shown as the user typed it, not as it travels. */
+			tc_endpoint shown = ls[i].dst, v4;
+			if (tc_nat64_unwrap(&v4, &shown) == TC_OK)
+				shown = v4;
+			char where[80];
+			(void)tc_endpoint_format(where, sizeof where, &shown);
+			fprintf(stderr, "# %s:%u -> %s, through the server\n", bind_addr,
+			        (unsigned)ls[i].local_port, where);
+		} else
 			fprintf(stderr, "# %s:%u -> the server's port %u\n", bind_addr,
 			        (unsigned)ls[i].local_port,
 			        (unsigned)ls[i].remote_port);
@@ -2922,7 +3038,7 @@ static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
 static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      bool insecure, unsigned timeout_s,
                      const char *derpmap_url, const char *key_spec,
-                     bool full_address)
+                     bool full_address, bool exit_node)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -3068,6 +3184,10 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		st.me = me;
 		memcpy(st.psk, ci.preshared_key, sizeof st.psk);
 		st.ports = ports;
+		st.exit_node = exit_node;
+		if (exit_node)
+			fprintf(stderr, "# acting as an exit node: clients may reach "
+			                "anything this machine can\n");
 		st.proxy = tc_proxy_new(TC_TCP_MAX_CONNS);
 		if (st.proxy == NULL) {
 			fprintf(stderr, "tailcat-c: out of memory\n");
@@ -3381,14 +3501,23 @@ int main(int argc, char **argv)
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
-			                 key_spec, full_address);
+			                 key_spec, full_address, false);
 		}
 
 		static tc_portset ports;
 		tc_portset_clear(&ports);
+		bool exit_node = false;
 		for (size_t i = 1; i < nargs; i++) {
 			tc_portset_service svc = TC_PORTSET_SVC_NONE;
 			int rc = tc_portset_parse(&ports, args[i], &svc);
+			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_EXIT_NODE) {
+				/* Implemented, unlike the other named services. It is the
+				 * one that has to be asked for by name rather than implied,
+				 * because it makes this machine a proxy for everything it
+				 * can reach. */
+				exit_node = true;
+				continue;
+			}
 			if (rc == TC_ERR_UNSUPPORTED) {
 				/* Naming the service beats "bad port list": it is a real
 				 * upstream feature, just not one we have. */
@@ -3406,7 +3535,7 @@ int main(int argc, char **argv)
 		}
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
-		                 key_spec, full_address);
+		                 key_spec, full_address, exit_node);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

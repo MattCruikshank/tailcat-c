@@ -186,7 +186,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -316,6 +316,11 @@ live-netcheck: $(BUILD)/livenetcheck
 # them, which is the half of Phase 4.4 a simulated network cannot check.
 live-direct: $(CLI)
 	CLI=$(CLI) sh scripts/live-direct.sh
+
+# A client reaching a third address through an exit node, and a server that
+# was not asked to be one refusing to.
+live-exitnode: $(CLI)
+	CLI=$(CLI) sh scripts/live-exitnode.sh
 
 live-cli: $(CLI)
 	CLI=$(CLI) sh scripts/live-cli.sh

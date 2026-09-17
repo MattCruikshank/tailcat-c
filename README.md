@@ -108,6 +108,7 @@ largest thing we add is the 181 KB CA bundle.
 | Multiple concurrent connections | ✅ | ✅ |
 | Multiple concurrent clients | ✅ (8) | ✅ |
 | UDP forwarding | the tunnel layer only | ✅ |
+| Exit node (forward to any address) | ✅ | ✅ |
 | IPv4 into the tunnel via NAT64 | ❌ | ✅ |
 | TLS to the relay | 1.2 | 1.2 + 1.3 |
 | **Commands** | | |
@@ -219,6 +220,8 @@ $ tailcat-c ping <tc-address>              # time the round trip
 $ tailcat-c resolve <tc-address>           # embed the relay, for offline use
 $ tailcat-c parse <tc-address>             # describe an address
 $ tailcat-c netcheck                       # UDP, NAT type, relay latency
+$ tailcat-c serve exit-node,22             # forward anywhere this machine can reach
+$ tailcat-c forward <addr> 13306:192.168.1.10:3306
 ```
 
 The address must be self-contained; run `tailcat resolve` on a short one,
@@ -588,7 +591,11 @@ Current, and deliberate unless noted.
   takes up to 8 clients and 64 connections at once.
 - **No `--allow` list.** Anyone holding the address can connect. Upstream can
   restrict by client public key; we cannot, so the address is the only
-  credential.
+  credential. This matters most for `serve exit-node`: anyone with the
+  address can then reach anything the serving machine can, including its own
+  loopback services and its cloud metadata endpoint. Upstream has the same
+  property and the same warning; the difference is that upstream can at least
+  narrow *who* by public key.
 
 ### TLS
 
