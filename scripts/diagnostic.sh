@@ -126,6 +126,15 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: real tailcat server" "make live-tailcat"
 	stage "live: CLI to a Go server" "make live-cli"
 	stage "live: Go client to our server" "make live-serve"
+	stage "live: Go client reaching a local service" "make live-serve-ports"
+	stage "live: four Go clients at once" "make live-multi"
+	stage "live: forward and socks to a Go server" "make live-forward"
+	stage "live: SOCKS5 UDP ASSOCIATE" "make live-socksudp"
+	stage "live: reaching a third address via an exit node" "make live-exitnode"
+	stage "live: --allow admits and refuses" "make live-allow"
+	stage "live: a saved key through both implementations" "make live-genkey"
+	stage "live: ssh and scp with us as ProxyCommand" "make live-ssh"
+	stage "live: a file into a real tailcat recv drop box" "make live-recv"
 	stage "live: session across a rekey (slow, ~6m)" "make live-rekey"
 fi
 

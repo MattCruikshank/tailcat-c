@@ -157,6 +157,7 @@ LIB_SRCS := \
 	src/crypto/blake2s.c \
 	src/crypto/kdf.c \
 	src/crypto/x25519.c \
+	src/crypto/ed25519.c \
 	src/crypto/aead.c \
 	src/crypto/salsa20.c \
 	src/crypto/random.c \

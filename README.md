@@ -317,6 +317,7 @@ something that is not ours.**
 | meow, disco, STUN | upstream's own encoders, via `tools/genvectors` |
 | UDP over IPv6 | packets built and checksummed by **gopacket** |
 | NAT64 | RFC 6052 §2.4's worked example, and `inet_pton`, which embeds a dotted quad itself |
+| Ed25519 | RFC 8032's published vectors, reached by feeding its own seeds to Go's `crypto/ed25519` |
 | IPv6 formatting | our output fed back through `inet_pton` |
 | everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
 
@@ -490,8 +491,12 @@ Nothing is given up by staying on 1.2 here: 1.2 with ECDHE and AEAD suites is
 not a weak configuration, and `tc_tls_last_version()` reports what was
 actually negotiated, so this is checkable rather than assumed.
 
-If Ed25519 gets written for the SSH server above, this becomes worth
-revisiting — the same 400 lines unblock both.
+**Ed25519 now exists** (`tc/ed25519.h`), so the missing piece is no longer
+the algorithm — it is that Mbed TLS's X.509 parser has no hook to hand an
+unknown signature algorithm to. Teaching a vendored TLS library to call out
+to ours in the middle of chain validation is a bigger and more delicate
+change than writing the curve was, and it is still in service of an
+optimisation we do not implement. Worth revisiting; not worth rushing.
 
 ## Vendoring an SSH server
 
@@ -534,12 +539,11 @@ No PTY allocation, no agent forwarding, no port forwarding, no interactive
 shell, no `scp` protocol. Those are most of what makes a general `sshd` big,
 and all of them are things a drop box should *not* have.
 
-The one genuine gap is **Ed25519**, which we do not have and which
-`ssh-ed25519` host and user keys need. Two ways out, and the first is
-probably right: implement Ed25519 (~400 lines on top of the field arithmetic
-X25519 already uses), or use `ecdsa-sha2-nistp256` host keys from Mbed TLS,
-which every OpenSSH client still accepts. Doing it ourselves also keeps the
-"no unvendored crypto beyond Mbed TLS" property the rest of the project has.
+The one genuine gap **was Ed25519**, and it is now closed: `tc/ed25519.h`
+implements RFC 8032 in about 600 lines, checked against RFC 8032's published
+vectors and byte-for-byte against Go's `crypto/ed25519`. So `ssh-ed25519`
+host and user keys are available without an `ecdsa-sha2-nistp256` fallback,
+and the "no unvendored crypto beyond Mbed TLS" property survives.
 
 Estimate with the crypto in hand: **~2,500 lines for the SSH subset, ~1,500
 for SFTP**, against ~30k for vendoring Dropbear and then carrying a second
@@ -955,9 +959,6 @@ Roughly in the order they should be picked up.
       covered; the other four targets and the entire aarch64 half are not.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
       that callers must serialise it.
-- [ ] **Ed25519.** Needed by the SSH server, and it would also unblock TLS
-      1.3; see both sections above. ~400 lines on top of the field
-      arithmetic X25519 already uses.
 - [ ] Revisit **TLS 1.3** *after* Ed25519 exists, not before — the blocker is
       the Ed25519 meta certificate, not the PSA dependency.
 - [ ] Refresh the **CA bundle** and decide on a cadence for it.

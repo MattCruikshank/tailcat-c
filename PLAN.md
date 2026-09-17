@@ -14,7 +14,8 @@ divides into three quite different things: one small piece of ordinary work
 (SOCKS5 UDP ASSOCIATE), one blocked on a licence decision (the SSH and SFTP
 servers), and one blocked on a toolchain that does not exist for
 Cosmopolitan (WebAssembly). A fourth, TLS 1.3, was attempted and turned out
-to be blocked on Ed25519 rather than on effort.
+to be blocked on an Ed25519 certificate Mbed TLS cannot parse, rather than
+on effort.
 
 Sizes are rough C line counts for the new code, excluding tests, which have
 run about 1:1 with implementation on this project. "Risk" is about how likely
@@ -501,7 +502,7 @@ that a server which was not asked to forward refuses. The second half is the
 one worth having: a default that quietly allowed forwarding would be the most
 dangerous kind of bug here, one that only shows up as a feature.
 
-### 5.3 TLS 1.3 ❌ tried, reverted · blocked on Ed25519
+### 5.3 TLS 1.3 ❌ tried, reverted · blocked on Mbed TLS's X.509 parser
 
 Enabling it is easy and it does not work.
 
@@ -554,10 +555,10 @@ single channel with only the `subsystem` request. No PTY, no port
 forwarding, no agent forwarding, no shell — which is most of what makes a
 general `sshd` large, and all of which a drop box should not have.
 
-The one real gap is **Ed25519** for `ssh-ed25519` keys: ~400 lines on top of
-the field arithmetic X25519 already uses, or fall back to
-`ecdsa-sha2-nistp256` host keys from Mbed TLS. Writing it also unblocks TLS
-1.3 (5.3), so the same 400 lines buy two things.
+The one real gap **was Ed25519**, and it is now done: `tc/ed25519.h`, about
+600 lines, checked against RFC 8032's published vectors and byte-for-byte
+against Go's `crypto/ed25519`. So `ssh-ed25519` keys need no
+`ecdsa-sha2-nistp256` fallback.
 
 The estimate drops from ~4,000 lines to ~2,500 precisely because the scope
 is the subset rather than a general server.
@@ -666,6 +667,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
 | — `--allow` list | ~300 | ✅ done |
+| — Ed25519 (RFC 8032) | ~600 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in
 particulars. Phase 4 came in at 2,801 against ~1,950 estimated — the extra is
@@ -696,8 +698,8 @@ discovery were not actually being made.
    every binary has never been executed at all. Cheapest first: build x86_64
    with `-funsigned-char` and run the suite, then qemu-user, then
    qemu-system, then real hardware.
-2. **Ed25519**, which unblocks both the SSH server and TLS 1.3.
-3. **Decide the SSH licence question** (see 5.4) and then write the subset.
+2. **Decide the SSH licence question** (see 5.4) and then write the subset.
+   Ed25519 is done, so the crypto it needs is all in hand.
 4. **TCP keepalive / idle timeout**, now the oldest thing on the list. A
    direct path notices silence and falls back, but that is the path, not the
    connection: a relayed connection to a peer that vanished still hangs.
