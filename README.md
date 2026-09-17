@@ -1207,6 +1207,21 @@ starting a fresh single-use server or re-listening on an address you may have
 shared with people months ago. Ours told you nothing, which is worst in the
 case that matters.
 
+**37. `ls <addr>:path` stopped working the moment DNS names were added.**
+*(Phase 6.6, found by `make live-ls` while preparing something else.)* The
+new resolver was wired into the `ls` dispatch, where the argument is still
+`<address>:<path>` as one string -- so it asked whether `tc...:sub` was a DNS
+name, and refused. `ls <addr>` with no path was unaffected, which is the form
+everything else exercised.
+
+It was written, committed and pushed without being noticed, because the test
+that catches it is a *live* one and lives in level 1. Levels 3 and 5 were
+green throughout. The lesson is not "run level 1 more often" -- it costs
+twenty minutes and dials someone else's relays -- but that a change to
+argument handling reaches commands whose only tests are live ones, and the
+tier has to be chosen by what the change touches rather than by how big it
+looks.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my

@@ -2821,14 +2821,20 @@ typedef struct {
 	uint64_t deadline;
 } ls_io;
 
-/* client_pump_once services the tunnel for one turn: the relay, the
- * direct-path probes, the WireGuard timers and the muxes. Named for
- * `ls` until `ping --until-direct` wanted exactly the same turn,
- * which is the usual sign that a name was too specific. */
-static int client_pump_once(tc_client *cl, uint64_t deadline)
-{
-	uint64_t t = now_ms();
+/* One turn of a client's tunnel, in three pieces so that a caller with
+ * several clients can interleave them.
+ *
+ * client_pump_once is still the whole turn and is what `ls` and `ping` use.
+ * The proxy needs the pieces because it polls every relay socket, every
+ * listener and every proxied file descriptor in one call: doing a turn per
+ * client, each with its own poll, would make a quiet moment cost twenty
+ * milliseconds per server rather than twenty in total.
+ */
 
+/* client_ready recovers a stalled relay and runs the timers. Non-zero means
+ * the relay is gone for good. */
+static int client_ready(tc_client *cl, uint64_t deadline)
+{
 	if (cl->ctx.relay_stalled) {
 		cl->ctx.relay_stalled = false;
 		vlogf("a relay write stalled; rebuilding the connection");
@@ -2837,41 +2843,46 @@ static int client_pump_once(tc_client *cl, uint64_t deadline)
 			return 1;
 	}
 
+	uint64_t t = now_ms();
 	tc_wg_peer_tick(&cl->peer, t);
 	tc_tcp_mux_tick(cl->mux, t);
-	pump_service_udp(&cl->ctx, cl->mux);
+	if (cl->umux != NULL)
+		tc_udp_mux_tick(cl->umux, t);
+	return 0;
+}
 
-	if (!tc_derp_has_pending(&cl->derp)) {
-		struct pollfd pfd;
-		int dfd = tc_derp_fd(&cl->derp);
-		if (dfd >= 0) {
-			pfd.fd = dfd;
-			pfd.events = POLLIN;
-			pfd.revents = 0;
-			int wait_ms = 20;
-			uint64_t dl = tc_tcp_mux_next_deadline(cl->mux);
-			uint64_t wdl = tc_wg_peer_next_deadline(&cl->peer);
-			if (wdl < dl)
-				dl = wdl;
-			if (dl != UINT64_MAX) {
-				uint64_t nowv = now_ms();
-				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
-				if (wait_ms > 200)
-					wait_ms = 200;
-			}
-			(void)poll(&pfd, 1, wait_ms);
-		}
-	}
+/* client_wait_ms is how long this client is willing to sleep: the sooner of
+ * its TCP and WireGuard deadlines, capped so a caller polling several of them
+ * still wakes up often enough for all. */
+static int client_wait_ms(const tc_client *cl, int cap_ms)
+{
+	uint64_t dl = tc_tcp_mux_next_deadline(cl->mux);
+	uint64_t wdl = tc_wg_peer_next_deadline(&cl->peer);
+	if (wdl < dl)
+		dl = wdl;
+	if (dl == UINT64_MAX)
+		return cap_ms;
+	uint64_t nowv = now_ms();
+	int ms = (dl > nowv) ? (int)(dl - nowv) : 0;
+	return (ms > cap_ms) ? cap_ms : ms;
+}
+
+/* client_recv_once reads whatever the relay has and delivers it. */
+static int client_recv_once(tc_client *cl, uint64_t deadline)
+{
+	pump_service_udp(&cl->ctx, cl->mux);
 
 	uint8_t src[32];
 	static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 	size_t len = 0;
 	int rc = tc_derp_recv(&cl->derp, src, buf, sizeof buf, &len);
 	if (rc == TC_ERR_TIMEOUT) {
-		if (tc_derp_idle_ms(&cl->derp) > TC_DERP_DEAD_AFTER_MS &&
-		    relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
-		                  cl->ping_len, deadline) != TC_OK)
-			return 1;
+		if (tc_derp_idle_ms(&cl->derp) > TC_DERP_DEAD_AFTER_MS) {
+			vlogf("no keep-alive; the relay is gone");
+			if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+			                  cl->ping_len, deadline) != TC_OK)
+				return 1;
+		}
 		return 0;
 	}
 	if (rc == TC_ERR_CLOSED) {
@@ -2887,7 +2898,8 @@ static int client_pump_once(tc_client *cl, uint64_t deadline)
 	if (pump_relay_disco(&cl->ctx, buf, len))
 		return 0;
 	if (tc_meow_is_meowed(buf, len)) {
-		/* Not WireGuard, so it would otherwise be dropped a line below. */
+		/* Not WireGuard, so it would otherwise be dropped below. `ping`
+		 * times the round trip with it. */
 		cl->ctx.meowed_at_ms = now_ms();
 		return 0;
 	}
@@ -2900,6 +2912,26 @@ static int client_pump_once(tc_client *cl, uint64_t deadline)
 	if (inner_len != 0)
 		deliver_inner(cl->mux, cl->ctx.umux, inner, inner_len);
 	return 0;
+}
+
+/* client_pump_once services the tunnel for one turn, for callers that have
+ * only this one client to wait on. */
+static int client_pump_once(tc_client *cl, uint64_t deadline)
+{
+	if (client_ready(cl, deadline) != 0)
+		return 1;
+
+	if (!tc_derp_has_pending(&cl->derp)) {
+		struct pollfd pfd;
+		int dfd = tc_derp_fd(&cl->derp);
+		if (dfd >= 0) {
+			pfd.fd = dfd;
+			pfd.events = POLLIN;
+			pfd.revents = 0;
+			(void)poll(&pfd, 1, client_wait_ms(cl, 20));
+		}
+	}
+	return client_recv_once(cl, deadline);
 }
 
 /* ping_run is `ping`, both with and without --until-direct.
@@ -3347,6 +3379,11 @@ static int ls_on_ready(void *ctx, tc_ssh_client *c)
 	return TC_OK;
 }
 
+/* Defined with the other argument handling near main; `ls` needs it here
+ * because only this function knows where the address ends and the path
+ * begins. */
+static const char *dest_arg(const char *arg, bool *from_dns);
+
 static int cmd_ls(const char *arg, bool long_form, bool insecure,
                   unsigned timeout_s, const char *derpmap_url,
                   const char *key_spec)
@@ -3366,6 +3403,18 @@ static int cmd_ls(const char *arg, bool long_form, bool insecure,
 	} else {
 		snprintf(addr, sizeof addr, "%s", arg);
 	}
+
+	/* After the split, not before. `ls <addr>:path` is one argument holding
+	 * two things, and handing the whole of it to the classifier asks whether
+	 * "<addr>:path" is a DNS name -- which it is not, so `ls` with a path
+	 * stopped working the moment DNS names were added. The colon is found
+	 * from the right above because an address never contains one and a path
+	 * might, and the same reasoning applies here. */
+	const char *resolved = dest_arg(addr, NULL);
+	if (resolved == NULL)
+		return 1;
+	if (resolved != addr)
+		snprintf(addr, sizeof addr, "%s", resolved);
 
 	static tc_client cl;
 	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
@@ -5589,10 +5638,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: ls needs one address\n");
 			return 2;
 		}
-		const char *dst = dest_arg(args[1], NULL);
-		if (dst == NULL)
-			return 1;
-		return cmd_ls(dst, long_listing, insecure,
+		return cmd_ls(args[1], long_listing, insecure,
 		              timeout_given ? timeout_s : 30, derpmap_url, key_spec);
 	}
 	if (strcmp(args[0], "recv") == 0) {
