@@ -120,6 +120,16 @@ typedef struct {
  * *out and *tcp must not be the same object. */
 int tc_tls_client(tc_stream *out, tc_stream *tcp, const tc_tls_config *cfg);
 
+/* tc_tls_last_version returns the protocol version the most recent handshake
+ * on this thread settled on -- "TLSv1.2", "TLSv1.3" -- or "" if there has not
+ * been one.
+ *
+ * Which version was negotiated is otherwise invisible, and "we support 1.3"
+ * is a claim about the build rather than about what actually happened on the
+ * wire. A relay that quietly never offers it, or a middlebox that strips it,
+ * looks exactly like success. */
+const char *tc_tls_last_version(void);
+
 /* tc_tls_error_string returns a short description of the last TLS failure on
  * this thread, or "" if there is none. Useful because a handshake failure has
  * many distinguishable causes and TC_ERR_INVAL alone is unhelpful. */

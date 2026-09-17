@@ -40,6 +40,7 @@
 #include "tc/shquote.h"
 #include "tc/proxy.h"
 #include "tc/tcpmux.h"
+#include "tc/tls.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2091,6 +2092,7 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 		return 1;
 	}
 	tc_derp_set_read_timeout(&cl->derp, 200);
+	vlogf("relay TLS: %s", tc_tls_last_version());
 
 	/* ---- meow: ask the server to add us as a peer ---------------------- */
 

@@ -75,17 +75,34 @@
  *
  * DERP speaks HTTPS, so the relay transport needs a TLS client.
  *
- * TLS 1.2 only. TLS 1.3 in Mbed TLS 3.6 additionally requires the PSA crypto
- * layer (MBEDTLS_PSA_CRYPTO_C and its HKDF), which is a large amount of extra
- * code; check_config.h rejects TLS 1.3 without it. Tailscale's DERP servers
- * accept TLS 1.2, so this is sufficient, and 1.2 with ECDHE and AEAD suites
- * is not a security compromise. Revisit if a relay ever requires 1.3.
+ * TLS 1.2 only, and the reason is interoperability rather than code size.
  *
- * Note the consequence for upstream's "fast start" optimisation: it reads the
- * server's DERP public key out of a meta certificate, but only when the
- * connection negotiated TLS 1.3. On 1.2 that path is unavailable, so we
- * always do the ordinary HTTP upgrade and read FRAME_SERVER_KEY, which works
- * against every server.
+ * Phase 5.3 enabled 1.3 and reverted it. Enabling it is genuinely easy: add
+ * MBEDTLS_SSL_PROTO_TLS1_3, the PSA crypto layer it requires
+ * (MBEDTLS_PSA_CRYPTO_C plus HKDF, and *not* MBEDTLS_PSA_CRYPTO_CONFIG,
+ * whose defaults drag in ARIA, Camellia, CCM and DES), about twenty extra
+ * Mbed TLS source files, and a psa_crypto_init() before the first context.
+ * That builds, links, and costs 232 KB -- about 11%.
+ *
+ * It also cannot connect to a single Tailscale relay.
+ *
+ * DERP servers append a self-signed *meta certificate* to the chain, which
+ * encodes the server's public key in its CommonName so a client can skip a
+ * round trip. They send it only on TLS 1.3, because 1.3 encrypts the
+ * certificate chain and 1.2 does not -- see initMetacert in
+ * tailscale.com/derp/derpserver. That certificate is Ed25519, and Mbed TLS
+ * 3.6 cannot parse an Ed25519 certificate at all: the chain is rejected
+ * whole, with "X509 - Signature algorithm (oid) is unsupported", before any
+ * verification happens. Every relay becomes unreachable.
+ *
+ * Making it work would mean teaching a vendored TLS library to skip
+ * certificates it cannot parse, in the middle of chain validation. That is
+ * not a change to make for an optimisation we do not implement.
+ *
+ * So the gain was never "1.3 is better than 1.2" -- 1.2 with ECDHE and AEAD
+ * suites is not a weak configuration. The gain would have been upstream's
+ * "fast start", which reads the DERP key out of that same meta certificate;
+ * and the thing that blocks 1.3 is the thing fast start is made of.
  */
 #define MBEDTLS_SSL_CLI_C
 #define MBEDTLS_SSL_TLS_C

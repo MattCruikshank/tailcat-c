@@ -201,7 +201,15 @@ $(CLI): src/cli/main.c $(LIB_OBJS)
 # overflow three call frames away from the change.
 DEPFLAGS = -MMD -MP
 
-$(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c
+# Named explicitly, because -MMD will not find it. Mbed TLS reaches our
+# config through its own build_info.h, which arrives via -isystem and is
+# therefore a system header -- and -MMD stops at system headers, so the
+# dependency chain never reaches third_party/mbedtls_config.h. Editing the
+# config then rebuilds nothing, and the objects that were already there stay
+# compiled against the old options. Enabling TLS 1.3 produced exactly that: a
+# link full of missing ARIA and Camellia symbols from a cipher_wrap.o built
+# under a config that no longer existed.
+$(BUILD)/$(MBEDTLS_DIR)/%.o: $(MBEDTLS_DIR)/%.c third_party/mbedtls_config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(MBEDTLS_CFLAGS) $(DEPFLAGS) -c $< -o $@
 

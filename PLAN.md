@@ -476,11 +476,35 @@ that a server which was not asked to forward refuses. The second half is the
 one worth having: a default that quietly allowed forwarding would be the most
 dangerous kind of bug here, one that only shows up as a feature.
 
-### 5.3 TLS 1.3 · ~50 lines config · low risk
-Enable `MBEDTLS_SSL_PROTO_TLS1_3`, which needs the PSA crypto layer
-(`MBEDTLS_PSA_CRYPTO_C`) — a large amount of additional Mbed TLS code for a
-modest gain. It would also unlock upstream's meta-certificate "fast start",
-which skips the HTTP upgrade.
+### 5.3 TLS 1.3 ❌ tried, reverted · blocked on Ed25519
+
+Enabling it is easy and it does not work.
+
+The config side is about what was estimated: `MBEDTLS_SSL_PROTO_TLS1_3`, the
+PSA crypto layer it requires (`MBEDTLS_PSA_CRYPTO_C` plus HKDF — and *not*
+`MBEDTLS_PSA_CRYPTO_CONFIG`, whose defaults drag in ARIA, Camellia, CCM and
+DES), about twenty extra Mbed TLS sources, and a `psa_crypto_init()` before
+the first context. It builds, links, and costs 232 KB, about 11%.
+
+It also cannot reach a single relay.
+
+DERP servers append a self-signed **meta certificate** to the chain, encoding
+the server's public key in its CommonName so a client can skip a round trip.
+They send it only on TLS 1.3, because 1.3 encrypts the certificate chain and
+1.2 does not. That certificate is **Ed25519**, and Mbed TLS 3.6 cannot parse
+an Ed25519 certificate at all — the chain is rejected whole, before any
+verification, with `X509 - Signature algorithm (oid) is unsupported`.
+
+The irony is exact: the thing 1.3 would have unlocked is "fast start", which
+reads the DERP key out of that meta certificate; and the meta certificate is
+what makes 1.3 unusable. Making it work means teaching a vendored TLS library
+to skip certificates it cannot parse, in the middle of chain validation,
+which is not a change to make for an optimisation we do not implement.
+
+Kept from the attempt: `tc_tls_last_version()`, so the negotiated version is
+observable rather than assumed, and a Makefile fix — Mbed TLS objects now
+depend on `mbedtls_config.h` explicitly, because `-MMD` stops at the
+`-isystem` header that includes it and editing the config rebuilt nothing.
 
 ### 5.4 SSH server · ~4,000+ lines · **high risk**
 The largest single item. Transport, key exchange, userauth, channels, PTY

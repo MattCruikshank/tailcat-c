@@ -104,6 +104,13 @@ int tc_stream_read_full(tc_stream *s, uint8_t *buf, size_t len)
  * what actually went wrong rather than just TC_ERR_INVAL. */
 static _Thread_local char g_tls_err[192];
 
+static _Thread_local char g_version[16];
+
+const char *tc_tls_last_version(void)
+{
+	return g_version;
+}
+
 const char *tc_tls_error_string(void)
 {
 	return g_tls_err;
@@ -506,8 +513,11 @@ int tc_tls_client(tc_stream *out, tc_stream *tcp, const tc_tls_config *cfg)
 		mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 	}
 
-	/* TLS 1.2 is both the floor and the ceiling here; see the note in
-	 * third_party/mbedtls_config.h about TLS 1.3 needing the PSA layer. */
+	/* TLS 1.2 is both the floor and the ceiling. Not a size decision: see
+	 * the note in third_party/mbedtls_config.h about the Ed25519 meta
+	 * certificate DERP servers send on 1.3 connections, which Mbed TLS
+	 * cannot parse. tc_tls_last_version reports what was actually
+	 * negotiated, so this is checkable rather than assumed. */
 	mbedtls_ssl_conf_min_tls_version(&t->conf, MBEDTLS_SSL_VERSION_TLS1_2);
 	mbedtls_ssl_conf_max_tls_version(&t->conf, MBEDTLS_SSL_VERSION_TLS1_2);
 
@@ -532,6 +542,12 @@ int tc_tls_client(tc_stream *out, tc_stream *tcp, const tc_tls_config *cfg)
 		set_tls_err("handshake", rc);
 		goto fail;
 	}
+
+	/* Recorded before verification, because a handshake that completed and
+	 * then failed its certificate check still says which version got that
+	 * far -- which is exactly what a diagnostic wants to know. */
+	(void)snprintf(g_version, sizeof g_version, "%s",
+	               mbedtls_ssl_get_version(&t->ssl));
 
 	if (!cfg->insecure_skip_verify) {
 		uint32_t flags = mbedtls_ssl_get_verify_result(&t->ssl);
