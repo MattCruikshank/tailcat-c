@@ -98,15 +98,9 @@ static int sock_write(void *ctx, const uint8_t *buf, size_t len)
  * worked" from "the client printed its own input back at itself". */
 static const char *g_dropbox_dir;
 
-/* serve_sftp runs the drop box over the channel.
- *
- * The framing is the part worth care. An SFTP packet is a length followed by
- * that many bytes, carried over a channel that is a byte stream -- so one
- * packet may arrive across several reads and several may arrive in one. A
- * loop that assumed a read gave it exactly one packet would work against a
- * client that sent them slowly and corrupt the stream against one that
- * pipelined, which is what scp does.
- */
+/* serve_sftp opens the drop box and hands it to the shared serving loop.
+ * The framing lives in tc_dropbox_serve so the CLI and this test run the
+ * same code rather than two copies of the same loop. */
 static int serve_sftp(tc_ssh_server *s)
 {
 	tc_dropbox db;
@@ -115,73 +109,10 @@ static int serve_sftp(tc_ssh_server *s)
 		fprintf(stderr, "livesshd: drop box %s unusable\n", g_dropbox_dir);
 		return rc;
 	}
-
-	static uint8_t buf[TC_SFTP_MAX_PACKET * 2];
-	size_t have = 0;
-
-	for (;;) {
-		/* Process everything already buffered before reading more. */
-		for (;;) {
-			size_t total = 0;
-			int lr = tc_sftp_packet_len(buf, have, &total);
-			if (lr == TC_ERR_AGAIN)
-				break; /* not even a length yet */
-			if (lr != TC_OK) {
-				tc_dropbox_close(&db);
-				return lr;
-			}
-			if (have < total)
-				break; /* length known, body still arriving */
-
-			tc_sftp_request req;
-			uint8_t reply[TC_SFTP_MAX_PACKET];
-			size_t reply_len = 0;
-			rc = tc_sftp_parse(&req, buf, total);
-			if (rc == TC_OK)
-				rc = tc_dropbox_handle(&db, &req, reply, sizeof reply,
-				                       &reply_len);
-			if (rc != TC_OK) {
-				tc_dropbox_close(&db);
-				return rc;
-			}
-			rc = tc_ssh_server_write(s, reply, reply_len);
-			if (rc != TC_OK) {
-				tc_dropbox_close(&db);
-				return rc;
-			}
-
-			memmove(buf, buf + total, have - total);
-			have -= total;
-		}
-
-		if (have == sizeof buf) {
-			/* A packet larger than the buffer cannot arrive, because
-			 * tc_sftp_packet_len caps it well below this. Reaching here means
-			 * the accounting above is wrong, not that a client is large. */
-			tc_dropbox_close(&db);
-			return TC_ERR_TOOMANY;
-		}
-
-		size_t got = 0;
-		rc = tc_ssh_server_read(s, buf + have, sizeof buf - have, &got);
-		if (rc == TC_ERR_DONE || rc == TC_ERR_CLOSED)
-			break;
-		if (rc != TC_OK) {
-			tc_dropbox_close(&db);
-			return rc;
-		}
-		have += got;
-	}
-
+	rc = tc_dropbox_serve(&db, s);
 	fprintf(stderr, "livesshd: drop box received %u files, %llu bytes\n",
 	        db.files, (unsigned long long)db.bytes);
-	tc_dropbox_close(&db);
-
-	/* Without this scp reports a failure for a transfer that worked: it reads
-	 * the subsystem's exit status, and a channel that closes without one
-	 * looks like a server that died part way through. */
-	(void)tc_ssh_server_exit(s, 0);
-	return TC_OK;
+	return rc;
 }
 
 static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,

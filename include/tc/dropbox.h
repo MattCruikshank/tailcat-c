@@ -48,6 +48,7 @@
 #define TC_DROPBOX_H_
 
 #include "tc/sftp.h"
+#include "tc/sshserver.h"
 
 /* The longest stored name, before the uniquifying suffix. */
 #define TC_DROPBOX_MAX_NAME 128
@@ -89,6 +90,19 @@ int tc_dropbox_handle(tc_dropbox *db, const tc_sftp_request *req, uint8_t *out,
 
 /* tc_dropbox_close releases any open file. Safe to call twice. */
 void tc_dropbox_close(tc_dropbox *db);
+
+/* tc_dropbox_serve runs the drop box over an SSH channel until the client is
+ * finished, then sends an exit status.
+ *
+ * The framing is why this lives here rather than being written out at each
+ * call site. An SFTP packet is a length followed by that many bytes, carried
+ * over a channel that is a byte stream, so one packet may arrive across
+ * several reads and several may arrive in one. A loop that assumed a read
+ * gave it exactly one packet works against a client that sends them slowly
+ * and corrupts the stream against one that pipelines -- which scp does. One
+ * copy of that loop, used by the CLI and by the live test, is one place for
+ * it to be right. */
+int tc_dropbox_serve(tc_dropbox *db, tc_ssh_server *s);
 
 /* tc_dropbox_safe_name reduces a client-supplied path to a storable name, or
  * reports that there is none.

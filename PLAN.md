@@ -823,6 +823,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
 | 5.4 — SSH subset (transport, kex, auth, channels, server, rekey) | 2,648 | ✅ done |
 | 5.5 — SFTP server and the drop box | 944 | ✅ done |
+| — `recv` wired into the CLI | ~250 | ✅ done |
 | — `ls` (needs an SFTP *client*) | ~400 | ⏸ a choice, see 5.5 |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
@@ -863,9 +864,11 @@ discovery were not actually being made.
    qemu-user and is written and waiting on `qemu-user-static` being
    installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
    APE assimilation is needed. After that: qemu-system, then hardware.
-2. **Wire the drop box into the CLI as `recv`.** The server and the policy
-   are done and driven by a real `scp`; what is left is the subcommand and
-   its argument handling, which is small.
+2. **Decide whether `ls` is worth an SFTP client.** It is the last of
+   upstream's command set missing, and 5.5 records the trade: exec the system
+   `sftp` and match neither upstream's output nor its lack of dependencies,
+   or write ~400 lines of client. The SSH transport it would need now
+   exists.
 3. **Bound `FIN_WAIT_2`** — see below; unchanged by any of the SSH work.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is

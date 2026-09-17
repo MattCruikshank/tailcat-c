@@ -66,6 +66,22 @@ typedef struct {
 	const uint8_t *authorized;
 	size_t num_authorized;
 
+	/* Accept any key that proves it holds its own private half, because
+	 * something below this layer has already decided who may connect.
+	 *
+	 * This exists for `recv`, where it is not a weakening but a statement of
+	 * where the authentication is. Reaching the SSH server at all means
+	 * completing a WireGuard handshake keyed to an address the sender had to
+	 * be given, and `--allow` can narrow that to named node keys. Demanding
+	 * an SSH key on top would mean every sender registering one in advance,
+	 * which is not something `scp` can do and not what upstream asks for.
+	 *
+	 * It is a separate flag rather than "an empty list means anyone" because
+	 * an empty list is what a misconfiguration looks like, and the two must
+	 * not be spelled the same way. Setting this is a decision; forgetting to
+	 * fill the list is an accident. */
+	bool any_key_authenticates;
+
 	tc_ssh_read_fn read;
 	tc_ssh_write_fn write;
 	void *io_ctx;

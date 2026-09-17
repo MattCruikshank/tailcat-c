@@ -83,10 +83,11 @@ widening the connection key from a port pair to a four-tuple.
 
 **Still out of scope**, in descending order of how much it would take:
 
-- **The CLI surface for `recv` and `serve ssh`.** Both servers are written
-  and driven by a real OpenSSH `scp` and `sftp`; what is missing is the
-  subcommand that points them at a directory. `ls` additionally needs an
-  SFTP *client*, which is a separate choice -- see PLAN.md 5.5.
+- **`ls`**, which is the last of upstream's command set missing. It needs an
+  SFTP *client* rather than a server, and that is a choice rather than a
+  gap -- see PLAN.md 5.5. `serve ssh` as a general shell server is
+  deliberately not planned: `recv` serves sftp and nothing else, and a drop
+  box that can run commands is not a drop box.
 - The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
   this means a second toolchain and a second build of everything — arguably
   against the premise of a project whose whole point is one fat APE.
@@ -171,8 +172,8 @@ direct peer-to-peer paths.
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ❌ | ✅ (in-process SFTP client) |
-| SSH *server* (`serve ssh`) | transport and SFTP done, not yet a subcommand | ✅ |
-| `recv` (file drop box, receiving) | server done, not yet a subcommand | ✅ |
+| SSH *server* (`serve ssh`) | serves sftp for `recv`; no shell, no PTY | ✅ |
+| `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
 | `browse`, `readme` | ❌ (not worth writing) | ✅ |
@@ -282,6 +283,7 @@ $ tailcat-c parse <tc-address>             # describe an address
 $ tailcat-c netcheck                       # UDP, NAT type, relay latency
 $ tailcat-c serve exit-node,22             # forward anywhere this machine can reach
 $ tailcat-c forward <addr> 13306:192.168.1.10:3306
+$ tailcat-c recv ~/inbox                   # receive files; senders name nothing
 $ tailcat-c serve --allow nodekey:...      # only that client may connect
 $ tailcat-c socks <addr> 1080             # CONNECT and UDP ASSOCIATE
 ```
@@ -856,6 +858,22 @@ This is the clearest case yet for the project's own rule about anchors. The
 packet layer's vectors were produced by Go written from the same OpenSSH
 document as the C, so both sides could be -- and in this respect both were --
 wrong in the same way. Only a peer written from neither could tell.
+
+**25. `recv` refused every connection it existed to accept.** *(Found by
+the first run over a real tunnel.)* Connections are admitted by an accept
+filter that consults the served port set, and `recv` serves no local ports at
+all -- so the SYN for port 22, where its own SSH server listens, was refused
+before the accept loop that would have recognised it. The feature could not
+work at all, and everything it is built from was passing.
+
+Nothing offline could have found it. The SFTP policy, the SSH server and the
+drop box are each driven by a real OpenSSH over a socket, and all of that was
+green; the filter only exists on the tunnel path, and a tunnel needs a relay.
+It took one deliberate live run, which is what live-recv-serve now is.
+
+The shape is worth noting: every component was tested and the wiring between
+two of them was not, because the wiring is the part that only exists in the
+whole. That is the same reason `make live-cli` exists at all.
 
 **24. Bug 7, reintroduced in a new file four years later.** *(Phase 5.5,
 found by the drop box working under host gcc and failing under cosmocc.)*

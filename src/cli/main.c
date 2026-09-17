@@ -26,6 +26,7 @@
 
 #include "tc/addr.h"
 #include "tc/allowlist.h"
+#include "tc/dropbox.h"
 #include "tc/crypto.h"
 #include "tc/derp.h"
 #include "tc/derpmap.h"
@@ -102,6 +103,10 @@ static void usage(FILE *f)
 	        "22,80,8000-8999 or all;\n"
 	        "                                          add exit-node to "
 	        "forward anywhere this machine can reach\n"
+	        "  tailcat-c recv <dir>                    receive files into "
+	        "<dir>; the sender picks\n"
+	        "                                          no names, overwrites "
+	        "nothing, reads nothing\n"
 	        "  tailcat-c forward <tc-addr> <maps>      forward local ports, "
 	        "e.g. 8080, 18080:8080,\n"
 	        "                                          or "
@@ -1216,11 +1221,6 @@ static int dial_localhost(uint16_t port)
 	return -1;
 }
 
-static bool port_is_served(void *ctx, uint16_t port)
-{
-	return tc_portset_has((const tc_portset *)ctx, port);
-}
-
 /* The one-shot pipe answers on whatever port the client dialled, which is
  * what upstream's argument-free server does. */
 static bool accept_any_port(void *ctx, uint16_t port)
@@ -1289,7 +1289,45 @@ typedef struct {
 	uint8_t disco_priv[32], disco_pub[32];
 	tc_endpoint local[TC_PATH_MAX_LOCAL];
 	size_t num_local;
+
+	/* Set by `recv <dir>`: where uploads land, and the host identity the SSH
+	 * server presents. NULL means this is an ordinary `serve`. */
+	const char *recv_dir;
+	uint8_t ssh_host_seed[32];
+
+	/* One SSH session at a time. The session's own read callback drives the
+	 * serve loop, which is where connections are accepted -- so without this
+	 * a second connection would start a second session inside the first, and
+	 * the recursion would be bounded only by the stack. A drop box taking one
+	 * file at a time is a limit worth having anyway. */
+	bool in_ssh;
 } serve_state;
+
+/* port_is_served decides which ports a client may open a connection to.
+ *
+ * It is an accept filter rather than a listener list because `all` is 65,535
+ * ports and a listener array holds sixteen.
+ *
+ * `recv` is why this takes the whole state rather than just the port set: it
+ * serves SSH on port 22 and no local ports at all, so with an empty set every
+ * SYN was refused here -- before the accept loop that would have recognised
+ * it. The refusal was correct for every port but the one the feature needs. */
+static bool port_is_served(void *ctx, uint16_t port)
+{
+	const serve_state *st = (const serve_state *)ctx;
+	if (st->recv_dir != NULL && port == 22)
+		return true;
+	return st->ports != NULL && tc_portset_has(st->ports, port);
+}
+
+/* UDP does not get the port 22 exception: SSH is a stream protocol, and a
+ * datagram to that port would be a binding to a local service that is not
+ * there. */
+static bool udp_port_is_served(void *ctx, uint16_t port)
+{
+	const serve_state *st = (const serve_state *)ctx;
+	return st->ports != NULL && tc_portset_has(st->ports, port);
+}
 
 static size_t client_count(const serve_state *st)
 {
@@ -1366,14 +1404,12 @@ static serve_client *add_client(serve_state *st, const uint8_t key[32],
 		memset(sc, 0, sizeof *sc);
 		return NULL;
 	}
-	tc_tcp_mux_set_accept_filter(sc->mux, port_is_served,
-	                             (void *)(uintptr_t)st->ports);
+	tc_tcp_mux_set_accept_filter(sc->mux, port_is_served, st);
 	tc_tcp_mux_set_exit_node(sc->mux, st->exit_node);
 	/* The same two decisions for datagrams. Without the filter the mux has
 	 * no listeners at all and drops everything addressed to us, which looks
 	 * exactly like a tunnel that is not carrying UDP. */
-	tc_udp_mux_set_accept_filter(sc->umux, port_is_served,
-	                             (void *)(uintptr_t)st->ports);
+	tc_udp_mux_set_accept_filter(sc->umux, udp_port_is_served, st);
 	tc_udp_mux_set_exit_node(sc->umux, st->exit_node);
 
 	if (st->have_udp)
@@ -1709,12 +1745,163 @@ static void expire_idle(serve_state *st, uint64_t now)
  * had a chance to notice they closed and let go. Reaping the muxes first --
  * the obvious place, at the top -- is a use-after-free that only appears when
  * a peer hangs up at the wrong moment. */
-static int run_serve_multi(serve_state *st, uint64_t deadline)
+/* ---- `recv`: an SSH drop box over the tunnel -------------------------- */
+
+static int serve_pump_once(serve_state *st, uint64_t deadline);
+
+typedef struct {
+	serve_state *st;
+	serve_client *sc;
+	tc_tcp_conn *conn;
+	uint64_t deadline;
+} recv_io;
+
+/* conn_alive re-finds the connection after a pump.
+ *
+ * The pump reaps closed connections, so a pointer held across it can be
+ * freed under us -- and a read from a freed tc_tcp_conn is the same bug as
+ * number 11, which ASan did not catch then either because the pointer was
+ * compared rather than dereferenced. Checking is cheap; there is one
+ * connection. */
+static bool conn_alive(const recv_io *io)
+{
+	for (size_t i = 0, n = tc_tcp_mux_count(io->sc->mux); i < n; i++)
+		if (tc_tcp_mux_at(io->sc->mux, i) == io->conn)
+			return true;
+	return false;
+}
+
+/* recv_read blocks until the tunnel delivers something.
+ *
+ * "Blocks" means "runs the serve loop", because the bytes it is waiting for
+ * arrive through that loop: the relay read, the WireGuard decrypt and the TCP
+ * reassembly all happen there. A read that simply waited would wait for ever
+ * on a connection only it could advance. */
+static int recv_read(void *ctx, uint8_t *buf, size_t cap, size_t *nread)
+{
+	recv_io *io = (recv_io *)ctx;
+	for (;;) {
+		if (!conn_alive(io))
+			return TC_ERR_CLOSED;
+		size_t got = 0;
+		if (tc_tcp_read(io->conn, buf, cap, &got) == TC_OK && got > 0) {
+			*nread = got;
+			return TC_OK;
+		}
+		if (tc_tcp_read_closed(io->conn))
+			return TC_ERR_CLOSED;
+		if (now_ms() > io->deadline)
+			return TC_ERR_TIMEOUT;
+		if (serve_pump_once(io->st, io->deadline) != 0)
+			return TC_ERR_CLOSED;
+	}
+}
+
+static int recv_write(void *ctx, const uint8_t *buf, size_t len)
+{
+	recv_io *io = (recv_io *)ctx;
+	size_t off = 0;
+	while (off < len) {
+		if (!conn_alive(io))
+			return TC_ERR_CLOSED;
+		size_t wrote = 0;
+		int rc = tc_tcp_write(io->conn, buf + off, len - off, &wrote,
+		                      now_ms());
+		if (rc != TC_OK && rc != TC_ERR_AGAIN)
+			return rc;
+		off += wrote;
+		if (off == len)
+			break;
+		/* The send buffer is full, so the only way on is to let the loop
+		 * drain it into the tunnel. */
+		if (now_ms() > io->deadline)
+			return TC_ERR_TIMEOUT;
+		if (serve_pump_once(io->st, io->deadline) != 0)
+			return TC_ERR_CLOSED;
+	}
+	return TC_OK;
+}
+
+static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
+                         const char *arg)
+{
+	serve_state *st = (serve_state *)ctx;
+
+	/* Only sftp. An exec would be a shell on the serving machine, which is
+	 * the one thing a drop box must never become. */
+	if (type != TC_SSH_REQ_SUBSYSTEM || strcmp(arg, "sftp") != 0) {
+		vlogf("recv: refused a request for %s", arg);
+		return TC_ERR_UNSUPPORTED;
+	}
+
+	tc_dropbox db;
+	int rc = tc_dropbox_open(&db, st->recv_dir);
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s is not a usable directory\n",
+		        st->recv_dir);
+		return rc;
+	}
+	rc = tc_dropbox_serve(&db, s);
+	if (db.files > 0)
+		fprintf(stderr, "received %u file%s, %llu bytes\n", db.files,
+		        db.files == 1 ? "" : "s", (unsigned long long)db.bytes);
+	return rc;
+}
+
+/* run_recv_session serves one SSH connection from the tunnel. */
+static void run_recv_session(serve_state *st, serve_client *sc,
+                             tc_tcp_conn *conn, uint64_t deadline)
+{
+	recv_io io;
+	io.st = st;
+	io.sc = sc;
+	io.conn = conn;
+	io.deadline = deadline;
+
+	tc_ssh_server_opts opts;
+	memset(&opts, 0, sizeof opts);
+	opts.host_seed = st->ssh_host_seed;
+	/* The tunnel is the authentication. See tc/sshserver.h: reaching this
+	 * point took a WireGuard handshake keyed to an address the sender had to
+	 * be given, and `--allow` can narrow that further. */
+	opts.any_key_authenticates = true;
+	opts.read = recv_read;
+	opts.write = recv_write;
+	opts.io_ctx = &io;
+	opts.on_start = recv_on_start;
+	opts.app_ctx = st;
+
+	st->in_ssh = true;
+	int rc = tc_ssh_server_run(&opts);
+	st->in_ssh = false;
+
+	if (rc != TC_OK && rc != TC_ERR_CLOSED && rc != TC_ERR_DONE)
+		vlogf("recv: session ended: %s", tc_strerror(rc));
+	if (conn_alive(&io))
+		tc_tcp_mux_close(sc->mux, conn, now_ms());
+}
+
+/* serve_pump_once runs one turn of the serve loop: relay reads, timers,
+ * proxying, and one poll if there is nothing else to do.
+ *
+ * Split out of run_serve_multi so that something other than the loop can
+ * drive it. The SSH server is a blocking state machine -- it reads until it
+ * has a packet -- and the bytes it is waiting for arrive through this loop,
+ * so "block" has to mean "keep the tunnel running until they turn up".
+ * Its read and write callbacks call this.
+ *
+ * The body is wrapped in `do { } while (0)` rather than rewritten. Every
+ * `continue` in it meant "this turn is finished, go round again", and that
+ * is exactly what a `continue` does inside a do-while whose condition is
+ * false. Rewriting twenty of them into returns by hand is a change that
+ * works nineteen times.
+ *
+ * Returns 0 to keep going and non-zero when the session cannot continue. */
+static int serve_pump_once(serve_state *st, uint64_t deadline)
 {
 	tc_derp_client *derp = st->derp;
-	tc_derp_set_read_timeout(derp, 20);
-
-	while (now_ms() < deadline) {
+	(void)derp;
+	do {
 		uint64_t t = now_ms();
 		serve_service_udp(st);
 
@@ -1758,6 +1945,22 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 				tc_tcp_local_addr(c, want);
 				uint8_t ours[TC_TUNNEL_ADDR_LEN];
 				tc_tunnel_addr_for_key(ours, st->me.public_key);
+
+				/* `recv` puts an SSH server on port 22 of our own
+				 * tunnel address, which is where `cp` and `scp` look for
+				 * one. Everything else on our address is still a local
+				 * service, so `recv` and `serve <ports>` compose. */
+				if (st->recv_dir != NULL && port == 22 &&
+				    memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
+					if (st->in_ssh) {
+						vlogf("recv: already serving a session; refusing");
+						tc_tcp_mux_close(sc->mux, c, t);
+						continue;
+					}
+					vlogf("recv: an SSH session began");
+					run_recv_session(st, sc, c, deadline);
+					continue;
+				}
 
 				int fd;
 				if (memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
@@ -1909,6 +2112,19 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 		if (inner_len == 0)
 			continue;
 		deliver_inner(sc->mux, sc->umux, inner, inner_len);
+	} while (0);
+	return 0;
+}
+
+static int run_serve_multi(serve_state *st, uint64_t deadline)
+{
+	tc_derp_client *derp = st->derp;
+	tc_derp_set_read_timeout(derp, 20);
+
+	while (now_ms() < deadline) {
+		int rc = serve_pump_once(st, deadline);
+		if (rc != 0)
+			return rc;
 	}
 	return 0;
 }
@@ -3698,7 +3914,7 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      bool insecure, unsigned timeout_s,
                      const char *derpmap_url, const char *key_spec,
                      bool full_address, bool exit_node,
-                     const tc_allowlist *allow)
+                     const tc_allowlist *allow, const char *recv_dir)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -3845,6 +4061,26 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		memcpy(st.psk, ci.preshared_key, sizeof st.psk);
 		st.ports = ports;
 		st.exit_node = exit_node;
+		st.recv_dir = recv_dir;
+		if (recv_dir != NULL) {
+			/* The SSH host key is derived from the tunnel identity rather
+			 * than generated, so it is the same on every run for as long as
+			 * the address is. A host key that changed per run would make
+			 * every client that does pin one complain, and `genkey` exists
+			 * precisely so the address stops changing.
+			 *
+			 * Derived rather than reused: the same private key must not be
+			 * both a WireGuard static and an SSH host key, because the two
+			 * protocols sign different things with it and nobody has
+			 * analysed the combination. */
+			tc_blake2s(st.ssh_host_seed, sizeof st.ssh_host_seed,
+			           "tailcat-c ssh host key v1", 25, me.private_key,
+			           sizeof me.private_key);
+			fprintf(stderr, "# receiving files into %s\n", recv_dir);
+			fprintf(stderr, "# the sender chooses nothing: names are ours, "
+			                "nothing is overwritten, nothing can be read "
+			                "back\n");
+		}
 		if (allow != NULL)
 			st.allow = *allow;
 		if (exit_node)
@@ -4180,7 +4416,7 @@ int main(int argc, char **argv)
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
-			                 key_spec, full_address, false, &allow);
+			                 key_spec, full_address, false, &allow, NULL);
 		}
 
 		static tc_portset ports;
@@ -4214,7 +4450,29 @@ int main(int argc, char **argv)
 		}
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
-		                 key_spec, full_address, exit_node, &allow);
+		                 key_spec, full_address, exit_node, &allow, NULL);
+	}
+	if (strcmp(args[0], "recv") == 0) {
+		if (nargs < 2) {
+			fprintf(stderr, "tailcat-c: recv needs a directory\n");
+			return 2;
+		}
+		/* The directory must already exist. Creating it would mean guessing
+		 * where the user meant, and a typo would silently make a drop box
+		 * nobody is watching. */
+		struct stat dirst;
+		if (stat(args[1], &dirst) != 0 || !S_ISDIR(dirst.st_mode)) {
+			fprintf(stderr, "tailcat-c: %s is not a directory\n", args[1]);
+			return 2;
+		}
+		/* An empty port set: `recv` serves SSH on port 22 of the tunnel and
+		 * nothing else. A client asking for any other port gets a reset,
+		 * which is what it should get -- there is no local service here. */
+		static tc_portset no_ports;
+		tc_portset_clear(&no_ports);
+		return cmd_serve(relay, &no_ports, insecure,
+		                 timeout_given ? timeout_s : 0, derpmap_url, key_spec,
+		                 full_address, false, &allow, args[1]);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

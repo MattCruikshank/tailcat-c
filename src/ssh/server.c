@@ -506,7 +506,7 @@ static int do_auth(tc_ssh_server *s)
 		/* The query form: the client is asking whether this key is worth
 		 * signing with. Answering PK_OK authenticates nobody. */
 		if (req.method == TC_SSH_AUTH_METHOD_PUBLICKEY && !req.has_signature) {
-			bool known = false;
+			bool known = s->opts->any_key_authenticates;
 			for (size_t i = 0; i < s->opts->num_authorized; i++)
 				if (tc_ct_equal(s->opts->authorized +
 				                    i * TC_SSH_ED25519_PUB_LEN,
@@ -525,8 +525,18 @@ static int do_auth(tc_ssh_server *s)
 			continue;
 		}
 
-		if (tc_ssh_auth_check(&req, s->session_id, s->opts->authorized,
-		                      s->opts->num_authorized) == TC_OK) {
+		/* With any_key_authenticates the key still has to prove itself: the
+		 * signature is checked against the key the client named, over this
+		 * session's id. What is skipped is only the question of whether that
+		 * key is on a list, which something below this layer has already
+		 * answered. An unsigned request never gets here. */
+		bool ok = s->opts->any_key_authenticates
+		              ? tc_ssh_auth_check(&req, s->session_id, req.pubkey, 1) ==
+		                    TC_OK
+		              : tc_ssh_auth_check(&req, s->session_id,
+		                                  s->opts->authorized,
+		                                  s->opts->num_authorized) == TC_OK;
+		if (ok) {
 			rc = tc_ssh_auth_success_build(buf, sizeof buf, &buf_len);
 			if (rc != TC_OK)
 				return rc;
