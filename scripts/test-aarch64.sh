@@ -39,7 +39,12 @@ test-aarch64: no qemu-aarch64 found, so the aarch64 half stayed untested.
 Nothing else is needed: cosmocc already emits a plain aarch64 ELF beside
 each binary, so there is no APE loader or binfmt registration involved.
 EOF
-	exit 2
+	# 77 is automake's "skipped", and it is for whoever runs this
+	# script by hand -- the diagnostic harness never sees it. Every
+	# stage reaches this through make, and make flattens any recipe
+	# failure to exit 2, so no exit code survives to mean anything
+	# specific. The harness decides separately, with --need.
+	exit 77
 fi
 echo "using $QEMU"
 

@@ -22,7 +22,14 @@ done
 
 tmp=$(mktemp -d)
 cleanup() {
-	[ -n "${srv_pid:-}" ] && kill "$srv_pid" 2>/dev/null
+	# `[ -n x ] && kill` is an AND-list, and an AND-list that ends
+	# non-zero -- which it does whenever the server has already
+	# exited -- trips `set -e` here inside the trap, so the rm
+	# below never ran and the script exited 1 with every check
+	# passed. Cleanup is the one path that must not stop early.
+	if [ -n "${srv_pid:-}" ]; then
+		kill "$srv_pid" 2>/dev/null || true
+	fi
 	rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM

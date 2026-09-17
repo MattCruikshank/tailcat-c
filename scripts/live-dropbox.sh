@@ -22,12 +22,24 @@ if [ ! -x "$SSHD" ]; then
 fi
 if ! command -v scp > /dev/null 2>&1 || ! command -v sftp > /dev/null 2>&1; then
 	echo "live-dropbox: scp and sftp are needed (apt install openssh-client)" >&2
-	exit 2
+	# 77 is automake's "skipped", and it is for whoever runs this
+	# script by hand -- the diagnostic harness never sees it. Every
+	# stage reaches this through make, and make flattens any recipe
+	# failure to exit 2, so no exit code survives to mean anything
+	# specific. The harness decides separately, with --need.
+	exit 77
 fi
 
 tmp=$(mktemp -d)
 cleanup() {
-	[ -n "${srv_pid:-}" ] && kill "$srv_pid" 2>/dev/null
+	# `[ -n x ] && kill` is an AND-list, and an AND-list that ends
+	# non-zero -- which it does whenever the server has already
+	# exited -- trips `set -e` here inside the trap, so the rm
+	# below never ran and the script exited 1 with every check
+	# passed. Cleanup is the one path that must not stop early.
+	if [ -n "${srv_pid:-}" ]; then
+		kill "$srv_pid" 2>/dev/null || true
+	fi
 	rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM
