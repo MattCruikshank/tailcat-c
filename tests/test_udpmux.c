@@ -584,6 +584,127 @@ static void test_queue(void)
 	tc_udp_mux_free(rx);
 }
 
+/* ---- acting as an exit node --------------------------------------------- */
+
+static void ep6(tc_endpoint *e, const char *text, uint16_t port)
+{
+	memset(e, 0, sizeof *e);
+	inet_pton(AF_INET6, text, e->ip);
+	e->ip_len = 16;
+	e->port = port;
+}
+
+static void test_udp_exit_node(void)
+{
+	tc_udp_mux *cl = tc_udp_mux_new(kLocal, kRemote, capture, NULL);
+	tc_udp_mux *srv = tc_udp_mux_new(kRemote, kLocal, capture, NULL);
+
+	tc_endpoint beyond;
+	ep6(&beyond, "2001:db8::10", 53);
+
+	TCT_CASE("a datagram addressed beyond the peer is dropped by default");
+	/* Worse than the TCP case, if anything: there is no handshake, so one
+	 * forged datagram is a complete request, and plenty of UDP services will
+	 * act on a single one. */
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 49152, &beyond, "query", 5, 1000),
+	           TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv, g_sent, g_sent_len, 1000), TC_ERR_INVAL);
+
+	TCT_CASE("with exit-node on, it arrives and names its destination");
+	tc_udp_mux_set_exit_node(srv, true);
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 49152, &beyond, "query", 5, 1000),
+	           TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv, g_sent, g_sent_len, 1000), TC_OK);
+
+	tc_udp_addrs a;
+	uint8_t got[64];
+	size_t n = 0;
+	TCT_EQ_INT(tc_udp_mux_recv_addrs(srv, &a, got, sizeof got, &n), TC_OK);
+	TCT_EQ_INT((int)n, 5);
+	TCT_TRUE(memcmp(got, "query", 5) == 0);
+	TCT_EQ_INT(a.remote_port, 49152);
+	TCT_EQ_INT(a.dst.ip_len, 16);
+	TCT_EQ_INT(a.dst.port, 53);
+	char where[80];
+	TCT_EQ_INT(tc_endpoint_format(where, sizeof where, &a.dst), TC_OK);
+	TCT_EQ_STR(where, "[2001:db8::10]:53");
+
+	TCT_CASE("and needs no listener, because the port is not ours");
+	/* Nothing called tc_udp_mux_listen on 53. An exit node's ports belong to
+	 * the destinations its peer names. */
+	tc_udp_mux_stats st;
+	tc_udp_mux_get_stats(srv, &st);
+	TCT_EQ_INT((int)st.dropped_no_listener, 0);
+
+	TCT_CASE("a datagram addressed to us still needs one");
+	/* Turning exit-node mode on must not quietly open every port on the
+	 * node itself. */
+	TCT_EQ_INT(tc_udp_mux_send(cl, 49152, 9999, "hi", 2, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv, g_sent, g_sent_len, 1000), TC_ERR_INVAL);
+	tc_udp_mux_get_stats(srv, &st);
+	TCT_EQ_INT((int)st.dropped_no_listener, 1);
+
+	TCT_CASE("a datagram to us reports no destination, which is the signal");
+	/* ip_len 0 is how a caller tells "for me" from "forward this" without a
+	 * separate flag to forget to set. */
+	TCT_EQ_INT(tc_udp_mux_listen(srv, 9999), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_send(cl, 49152, 9999, "hi", 2, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv, g_sent, g_sent_len, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_recv_addrs(srv, &a, got, sizeof got, &n), TC_OK);
+	TCT_EQ_INT(a.dst.ip_len, 0);
+	TCT_EQ_INT(a.local_port, 9999);
+
+	TCT_CASE("the checksum covers the destination, not our own address");
+	/* send_to must checksum against where it is going. A datagram summed
+	 * against the peer's address instead would be discarded by anything that
+	 * checks -- which, over IPv6, is everything. */
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 49152, &beyond, "x", 1, 1000), TC_OK);
+	uint8_t pkt[2048];
+	size_t plen = g_sent_len;
+	memcpy(pkt, g_sent, plen);
+	TCT_EQ_MEM(pkt + 24, beyond.ip, 16);
+	/* Verified the way a receiver would: summing the datagram with its own
+	 * checksum in place yields zero. */
+	TCT_EQ_INT(tc_udp_mux_input(srv, pkt, plen, 1000), TC_OK);
+
+	TCT_CASE("two destinations on one port pair stay apart");
+	/* The same hazard tcpmux had, and UDP cannot rely on a connection to
+	 * keep them separate -- the destination has to travel with each
+	 * datagram, which is why recv reports it. */
+	tc_endpoint other;
+	ep6(&other, "2001:db8::11", 53);
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 49152, &beyond, "one", 3, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv, g_sent, g_sent_len, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 49152, &other, "two", 3, 1000), TC_OK);
+	TCT_EQ_INT(tc_udp_mux_input(srv, g_sent, g_sent_len, 1000), TC_OK);
+
+	while (tc_udp_mux_recv_addrs(srv, &a, got, sizeof got, &n) == TC_OK) {
+		if (n == 3 && memcmp(got, "one", 3) == 0)
+			TCT_TRUE(tc_endpoint_equal(&a.dst, &beyond));
+		else if (n == 3 && memcmp(got, "two", 3) == 0)
+			TCT_TRUE(tc_endpoint_equal(&a.dst, &other));
+	}
+
+	TCT_CASE("null arguments");
+	TCT_EQ_INT(tc_udp_mux_send_to(NULL, 1, &beyond, "x", 1, 0), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 1, NULL, "x", 1, 0), TC_ERR_INVAL);
+	tc_endpoint v4;
+	memset(&v4, 0, sizeof v4);
+	v4.ip_len = 4;
+	v4.port = 53;
+	/* An IPv4 destination has to be wrapped first; the tunnel carries only
+	 * IPv6, and accepting a four-byte address here would mean guessing. */
+	TCT_EQ_INT(tc_udp_mux_send_to(cl, 1, &v4, "x", 1, 0), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_udp_mux_recv_addrs(cl, NULL, got, sizeof got, &n),
+	           TC_ERR_INVAL);
+	TCT_EQ_INT(tc_udp_mux_recv_addrs(NULL, &a, got, sizeof got, &n),
+	           TC_ERR_INVAL);
+	tc_udp_mux_set_exit_node(NULL, true);
+
+	tc_udp_mux_free(cl);
+	tc_udp_mux_free(srv);
+}
+
 static void test_sizes_and_api(void)
 {
 	tc_udp_mux *m = tc_udp_mux_new(kLocal, kRemote, capture, NULL);
@@ -646,6 +767,7 @@ int main(void)
 	test_listeners();
 	test_bindings();
 	test_queue();
+	test_udp_exit_node();
 	test_sizes_and_api();
 	return tct_report("udpmux");
 }

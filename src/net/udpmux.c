@@ -30,6 +30,7 @@ static void touch(binding *b, uint64_t now_ms)
 typedef struct {
 	uint16_t local_port;
 	uint16_t remote_port;
+	tc_endpoint dst; /* ip_len 0 when it was addressed to us */
 	size_t len;
 	uint8_t data[TC_UDP_MAX_DGRAM];
 } queued;
@@ -47,6 +48,7 @@ struct tc_udp_mux {
 
 	binding bindings[TC_UDPMUX_MAX_BINDINGS];
 	uint16_t next_ephemeral;
+	bool exit_node;
 
 	/* A ring, so taking the oldest is not a memmove of the whole queue. */
 	queued q[TC_UDPMUX_QUEUE];
@@ -274,8 +276,16 @@ void tc_udp_mux_tick(tc_udp_mux *m, uint64_t now_ms)
 
 /* ---- sending ----------------------------------------------------------- */
 
-int tc_udp_mux_send(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
-                    const void *data, size_t len, uint64_t now_ms)
+void tc_udp_mux_set_exit_node(tc_udp_mux *m, bool on)
+{
+	if (m != NULL)
+		m->exit_node = on;
+}
+
+/* send_one builds and transmits one datagram to an explicit destination. */
+static int send_one(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
+                    const uint8_t dst_ip[TC_IPV6_ADDR_LEN], const void *data,
+                    size_t len, uint64_t now_ms)
 {
 	if (m == NULL || (data == NULL && len > 0))
 		return TC_ERR_INVAL;
@@ -293,7 +303,7 @@ int tc_udp_mux_send(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
 	pkt[6] = 17; /* next header: UDP */
 	pkt[7] = 64; /* hop limit */
 	memcpy(pkt + 8, m->local_ip, TC_IPV6_ADDR_LEN);
-	memcpy(pkt + 24, m->remote_ip, TC_IPV6_ADDR_LEN);
+	memcpy(pkt + 24, dst_ip, TC_IPV6_ADDR_LEN);
 
 	uint8_t *uh = pkt + TC_IPV6_HEADER_LEN;
 	wr16(uh + 0, local_port);
@@ -303,7 +313,7 @@ int tc_udp_mux_send(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
 	if (len != 0)
 		memcpy(uh + TC_UDP_HEADER_LEN, data, len);
 
-	uint16_t ck = udp_checksum(m->local_ip, m->remote_ip, uh, udp_len);
+	uint16_t ck = udp_checksum(m->local_ip, dst_ip, uh, udp_len);
 	/* Zero means "no checksum", which IPv6 does not allow. A computed zero
 	 * is therefore sent as 0xffff, which is the same value in ones-complement
 	 * arithmetic and so verifies identically. */
@@ -318,6 +328,24 @@ int tc_udp_mux_send(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
 	m->stats.dgrams_sent++;
 	m->stats.bytes_sent += len;
 	return m->out(m->out_ctx, pkt, TC_IPV6_HEADER_LEN + udp_len);
+}
+
+int tc_udp_mux_send(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
+                    const void *data, size_t len, uint64_t now_ms)
+{
+	if (m == NULL)
+		return TC_ERR_INVAL;
+	return send_one(m, local_port, remote_port, m->remote_ip, data, len,
+	                now_ms);
+}
+
+int tc_udp_mux_send_to(tc_udp_mux *m, uint16_t local_port,
+                       const tc_endpoint *dst, const void *data, size_t len,
+                       uint64_t now_ms)
+{
+	if (m == NULL || dst == NULL || dst->ip_len != 16)
+		return TC_ERR_INVAL;
+	return send_one(m, local_port, dst->port, dst->ip, data, len, now_ms);
 }
 
 /* ---- receiving --------------------------------------------------------- */
@@ -342,11 +370,19 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 		return TC_ERR_INVAL;
 	}
 
-	/* The addresses must be this tunnel's, in this direction. The tunnel is
-	 * point to point, so anything else is either a bug at the far end or an
-	 * attempt to have us treat one peer's traffic as another's. */
-	if (memcmp(pkt + 8, m->remote_ip, TC_IPV6_ADDR_LEN) != 0 ||
-	    memcmp(pkt + 24, m->local_ip, TC_IPV6_ADDR_LEN) != 0) {
+	/* The source must be our peer: this mux serves one tunnel, and a
+	 * datagram claiming another source is either a bug at the far end or an
+	 * attempt to have one peer's traffic treated as another's.
+	 *
+	 * The destination must be us, unless we are an exit node -- in which
+	 * case the peer may name somewhere else, and that address travels with
+	 * the datagram because UDP has no connection to hang it on. */
+	if (memcmp(pkt + 8, m->remote_ip, TC_IPV6_ADDR_LEN) != 0) {
+		m->stats.dropped_malformed++;
+		return TC_ERR_INVAL;
+	}
+	bool to_us = memcmp(pkt + 24, m->local_ip, TC_IPV6_ADDR_LEN) == 0;
+	if (!to_us && !m->exit_node) {
 		m->stats.dropped_malformed++;
 		return TC_ERR_INVAL;
 	}
@@ -395,8 +431,11 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 	 * flow we started. A datagram matching neither is unsolicited traffic on
 	 * a point-to-point tunnel and is dropped without an answer -- an ICMP
 	 * port-unreachable would make this a reflector. */
-	binding *b = find_binding(m, dst_port, src_port);
-	if (b == NULL && !listening(m, dst_port)) {
+	/* A datagram addressed beyond us needs no listener: the port belongs to
+	 * the destination the peer named, not to anything of ours. That is what
+	 * being an exit node means, and why it is off by default. */
+	binding *b = to_us ? find_binding(m, dst_port, src_port) : NULL;
+	if (to_us && b == NULL && !listening(m, dst_port)) {
 		m->stats.dropped_no_listener++;
 		return TC_ERR_INVAL;
 	}
@@ -418,6 +457,12 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 	queued *slot = &m->q[(m->q_head + m->q_count) % TC_UDPMUX_QUEUE];
 	slot->local_port = dst_port;
 	slot->remote_port = src_port;
+	memset(&slot->dst, 0, sizeof slot->dst);
+	if (!to_us) {
+		memcpy(slot->dst.ip, pkt + 24, TC_IPV6_ADDR_LEN);
+		slot->dst.ip_len = 16;
+		slot->dst.port = dst_port;
+	}
 	slot->len = data_len;
 	if (data_len != 0)
 		memcpy(slot->data, uh + TC_UDP_HEADER_LEN, data_len);
@@ -426,6 +471,19 @@ int tc_udp_mux_input(tc_udp_mux *m, const uint8_t *pkt, size_t len,
 	m->stats.dgrams_received++;
 	m->stats.bytes_received += data_len;
 	return TC_OK;
+}
+
+int tc_udp_mux_recv_addrs(tc_udp_mux *m, tc_udp_addrs *addrs, uint8_t *out,
+                          size_t cap, size_t *out_len)
+{
+	if (addrs == NULL)
+		return TC_ERR_INVAL;
+	memset(addrs, 0, sizeof *addrs);
+	if (m == NULL || m->q_count == 0)
+		return (m == NULL) ? TC_ERR_INVAL : TC_ERR_AGAIN;
+	addrs->dst = m->q[m->q_head].dst;
+	return tc_udp_mux_recv(m, &addrs->local_port, &addrs->remote_port, out,
+	                       cap, out_len);
 }
 
 int tc_udp_mux_recv(tc_udp_mux *m, uint16_t *local_port,

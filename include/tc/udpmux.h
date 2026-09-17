@@ -52,6 +52,7 @@
 #ifndef TC_UDPMUX_H_
 #define TC_UDPMUX_H_
 
+#include "tc/endpoint.h"
 #include "tc/tcp.h" /* for TC_IPV6_ADDR_LEN and TC_IPV6_HEADER_LEN */
 
 #define TC_UDP_HEADER_LEN 8
@@ -89,6 +90,18 @@
 #define TC_UDP_EPHEMERAL_HI 65535u
 
 typedef struct tc_udp_mux tc_udp_mux;
+
+/* Datagrams carry a destination as well as a port pair once a peer may
+ * address them beyond us. Unlike TCP there is no connection to hang that on,
+ * so it travels with each datagram. */
+typedef struct {
+	uint16_t local_port;
+	uint16_t remote_port;
+	/* Where the datagram was addressed. ip_len 0 means our own tunnel
+	 * address -- the ordinary case, and the only one without exit-node
+	 * mode. */
+	tc_endpoint dst;
+} tc_udp_addrs;
 
 /* Called with a complete IPv6 packet to transmit through the tunnel. */
 typedef int (*tc_udp_output_fn)(void *ctx, const uint8_t *ip_pkt, size_t len);
@@ -134,9 +147,37 @@ void tc_udp_mux_set_accept_filter(tc_udp_mux *m, tc_udp_accept_fn fn,
 int tc_udp_mux_bind(tc_udp_mux *m, uint16_t remote_port, uint64_t now_ms,
                     uint16_t *out_local_port);
 
-/* tc_udp_mux_send transmits one datagram. */
+/* tc_udp_mux_send transmits one datagram to the peer itself. */
 int tc_udp_mux_send(tc_udp_mux *m, uint16_t local_port, uint16_t remote_port,
                     const void *data, size_t len, uint64_t now_ms);
+
+/* tc_udp_mux_send_to transmits one addressed beyond the peer, which must be
+ * willing to act as an exit node for it.
+ *
+ * dst is an IPv6 address; an IPv4 destination travels inside one, see
+ * nat64.h. The port comes from dst, not from a separate argument, because a
+ * destination with the wrong port is a silent misdelivery rather than an
+ * error. */
+int tc_udp_mux_send_to(tc_udp_mux *m, uint16_t local_port,
+                       const tc_endpoint *dst, const void *data, size_t len,
+                       uint64_t now_ms);
+
+/* tc_udp_mux_set_exit_node decides whether datagrams addressed to somewhere
+ * other than our own tunnel address are accepted and reported.
+ *
+ * Off by default, for the reasons in tcpmux.h. UDP makes the exposure a
+ * little worse than TCP does: there is no handshake, so a single forged
+ * datagram is a complete request, and plenty of UDP services will act on
+ * one. */
+void tc_udp_mux_set_exit_node(tc_udp_mux *m, bool on);
+
+/* tc_udp_mux_recv_addrs is tc_udp_mux_recv with the destination as well.
+ *
+ * An exit node needs it: the destination is the only record of where the
+ * datagram was meant to go, and unlike TCP there is no connection holding
+ * onto it. */
+int tc_udp_mux_recv_addrs(tc_udp_mux *m, tc_udp_addrs *addrs, uint8_t *out,
+                          size_t cap, size_t *out_len);
 
 /* tc_udp_mux_input feeds one received IPv6 packet.
  *

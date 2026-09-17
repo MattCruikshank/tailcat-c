@@ -445,10 +445,17 @@ IPv6, where zero means "skip verification"; written that way it is caught. A
 mutation that survives is a gap in the tests, but a mutation that is *caught*
 is only useful if it was the right mutation.
 
-**Still to do:** wiring it to the CLI — `forward` and `serve` accepting UDP
-port specs, and a local UDP socket pumped in both directions. The tunnel
-plumbing (routing an arriving IP packet to the TCP or the UDP mux by its next
-header) is one branch, since `tc_udp_mux_is_udp` exists for it.
+`udpmux` also gained exit-node mode, symmetric with tcpmux's. Because UDP has
+no connection to hang a destination on, it travels with each datagram and
+`tc_udp_mux_recv_addrs` reports it. The exposure is slightly worse than TCP's
+and the header says so: there is no handshake, so one forged datagram is a
+complete request, and plenty of UDP services act on a single one.
+
+**Still to do:** nothing in the CLI originates UDP through the tunnel.
+Upstream's surface for that is **SOCKS5 UDP ASSOCIATE** (RFC 1928 §7) —
+`forward` is TCP-only upstream too — and our SOCKS implementation currently
+handles CONNECT only. That is the remaining piece: UDP ASSOCIATE, plus the
+server pumping datagrams to the destination each one names.
 
 ### 5.2 NAT64 and exit nodes ✅ · 830 lines
 
