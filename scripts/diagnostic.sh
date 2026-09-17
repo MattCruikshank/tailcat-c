@@ -157,6 +157,23 @@ if [ "$LEVEL" -eq 1 ]; then
 			exit 1
 		fi'
 
+	# src/usage_text.c is doc/usage.md turned into a C string literal, and is
+	# committed so that a build needs no Python. That makes it possible to
+	# edit the prose and ship the old text, which nothing else would notice:
+	# the generated file compiles either way. Unlike the CA bundle -- whose
+	# source is a download and so cannot be checked this way -- this one is a
+	# pure function of a file in the tree.
+	stage "the embedded usage text matches doc/usage.md" '
+		cp src/usage_text.c /tmp/usage.before &&
+		python3 scripts/gen-usage.py 2>/dev/null &&
+		if diff -q /tmp/usage.before src/usage_text.c >/dev/null; then
+			echo "    src/usage_text.c matches doc/usage.md"
+		else
+			cp /tmp/usage.before src/usage_text.c
+			echo "    src/usage_text.c is STALE -- run scripts/gen-usage.py and commit" >&2
+			exit 1
+		fi'
+
 	# Live interop. These dial Tailscale production relays and run a real
 	# tailcat, which is exactly why they are not in any faster level: a robot
 	# pointed at someone else'"'"'s infrastructure on every push is rude, and

@@ -101,8 +101,8 @@ widening the connection key from a port pair to a four-tuple.
 - **TLS 1.3**, which is blocked on something more interesting than effort;
   see [the note below](#tls-13-is-blocked-on-ed25519).
 
-`forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes and
-saved identities are all here.
+`forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes, saved
+identities and `readme` are all here.
 
 ## How it compares
 
@@ -116,8 +116,8 @@ keeps debug information in sibling files rather than in the executable.)
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **2.18 MB** | 17.70 MB |
-| gzipped | **1.09 MB** | 6.85 MB |
+| binary | **2.20 MB** | 17.70 MB |
+| gzipped | **1.10 MB** | 6.85 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
 The ratio is about 8×, and **most of it is the feature gap below, not
@@ -125,7 +125,7 @@ craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
 of the rest.
 
-Where our 2.18 MB actually goes, as `size` reports text+data on the x86_64
+Where our 2.20 MB actually goes, as `size` reports text+data on the x86_64
 objects — so these are code and initialised data, not file offsets, and they
 do not sum to the binary:
 
@@ -134,6 +134,7 @@ do not sum to the binary:
 | Mbed TLS | 249 KB |
 | **all of our own code** | **183 KB** |
 | the compiled-in CA bundle | 181 KB |
+| the embedded usage text (`readme`) | 4.5 KB |
 | Cosmopolitan libc, and two architectures of everything | the remainder |
 
 Everything we wrote — addresses, CBOR, JSON, crypto, DERP, WireGuard, TCP,
@@ -183,7 +184,8 @@ direct peer-to-peer paths.
 | `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
-| `browse`, `readme` | ❌ (not worth writing) | ✅ |
+| `readme` | ✅ (embeds doc/usage.md, not this file) | ✅ (embeds README.md) |
+| `browse` | ❌ (it is `forward 0:80` plus opening a URL) | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
@@ -198,9 +200,10 @@ forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and the SSH
 and SFTP subset behind `recv` and `ls`.
 
 What is left is the **browser build**, which Cosmopolitan cannot target, and
-two deliberate omissions: `serve ssh` as a general shell server, and
-upstream's read-write and recursive file modes. A drop box that can run
-commands is not a drop box.
+three deliberate omissions: `serve ssh` as a general shell server,
+upstream's read-write and recursive file modes, and `browse`, which is
+`forward 0:80` plus opening a URL. A drop box that can run commands is not a
+drop box.
 
 ## Build
 

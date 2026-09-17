@@ -94,4 +94,14 @@ void tc_tunnel_addr_for_key(uint8_t out[TC_TUNNEL_ADDR_LEN],
 int tc_tunnel_addr_format(char *out, size_t cap,
                           const uint8_t addr[TC_TUNNEL_ADDR_LEN]);
 
+
+/* tc_usage_text is what `tailcat-c readme` prints: a short usage document,
+ * generated from doc/usage.md by scripts/gen-usage.py.
+ *
+ * Deliberately not README.md, which upstream embeds for its equivalent
+ * command. Ours is an engineering log three times the size, and a user who
+ * types `readme` wants examples rather than an account of how the TCP stack
+ * was fuzzed. */
+extern const char tc_usage_text[];
+
 #endif /* TC_TAILCAT_H_ */

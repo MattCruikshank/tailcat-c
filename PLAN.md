@@ -787,6 +787,37 @@ the same 64 accepted connections at 20,000 iterations and at 200,000, and
 nothing was watching that number. Every harness now fails if it stops
 reaching the code it exists to exercise.
 
+### 5.9 `readme` ✅ · ~175 lines, mostly prose
+
+Skipped once as "not worth writing", which was half right and half a wrong
+reason. The command is four lines -- upstream is a `//go:embed README.md` and
+a write to stdout -- so effort was never the objection. What was missing was
+the *document*. Upstream's README.md is 30 KB of user documentation, so
+embedding it answers the question a user is asking. Ours is 83 KB of
+engineering log, and printing 1,400 lines about mutation testing to someone
+who typed `readme` would answer a question nobody asked, for four per cent of
+a binary whose size is a selling point.
+
+So `doc/usage.md` was written to be the thing worth embedding: examples,
+flags, and the three things a user can get wrong here -- that the address is a
+bearer credential, that `serve exit-node` reaches loopback, and that `ssh`
+turns off host key checking. `scripts/gen-usage.py` turns it into
+`src/usage_text.c`, the way `gen-ca-bundle.py` does for the certificate list.
+
+Two decisions inside it are worth keeping:
+
+- The generated file is committed, so a build needs no Python, but it is
+  **not** a prerequisite of the object file in the Makefile. A checkout sets
+  mtimes in whatever order it likes, and a build graph that can decide to
+  shell out to `python3` is one that breaks on a machine without it.
+  `make usage-text` regenerates by hand and level 1 fails if the two have
+  drifted, which is the same shape as the crypto and SSH vector checks.
+- The generator **refuses non-ASCII**. `doc/usage.md` was written with em
+  dashes, which is right for a Markdown file and wrong for something printed
+  to a terminal on six operating systems that do not agree about encoding.
+  Every other byte this program emits is ASCII; the check makes that true by
+  construction rather than by remembering.
+
 ---
 
 ## Cross-cutting
@@ -836,6 +867,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
+| 5.9 — `readme` and `doc/usage.md` | ~175 | ✅ done |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in
@@ -846,8 +878,9 @@ because the scope turned out to be "sftp over ssh" rather than "an ssh
 server". The one that was simply wrong was 3.5 (`recv`), estimated at ~300
 lines and actually a subset of 5.5.
 
-Source today is **25,436 lines** under `src/` plus 5,502 of headers, against
-**19,517** of tests and another 2,892 of shell for the live ones. Counting
+Source today is **25,611 lines** under `src/` plus 5,512 of headers, against
+**19,517** of tests and another 2,909 of shell for the live ones. (165 of
+that `src/` figure are generated: `doc/usage.md` as a C string literal.) Counting
 the live scripts as tests, which is what they are, that is roughly 22,000 of
 checking against 25,000 of implementation. The 1:1 ratio predicted at the
 start has held to within about ten per cent for the whole project, and the

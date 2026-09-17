@@ -133,6 +133,8 @@ static void usage(FILE *f)
 	        "  tailcat-c printpub                      the client key that "
 	        "would be used\n"
 	        "  tailcat-c version\n"
+	        "  tailcat-c readme                        usage, with "
+	        "examples\n"
 	        "\n"
 	        "flags:\n"
 	        "  -v, --verbose         report progress on stderr\n"
@@ -4952,6 +4954,14 @@ int main(int argc, char **argv)
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
 		                 key_spec, full_address, exit_node, &allow, NULL);
+	}
+	if (strcmp(args[0], "readme") == 0) {
+		/* Upstream embeds its own README.md here. Ours is an engineering log
+		 * three times the size, so doc/usage.md is embedded instead: a user
+		 * who types `readme` wants examples, not an account of how the TCP
+		 * stack was fuzzed. */
+		fputs(tc_usage_text, stdout);
+		return 0;
 	}
 	if (strcmp(args[0], "ls") == 0) {
 		if (nargs != 2) {
