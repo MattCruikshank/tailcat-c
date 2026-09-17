@@ -128,11 +128,19 @@ Restrict who may connect, by client node key:
     --full-address      embed the relay in the address, so clients need no map
     --bind ADDR         listen address for forward and socks (default 127.0.0.1)
     --open-browser      for forward: open a browser at the local listener
-    --timeout SEC       give up after SEC seconds (0 = never)
+    --timeout DUR       give up after DUR: seconds, or 30s, 2m, 1h30m
+                        (0 = never)
     --derpmap-url URL   where to fetch the relay list
     --insecure          skip TLS verification of the relay
     -v                  explain what is happening
     -p PORT             port for the pipe and ssh forms
+
+Flags take either spelling: --key default or --key=default.
+
+After `ssh` and `cp`, everything is handed to the real ssh and scp, so their
+flags are theirs: `tailcat-c ssh <tc-addr> ls -la` and `tailcat-c cp -r dir/
+<tc-addr>:` do what they look like. The exception is -p, which names a port
+on the tailcat server.
 
 
 ## What to be careful about

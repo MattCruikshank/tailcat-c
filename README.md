@@ -105,6 +105,11 @@ widening the connection key from a port pair to a four-tuple.
 `forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes, saved
 identities, `browse` and `readme` are all here.
 
+Every instruction in upstream's README has been typed at our binary and the
+result written down: [doc/upstream-readme.md](doc/upstream-readme.md). It is
+a sharper question than the feature table asks, and it found three bugs that
+the table would have called implemented.
+
 ## How it compares
 
 ### Size
@@ -117,8 +122,8 @@ keeps debug information in sibling files rather than in the executable.)
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **2.21 MB** | 17.70 MB |
-| gzipped | **1.10 MB** | 6.85 MB |
+| binary | **2.22 MB** | 17.70 MB |
+| gzipped | **1.11 MB** | 6.85 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
 The ratio is about 8×, and **most of it is the feature gap below, not
@@ -126,21 +131,21 @@ craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
 of the rest.
 
-Where our 2.21 MB actually goes, as `size` reports text+data on the x86_64
+Where our 2.22 MB actually goes, as `size` reports text+data on the x86_64
 objects — so these are code and initialised data, not file offsets, and they
 do not sum to the binary:
 
 | | |
 |---|---:|
 | Mbed TLS | 249 KB |
-| **all of our own code** | **187 KB** |
+| **all of our own code** | **189 KB** |
 | the compiled-in CA bundle | 181 KB |
-| the embedded usage text (`readme`) | 5.1 KB |
+| the embedded usage text (`readme`) | 5.3 KB |
 | Cosmopolitan libc, and two architectures of everything | the remainder |
 
 Everything we wrote — addresses, CBOR, JSON, crypto, DERP, WireGuard, TCP,
 UDP, STUN, disco, netcheck, path discovery, Ed25519, and an SSH and SFTP
-client and server — now comes to 187 KB. For most of this project's life
+client and server — now comes to 189 KB. For most of this project's life
 that number was smaller than the list of certificate authorities the binary
 ships with; the SSH subset added 42 KB and overtook it, and it now leads by
 six.
@@ -330,7 +335,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-36 test binaries, 9,979 assertions, under two toolchains and on both
+37 test binaries, 10,185 assertions, under two toolchains and on both
 architectures. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
@@ -1026,6 +1031,81 @@ built nothing. Every diagnostic level kept passing, because each of them
 names its targets. It was found by a number that refused to move: the binary
 was the same size after a change that should have grown it. The rule now
 sits below `all`, with a comment saying why it has to.
+
+
+**29. Nothing after the first non-zero stage in a diagnostic ever ran.**
+*(Found by running a level 1 diagnostic to the end, which had not happened
+before.)* `scripts/diagnostic.sh` runs under `set -e`, and `stage()` did
+`sh -c "$*"` followed by `rc=$?`. Under `set -e` the shell exits on the
+untested non-zero, so `rc` was never read: the FAIL branch, the SKIP branch
+and the summary at the bottom were all unreachable, and the comment promising
+that a stage "keeps going on failure so one broken thing does not hide the
+state of everything after it" described the opposite. Level 1 reached the
+qemu stage, found no emulator, and stopped — with twenty-four live interop
+stages, the only ones that prove interop, never run.
+
+**30. No exit code could mean "skipped".** *(Found by fixing 29 and watching
+what the newly-reachable SKIP branch reported.)* The convention was that exit
+2 meant "the tooling is not installed". Every stage is a `make` target, and
+make exits 2 for *any* recipe failure, so a script's "I have no scp" and "the
+test failed" arrive as the same byte. The live drop-box stage was failing and
+was reported as skipped: a green run with a broken test inside it, which is
+worse than the abort in 29. Moving the code to 77 does not help — make
+flattens that to 2 as well, which is worth checking rather than assuming. So
+the exit-code convention is gone; prerequisites are declared at the call site
+with `--need`, and anything non-zero is a failure.
+
+**31. Four cleanup traps aborted before cleaning up.** *(Found by 30, once a
+real failure could be seen.)* `[ -n "$pid" ] && kill "$pid"` is an AND-list,
+and it ends non-zero whenever the server has already exited — tripping
+`set -e` inside the EXIT trap, so the `rm -rf` after it never ran.
+`live-dropbox.sh` exited 1 with all six of its adversarial checks passed, and
+had leaked a temp directory on every run it had ever done; there were 31 in
+`/tmp`. Three sibling scripts carry the identical line and had been lucky.
+
+Bugs 29 and 31 are the same shell footgun in two places, and 30 is what made
+31 invisible. The harness now has a self-test: `sh scripts/diagnostic.sh
+selftest` runs synthetic stages through the real `stage()` and asserts
+nineteen things, including that exit 2 reports FAIL "because that is all make
+ever says". It runs at the start of every level, and deliberately not through
+`stage()` — if `stage()` is what is broken, a check routed through it cannot
+report.
+
+**32. `ssh` and `cp` never passed their tail through, and one way of failing
+was silent.** *(Phase 6, found by typing upstream's README at our binary.)*
+A comment in `src/cli/main.c` said those subcommands "take the tail of argv
+rather than the parsed list". They did not. So:
+
+- `tailcat-c ssh <addr> ls -la` died on `unknown flag -la`.
+- `tailcat-c cp -r photos/ <addr>:` died on `unknown flag -r` — an example in
+  our own usage text.
+- `tailcat-c ssh <addr> ls -l` **worked**, having quietly eaten the `-l` as
+  though it were the one belonging to our own `ls -l`. The remote command ran
+  without it and nothing said so.
+
+The third is the one worth remembering. The first two are an error message;
+the third is a wrong answer, and the user has no way to notice. Flag parsing
+now stops when the subcommand turns out to be `ssh` or `cp`, with `-p` the
+one exception, because upstream's `-p` is its own too.
+
+**33. `--timeout=2m` meant two seconds.** *(Phase 6, same walk.)* Upstream
+takes a Go duration; we took an integer through `strtoul`, which stops at the
+first character it does not understand and reports nothing. `--timeout=30s`
+became 30, which is right by accident and is why it survived; `--timeout=2m`
+became 2. The command still ran, it just gave up fifty-eight seconds early.
+There is now a parser in `src/duration.c` taking `ns`, `us`, `ms`, `s`, `m`
+and `h`
+and compounds of them, keeps a bare number meaning seconds, rounds up so a
+sub-second timeout cannot become zero — zero means "no deadline" to every
+caller here — and refuses everything else rather than reading a prefix.
+
+Its own tests found an overflow in it before it shipped: rounding with
+`(total + NS_PER_S - 1) / NS_PER_S` wraps for a total near the top of the
+range, and two nanosecond counts that each fit and together do not were
+accepted and returned 0. Dividing before rounding fixes it. Written down
+because the lesson is about the test, not the arithmetic: the case was in the
+file because "a sum that overflows only when added" is a thing to check, not
+because anyone suspected that line.
 
 
 The pattern is hard to miss: **four of the first six came from running the

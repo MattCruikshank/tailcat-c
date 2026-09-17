@@ -864,6 +864,46 @@ borrowing the environment. See the README: three of them survived because
 `xdg-open` implements the same `$BROWSER` convention we do, so a build that
 ignored ours still ran the recorder by a longer route.
 
+## Phase 6 — reading the documentation as a user would
+
+### 6.1 Walking upstream's README ✅ · ~450 lines, most of them tests
+
+Every instruction in upstream's README, typed at our binary, with the result
+written down in [doc/upstream-readme.md](doc/upstream-readme.md). The feature
+table already said what was implemented; this asked what a person *following
+the documentation* actually sees, which turns out to be a different question
+with a worse answer.
+
+Five things were wrong. Two were found by reading the argument parser while
+planning the walk, before running anything:
+
+- **`--flag=value` was not accepted anywhere.** Upstream's README is written
+  almost entirely in that spelling, so nearly every flag example produced
+  `unknown flag`.
+- **`parse` printed a table where upstream prints JSON**, so every `| jq`
+  in circulation worked against the real thing and not against ours. Now
+  byte-identical, pinned by `make parse-interop` over 500 generated
+  addresses.
+
+Three more came out of the walk itself, and are README bugs 32 and 33. The
+one worth carrying forward is that `ssh <addr> ls -l` *worked* while quietly
+dropping the `-l`, because our own `ls -l` flag was parsed before the
+subcommand was known. An error message is a bad outcome a user can see. A
+changed command is a bad outcome they cannot.
+
+What the walk confirms: the data plane, `serve` in every form, all the
+`forward` mapping shapes, `browse`, `socks`, exit nodes, the whole key
+workflow including the magic `default` key, and `parse`/`resolve` producing
+upstream's bytes exactly. Region names resolve to upstream's own numbers.
+
+One near-miss worth recording as method. Upstream's `ping` appeared to fail
+against our server -- `context deadline exceeded` -- which would have been a
+serious interop finding. It was the test's fault: a `serve` with no ports and
+the default ten-second timeout. Given ports and thirty seconds, upstream
+pings us in 5.61ms over a direct path. The rule that saved it is the same one
+bugs 7 and 8 taught: when an interop test fails, suspect the scaffolding
+first.
+
 ---
 
 ## Cross-cutting
@@ -929,6 +969,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
 | 5.9 — `readme` and `doc/usage.md` | ~175 | ✅ done |
 | 5.10 — `browse` and `--open-browser` | ~700 | ✅ done |
+| 6.1 — walking upstream’s README | ~450 | ✅ done |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in
@@ -939,8 +980,8 @@ because the scope turned out to be "sftp over ssh" rather than "an ssh
 server". The one that was simply wrong was 3.5 (`recv`), estimated at ~300
 lines and actually a subset of 5.5.
 
-Source today is **26,132 lines** under `src/` plus 5,644 of headers, against
-**19,995** of tests and another 3,095 of shell for the live ones. (177 of
+Source today is **26,629 lines** under `src/` plus 5,721 of headers, against
+**20,286** of tests and another 3,427 of shell for the live ones. (189 of
 that `src/` figure are generated: `doc/usage.md` as a C string literal.)
 Counting the live scripts as tests, which is what they are, that is roughly
 23,000 of checking against 26,000 of implementation. The 1:1 ratio predicted

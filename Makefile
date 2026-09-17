@@ -161,6 +161,7 @@ LIB_SRCS := \
 	src/portset.c \
 	src/fwdspec.c \
 	src/shquote.c \
+	src/duration.c \
 	src/browser.c \
 	src/keyfile.c \
 	src/json.c \

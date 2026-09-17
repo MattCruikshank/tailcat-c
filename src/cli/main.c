@@ -28,6 +28,7 @@
 #include "tc/allowlist.h"
 #include "tc/browser.h"
 #include "tc/dropbox.h"
+#include "tc/duration.h"
 #include "tc/sshclient.h"
 #include "tc/crypto.h"
 #include "tc/derp.h"
@@ -4953,19 +4954,55 @@ int main(int argc, char **argv)
 	 * arguments for us. Split it off before parsing anything, so a flag
 	 * meant for the child is never claimed here. */
 	const char *const *child_argv = NULL;
-	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--") == 0) {
-			if (i + 1 < argc)
-				child_argv = (const char *const *)&argv[i + 1];
-			argc = i;
-			break;
-		}
-	}
+	/* `ssh` and `cp` hand their tail to the real ssh and scp, so once one of
+	 * them is the subcommand this program stops reading the line as its own.
+	 *
+	 * This is what the comment below the loop has claimed since the day it
+	 * was written, and it was not true: the tail went through the parser
+	 * like everything else. `ssh <addr> ls -la` died on "unknown flag -la",
+	 * `cp -r` died on "unknown flag -r" -- which is an example in our own
+	 * usage text -- and worst of the three, `ssh <addr> ls -l` *worked*,
+	 * having quietly eaten the -l as though it were the one belonging to
+	 * `ls`. The command ran without it and nothing said so.
+	 *
+	 * -p stays ours after the subcommand, because upstream's is too:
+	 * `tailcat ssh [-p <port|ip:port>] [user@]<tc-addr> [<command> ...]`. It
+	 * names a port on the tailcat server, not on whatever ssh would dial. */
+	bool passthrough = false;
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		const char *inl = NULL;
 		char namebuf[64];
+
+		if (passthrough) {
+			/* -p is the one flag still ours out here. Everything else,
+			 * including `--`, is the far end's business. */
+			if (strcmp(a, "-p") == 0 && i + 1 < argc) {
+				ssh_port = argv[++i];
+				continue;
+			}
+			if (nargs >= sizeof args / sizeof args[0]) {
+				fprintf(stderr, "tailcat-c: too many arguments\n");
+				return 2;
+			}
+			args[nargs++] = a;
+			continue;
+		}
+
+		/* `--` ends our flags. For socks it also starts the child command,
+		 * which is the only subcommand that runs one. Handled here rather
+		 * than in a pass over argv beforehand, because which subcommand this
+		 * is has to be known first, and before this loop it is not. */
+		if (strcmp(a, "--") == 0) {
+			if (nargs >= 1 && strcmp(args[0], "socks") == 0) {
+				if (i + 1 < argc)
+					child_argv = (const char *const *)&argv[i + 1];
+				break;
+			}
+			passthrough = true;
+			continue;
+		}
 
 		/* --name=value as well as --name value. Upstream's ff library takes
 		 * both and its README is written almost entirely in the first form
@@ -5072,7 +5109,13 @@ int main(int argc, char **argv)
 			derpmap_url = val;
 		} else if (strcmp(a, "--timeout") == 0) {
 			NEED_VAL();
-			timeout_s = (unsigned)strtoul(val, NULL, 10);
+			if (tc_parse_duration_s(&timeout_s, val) != TC_OK) {
+				fprintf(stderr,
+				        "tailcat-c: --timeout wants seconds or a duration "
+				        "like 30s, 2m or 1h30m, not \"%s\"\n",
+				        val);
+				return 2;
+			}
 			timeout_given = true;
 		} else if (strcmp(a, "-l") == 0) {
 			/* `ls -l`. Flags are parsed before the subcommand is known, so a
@@ -5089,6 +5132,9 @@ int main(int argc, char **argv)
 			return 2;
 		} else if (nargs < sizeof args / sizeof args[0]) {
 			args[nargs++] = a;
+			if (nargs == 1 &&
+			    (strcmp(a, "ssh") == 0 || strcmp(a, "cp") == 0))
+				passthrough = true;
 		} else {
 			fprintf(stderr, "tailcat-c: too many arguments\n");
 			return 2;
@@ -5109,10 +5155,6 @@ int main(int argc, char **argv)
 	    strcmp(args[0], "forward") != 0 && strcmp(args[0], "socks") != 0)
 		timeout_s = 60;
 
-	/* ssh and cp pass everything after their own arguments straight through,
-	 * including things that look like our flags, so they take the tail of
-	 * argv rather than the parsed list. Re-scan for them before anything
-	 * else claims a flag that was meant for ssh. */
 	if (strcmp(args[0], "version") == 0) {
 		printf("tailcat-c %s\n", TAILCAT_C_VERSION);
 		return 0;
