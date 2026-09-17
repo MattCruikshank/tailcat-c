@@ -25,6 +25,7 @@
  */
 
 #include "tc/addr.h"
+#include "tc/allowlist.h"
 #include "tc/crypto.h"
 #include "tc/derp.h"
 #include "tc/derpmap.h"
@@ -129,6 +130,8 @@ static void usage(FILE *f)
 	        "choosing one\n"
 	        "      --full-address    embed the relay in the address, so "
 	        "clients need no map\n"
+	        "      --allow KEYS      comma-separated client nodekey: list "
+	        "for serve, or \"none\"\n"
 	        "      --bind ADDR       listen address for forward and socks "
 	        "(default 127.0.0.1)\n"
 	        "  -p, PORT              server port for ssh and cp (default 22)\n"
@@ -1250,6 +1253,11 @@ typedef struct {
 	 * means to turn this on. */
 	bool exit_node;
 
+	/* Which clients may connect. Inactive means all of them, which is the
+	 * default and what every version before this did. */
+	tc_allowlist allow;
+	uint64_t refused_by_allow;
+
 	tc_udp udp;
 	bool have_udp;
 	uint8_t disco_priv[32], disco_pub[32];
@@ -1355,6 +1363,17 @@ static void handle_meow(serve_state *st, const uint8_t src[32],
 	 * anyone could introduce anyone. */
 	if (memcmp(node, src, 32) != 0)
 		return;
+
+	/* Checked before anything is allocated or answered. A client that is not
+	 * allowed gets silence rather than a refusal: an explicit "no" would
+	 * confirm to an unauthorised caller that they had found a real server,
+	 * which is the one thing they did not already know. */
+	if (!tc_allow_permits(&st->allow, node)) {
+		st->refused_by_allow++;
+		vlogf("refusing client %02x%02x%02x%02x: not in --allow", node[0],
+		      node[1], node[2], node[3]);
+		return;
+	}
 
 	serve_client *sc = find_client(st, node);
 	if (sc == NULL) {
@@ -3040,7 +3059,8 @@ static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
 static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      bool insecure, unsigned timeout_s,
                      const char *derpmap_url, const char *key_spec,
-                     bool full_address, bool exit_node)
+                     bool full_address, bool exit_node,
+                     const tc_allowlist *allow)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -3187,6 +3207,8 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		memcpy(st.psk, ci.preshared_key, sizeof st.psk);
 		st.ports = ports;
 		st.exit_node = exit_node;
+		if (allow != NULL)
+			st.allow = *allow;
 		if (exit_node)
 			fprintf(stderr, "# acting as an exit node: clients may reach "
 			                "anything this machine can\n");
@@ -3257,6 +3279,12 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 				continue;
 			if (memcmp(node, src, 32) != 0)
 				continue; /* the relay's idea of the sender must agree */
+			/* Same rule as the multi-client path, and the same silence. */
+			if (allow != NULL && !tc_allow_permits(allow, node)) {
+				vlogf("refusing client %02x%02x%02x%02x: not in --allow",
+				      node[0], node[1], node[2], node[3]);
+				continue;
+			}
 			if (!have_client) {
 				memcpy(client_key, node, 32);
 				memcpy(client_disco, disco, 32);
@@ -3395,6 +3423,8 @@ int main(int argc, char **argv)
 	/* Upstream's default address names a region by number; --full-address
 	 * embeds the relay so a client needs no DERP map at all. */
 	bool full_address = false;
+	static tc_allowlist allow;
+	memset(&allow, 0, sizeof allow);
 	/* Room for a subcommand plus several port specs: upstream allows the
 	 * list to be spread over arguments, as in `serve 80,443 8000-8999`. */
 	const char *args[16];
@@ -3428,6 +3458,15 @@ int main(int argc, char **argv)
 			key_spec = argv[++i];
 		} else if (strcmp(a, "--full-address") == 0) {
 			full_address = true;
+		} else if (strcmp(a, "--allow") == 0 && i + 1 < argc) {
+			/* Fatal on a bad list rather than a warning. A typo that left
+			 * the list inactive would mean a server that admits everyone
+			 * while its operator believes it admits three people, and
+			 * nothing about the running server would look wrong. */
+			if (tc_allow_parse(&allow, argv[++i]) != TC_OK) {
+				fprintf(stderr, "tailcat-c: %s\n", tc_allow_error_string());
+				return 2;
+			}
 		} else if (strcmp(a, "--client") == 0) {
 			gk_client = true;
 		} else if (strcmp(a, "--force") == 0) {
@@ -3503,7 +3542,7 @@ int main(int argc, char **argv)
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
-			                 key_spec, full_address, false);
+			                 key_spec, full_address, false, &allow);
 		}
 
 		static tc_portset ports;
@@ -3537,7 +3576,7 @@ int main(int argc, char **argv)
 		}
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
-		                 key_spec, full_address, exit_node);
+		                 key_spec, full_address, exit_node, &allow);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

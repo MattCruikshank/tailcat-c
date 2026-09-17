@@ -147,6 +147,7 @@ LIB_SRCS := \
 	src/base64url.c \
 	src/cbor.c \
 	src/endpoint.c \
+	src/allowlist.c \
 	src/portset.c \
 	src/fwdspec.c \
 	src/shquote.c \
@@ -186,7 +187,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -329,6 +330,11 @@ live-direct: $(CLI)
 # was not asked to be one refusing to.
 live-exitnode: $(CLI)
 	CLI=$(CLI) sh scripts/live-exitnode.sh
+
+# A server refusing a client that is not on its --allow list, and admitting
+# one that is, through a real relay.
+live-allow: $(CLI)
+	CLI=$(CLI) sh scripts/live-allow.sh
 
 live-cli: $(CLI)
 	CLI=$(CLI) sh scripts/live-cli.sh
