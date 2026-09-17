@@ -63,6 +63,36 @@
 #define TC_TCP_OOO_SEGS 16
 #endif
 
+/* Idle detection.
+ *
+ * An established connection with nothing to send has no retransmission timer,
+ * so a peer that vanishes -- crashed, unplugged, or whose reset was lost in
+ * the tunnel -- leaves this side ESTABLISHED for ever. On a general-purpose
+ * host that is untidy. Here it is fatal: TC_TCP_MAX_CONNS is 64, and a
+ * listener that loses a slot for every peer that disappears eventually stops
+ * answering at all.
+ *
+ * Probing rather than simply timing out is the whole point. An interactive
+ * session may sit idle for hours and must survive it, so what is detected is
+ * a peer that does not *answer*, never one that is merely quiet. After
+ * TC_TCP_KEEPALIVE_IDLE_MS of silence a probe goes out, and after
+ * TC_TCP_KEEPALIVE_PROBES of them go unanswered the connection is dropped.
+ *
+ * These are far shorter than RFC 1122's two-hour floor for kernel keepalive,
+ * deliberately: that floor protects a stack whose table is effectively
+ * unbounded and whose probes cost real network. A probe here is one small
+ * packet a minute inside an established tunnel, and the table it protects
+ * holds sixty-four entries. */
+#ifndef TC_TCP_KEEPALIVE_IDLE_MS
+#define TC_TCP_KEEPALIVE_IDLE_MS 60000
+#endif
+#ifndef TC_TCP_KEEPALIVE_INTVL_MS
+#define TC_TCP_KEEPALIVE_INTVL_MS 10000
+#endif
+#ifndef TC_TCP_KEEPALIVE_PROBES
+#define TC_TCP_KEEPALIVE_PROBES 6
+#endif
+
 typedef enum {
 	TC_TCP_CLOSED = 0,
 	TC_TCP_LISTEN,

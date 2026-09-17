@@ -362,6 +362,36 @@ tag, associated data or counter always fails, BLAKE2s fed in arbitrary chunk
 sizes equals the one-shot digest, and X25519 is commutative and refuses
 small-order points.
 
+`tests/fuzz_tcp.c` is the newest and took three attempts to make honest,
+which is the interesting part. Generating random packets and feeding them in
+was nearly useless: over 200,000 iterations it opened 76 connections, because
+a packet must clear a checksum, a port lookup and a state check before it
+reaches anything worth fuzzing. It exercised the length checks thoroughly and
+the reassembly queue barely at all. So it now runs two real stacks against
+each other, exchanging real data, and corrupts a fraction of the packets in
+flight, with one uncorrupted connection carrying a byte counter as an
+integrity oracle -- because a reassembly bug that silently reorders or
+duplicates data crashes nothing and would pass every crash-based check.
+
+Then the counters were printed, and they said 64 accepted connections at
+20,000 iterations and 64 at 200,000. The churn opened connections and never
+closed any, so both tables filled to `TC_TCP_MAX_CONNS` and stayed there: a
+ten-fold longer run did exactly the same work. Fixing that turned up bugs 20
+and 21 within minutes, one after the other, each of which had been holding
+the table full in its own way.
+
+The lesson is the one the file was written for, one level up, so every fuzz
+harness now **asserts its own reach** and fails if it stops getting there --
+no connection accepted, no byte carried end to end, nothing corrupted, or a
+connection table that never turned over. A fuzzer that has quietly stopped
+reaching the code looks identical, from the outside, to one that is finding
+no bugs.
+
+A smaller instance of the same thing: every harness seeded itself with
+`strtoull(argv[2]) | 1`, which maps seeds 2 and 3 -- and 4 and 5, and so on
+-- to the same state. Half of every seed sweep was a verbatim repeat of the
+run before it, and the sweep looked twice as wide as it was.
+
 ## Design notes
 
 **No dynamic allocation in the parsers.** Addresses arrive from untrusted
@@ -747,6 +777,57 @@ that were never in it** -- `live-allow`, `live-exitnode`, `live-socksudp`,
 of which were written in the same session that found this. The README said
 level 1 ran "every live test". It ran nine of seventeen.
 
+**20. A corrupt SYN cost a table slot, permanently.** *(Found by the TCP
+fuzzer, which ran out of connections.)* The demultiplexer checks a SYN's
+flags and ports, then opens a connection and hands it the segment -- and the
+connection validates the whole thing again, checksum included, rejecting a
+bad one by dropping it without touching its state. So a corrupt SYN left a
+connection sitting in `LISTEN`, holding nothing. `accept_syn` tested only for
+`CLOSED`, so it kept it; a connection in `LISTEN` never reaches `CLOSED`, so
+the reaper could never free it; and `TC_TCP_MAX_CONNS` is 64. Sixty-four
+corrupt SYNs from an authenticated peer and the listener stopped answering
+for good. It was pushed onto the accept backlog too, so the application was
+handed a connection that would never establish and never close.
+
+Fixed by requiring `SYN_RECEIVED` -- the one state a bare SYN can produce --
+rather than enumerating the ways it can fail.
+
+**21. A peer that vanished held its slot for ever.** *(Same fuzz run, one
+layer down.)* An established connection with nothing to send has no
+retransmission timer, so nothing at all was watching it. A peer that crashed,
+was unplugged, or whose reset was lost in the tunnel left this side
+`ESTABLISHED` until the process exited. On a general-purpose host that is
+untidy; against a 64-entry table it is the same permanent exhaustion as 20,
+reached by a route that requires no hostility whatsoever -- just a laptop
+closing its lid.
+
+Fixed with keepalive probes: silence is not evidence, so after a minute of it
+a probe goes out, and the connection is dropped only after six of those go
+unanswered. Probing rather than simply timing out is the whole of it, since
+an interactive session may legitimately sit idle for hours.
+
+That fix contained a third bug and revealed a fourth. The third: the idle
+timer is re-armed by every segment that arrives, in *any* state, but is only
+acted on in the synchronised ones -- so `tc_tcp_next_deadline` would report a
+time the tick declined to act on, the deadline would never advance, and a
+caller that sleeps until the next deadline would spin at full speed instead.
+A wrong answer is loud; a busy loop is silent, and it is somebody's battery.
+Both now share one `ka_active` predicate, because the failure mode of the tick
+and the deadline disagreeing is precisely that.
+
+The fourth: our own probe carries a garbage octet, so it is answered by the
+path that re-acknowledges old *data*, and a tailcat-to-tailcat test could
+never notice that a **zero-length** probe drew no reply at all. RFC 793 asks
+for an acknowledgement to exactly that segment, and a Linux kernel at the far
+end of the tunnel sends one by default -- so its keepalives went unanswered
+and it would eventually reset a perfectly good connection. Found by mutation
+testing, not by the fuzzer: disabling the new code changed no test result,
+which is the only reason it was looked at again.
+
+All four were locked down with direct tests before the fix was believed, and
+each of those tests was checked against a mutation that reintroduces the bug
+it covers.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -943,10 +1024,16 @@ Current, and deliberate unless noted.
 
 Roughly in the order they should be picked up.
 
-- [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
-      Less pressing than it was: a direct path now notices silence within
-      `TC_PATH_TRUST_MS` and falls back, but that is the *path*, not the
-      connection, and a relayed connection to a vanished peer still hangs.
+- [x] **TCP keepalive and idle timeout.** Done, and overdue: see bug 21. An
+      established connection with nothing to send had no timer at all, so a
+      peer that vanished held its table slot until the process exited. After
+      `TC_TCP_KEEPALIVE_IDLE_MS` of silence a probe goes out, and after
+      `TC_TCP_KEEPALIVE_PROBES` unanswered ones the connection is dropped.
+
+      What remains, and is much smaller: a connection in `FIN_WAIT_2` whose
+      peer is alive but never closes. The probes are answered, so it is not
+      the vanished-peer case, and no timer bounds it. Linux caps it at 60
+      seconds (`tcp_fin_timeout`) for the same reason we would need to.
 - [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
       closed connections hold their table slots; nothing does it on a timer.
 - [x] **Tiered local diagnostics** (`make diag5/3/1`) with a pre-push hook.

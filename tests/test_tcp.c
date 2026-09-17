@@ -107,8 +107,18 @@ static int link_out(link_t *l, const uint8_t *p, size_t n, bool to_b)
 	return TC_OK;
 }
 
+/* The last packet A sent. Its acknowledgement field is A's rcv_nxt, which is
+ * how the probe test below learns a sequence number it cannot otherwise see
+ * without reaching into the connection. */
+static uint8_t last_from_a[LINK_MAXPKT];
+static size_t last_from_a_len;
+
 static int out_a(void *ctx, const uint8_t *p, size_t n)
 {
+	if (n <= sizeof last_from_a) {
+		memcpy(last_from_a, p, n);
+		last_from_a_len = n;
+	}
 	return link_out((link_t *)ctx, p, n, true);
 }
 
@@ -598,6 +608,218 @@ static void test_segment_size(void)
 	link_done(&l);
 }
 
+/* Idle detection.
+ *
+ * An established connection with nothing to send has no retransmission timer,
+ * so nothing at all was watching it: a peer that vanished left this side
+ * ESTABLISHED for ever, and with a sixty-four entry table that is a listener
+ * that eventually stops answering. The fix probes rather than simply timing
+ * out, and both halves of that matter -- so both are checked here. Getting
+ * only the second right would be a stack that drops every quiet session.
+ *
+ * The first case also covers a smaller fix it depends on: a probe carries no
+ * new data, and our receive path used to answer only segments that carried
+ * some. Without that, every probe goes unanswered and this case fails. */
+static void test_idle_detection(void)
+{
+	TCT_CASE("an idle connection survives while the peer answers");
+	link_t l;
+	link_init(&l, 99);
+	TCT_TRUE(establish(&l));
+
+	/* Many times longer than the whole probe sequence takes to give up, with
+	 * the link carrying nothing but what the two stacks generate. */
+	uint64_t span = TC_TCP_KEEPALIVE_IDLE_MS +
+	                TC_TCP_KEEPALIVE_PROBES * TC_TCP_KEEPALIVE_INTVL_MS;
+	uint64_t until = l.now + 10 * span;
+	/* Bounded by steps as well as by the clock. A regression that stops the
+	 * virtual clock advancing -- a deadline reported but never acted on, say
+	 * -- would otherwise hang here instead of failing. */
+	int steps = 0;
+	while (l.now < until && steps++ < 200000)
+		link_step(&l);
+	TCT_TRUE(l.now >= until);
+	TCT_TRUE(tc_tcp_is_established(l.a));
+	TCT_TRUE(tc_tcp_is_established(l.b));
+
+	TCT_CASE("a short silence is not fatal on its own");
+	uint64_t vanished = l.now;
+	l.loss_pct = 100; /* the peer is gone: nothing more gets through */
+	steps = 0;
+	while (l.now < vanished + TC_TCP_KEEPALIVE_IDLE_MS && steps++ < 200000)
+		link_step(&l);
+	TCT_TRUE(tc_tcp_is_established(l.a));
+
+	TCT_CASE("but a peer that never answers is given up on");
+	uint64_t giveup = vanished + span + TC_TCP_KEEPALIVE_INTVL_MS;
+	steps = 0;
+	while (l.now < giveup && tc_tcp_get_state(l.a) != TC_TCP_CLOSED &&
+	       steps++ < 200000)
+		link_step(&l);
+	TCT_EQ_INT((int)tc_tcp_get_state(l.a), (int)TC_TCP_CLOSED);
+
+	link_done(&l);
+}
+
+/* An independent TCP checksum over the IPv6 pseudo-header, so the probe built
+ * below does not borrow the implementation's own arithmetic to prove a point
+ * about the implementation. */
+static uint16_t tcp_ck(const uint8_t *src, const uint8_t *dst,
+                       const uint8_t *seg, size_t n)
+{
+	uint32_t sum = 0;
+	for (size_t i = 0; i < 16; i += 2)
+		sum += (uint32_t)src[i] << 8 | src[i + 1];
+	for (size_t i = 0; i < 16; i += 2)
+		sum += (uint32_t)dst[i] << 8 | dst[i + 1];
+	sum += (uint32_t)(n >> 16) & 0xffffu;
+	sum += (uint32_t)n & 0xffffu;
+	sum += 6; /* next header: TCP */
+	for (size_t i = 0; i + 1 < n; i += 2)
+		sum += (uint32_t)seg[i] << 8 | seg[i + 1];
+	if (n & 1)
+		sum += (uint32_t)seg[n - 1] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffffu) + (sum >> 16);
+	return (uint16_t)~sum;
+}
+
+/* A keepalive probe carries a sequence number one before the next, and most
+ * stacks -- a Linux kernel at the other end of the tunnel, for one -- send it
+ * with no payload at all. RFC 793 calls such a segment unacceptable and asks
+ * for an acknowledgement in reply.
+ *
+ * Our own probes carry a garbage octet, so they are answered by the path that
+ * re-acknowledges old *data* and this case never arose in a tailcat-to-tailcat
+ * test. A peer that omits the octet got silence, decided we were gone, and
+ * reset a working connection. Hence a test that builds the segment by hand.
+ */
+static void test_answers_a_zero_length_probe(void)
+{
+	TCT_CASE("a zero-length segment before rcv_nxt draws an acknowledgement");
+	link_t l;
+	link_init(&l, 77);
+	TCT_TRUE(establish(&l));
+	TCT_TRUE(transfer(&l, l.b, l.a, 4096, 0x1234));
+	for (int i = 0; i < 20; i++)
+		link_step(&l);
+	TCT_TRUE(last_from_a_len >= TC_IPV6_HEADER_LEN + TC_TCP_HEADER_LEN);
+
+	/* A's acknowledgement field is its rcv_nxt, which is the one number this
+	 * segment has to get right. */
+	const uint8_t *ath = last_from_a + TC_IPV6_HEADER_LEN;
+	uint32_t rcv_nxt = (uint32_t)ath[8] << 24 | (uint32_t)ath[9] << 16 |
+	                   (uint32_t)ath[10] << 8 | ath[11];
+	uint16_t a_port = (uint16_t)((uint16_t)ath[0] << 8 | ath[1]);
+	uint16_t b_port = (uint16_t)((uint16_t)ath[2] << 8 | ath[3]);
+	uint32_t probe_seq = rcv_nxt - 1;
+
+	uint8_t pkt[TC_IPV6_HEADER_LEN + TC_TCP_HEADER_LEN];
+	memset(pkt, 0, sizeof pkt);
+	pkt[0] = 0x60;
+	pkt[4] = 0;
+	pkt[5] = TC_TCP_HEADER_LEN;
+	pkt[6] = 6;
+	pkt[7] = 64;
+	memcpy(pkt + 8, kIpB, 16);
+	memcpy(pkt + 24, kIpA, 16);
+	uint8_t *th = pkt + TC_IPV6_HEADER_LEN;
+	th[0] = (uint8_t)(b_port >> 8);
+	th[1] = (uint8_t)b_port;
+	th[2] = (uint8_t)(a_port >> 8);
+	th[3] = (uint8_t)a_port;
+	th[4] = (uint8_t)(probe_seq >> 24);
+	th[5] = (uint8_t)(probe_seq >> 16);
+	th[6] = (uint8_t)(probe_seq >> 8);
+	th[7] = (uint8_t)probe_seq;
+	memcpy(th + 8, ath + 4, 4); /* acknowledge what A last sent */
+	th[12] = 5 << 4;
+	th[13] = 0x10; /* ACK, no data, no FIN, no SYN */
+	th[14] = 0xff;
+	th[15] = 0xff;
+	uint16_t ck = tcp_ck(kIpB, kIpA, th, TC_TCP_HEADER_LEN);
+	th[16] = (uint8_t)(ck >> 8);
+	th[17] = (uint8_t)ck;
+
+	tc_tcp_stats before, after;
+	tc_tcp_get_stats(l.a, &before);
+	TCT_EQ_INT(tc_tcp_input(l.a, pkt, sizeof pkt, l.now), TC_OK);
+	tc_tcp_get_stats(l.a, &after);
+
+	/* The segment must be taken as valid at all -- a checksum this test got
+	 * wrong would fail the next check for the wrong reason. */
+	TCT_TRUE(after.segs_received > before.segs_received);
+	TCT_TRUE(after.segs_dropped_checksum == before.segs_dropped_checksum);
+	TCT_TRUE(after.segs_sent > before.segs_sent);
+
+	TCT_CASE("and the connection is undisturbed by it");
+	TCT_TRUE(tc_tcp_is_established(l.a));
+	TCT_TRUE(transfer(&l, l.a, l.b, 4096, 0x5678));
+	link_done(&l);
+}
+
+/* An event loop sleeps until tc_tcp_next_deadline and then ticks. If that
+ * ever reports a time the tick declines to act on, the deadline never
+ * advances and the loop stops sleeping: it spins at full speed for as long as
+ * the connection exists. That is a worse failure than a wrong answer and a
+ * quieter one, because a test that drives the clock itself never notices --
+ * it just runs, and the bill arrives on somebody's laptop battery.
+ *
+ * The idle timer is the deadline that can outlive the states that act on it,
+ * because every arriving segment re-arms it whatever state the connection is
+ * in. A connection that has finished TIME_WAIT is the plain case: closed,
+ * nothing left to do, and an idle deadline still set from the last segment it
+ * ever saw.
+ */
+static void test_a_finished_connection_has_no_deadline(void)
+{
+	TCT_CASE("a connection that has finished reports no deadline at all");
+	link_t l;
+	link_init(&l, 55);
+	TCT_TRUE(establish(&l));
+
+	tc_tcp_shutdown_write(l.a, l.now);
+	int steps = 0;
+	while (!tc_tcp_read_closed(l.b) && steps++ < 20000)
+		link_step(&l);
+	TCT_TRUE(tc_tcp_read_closed(l.b));
+
+	tc_tcp_shutdown_write(l.b, l.now);
+	steps = 0;
+	while ((tc_tcp_get_state(l.a) != TC_TCP_CLOSED ||
+	        tc_tcp_get_state(l.b) != TC_TCP_CLOSED) &&
+	       steps++ < 200000)
+		link_step(&l);
+	TCT_EQ_INT((int)tc_tcp_get_state(l.a), (int)TC_TCP_CLOSED);
+	TCT_EQ_INT((int)tc_tcp_get_state(l.b), (int)TC_TCP_CLOSED);
+
+	/* Both are done, so neither has anything to wake a caller for. A
+	 * deadline in the past here is the spin: the caller would not sleep, the
+	 * tick would change nothing, and round it would go. */
+	TCT_TRUE(tc_tcp_next_deadline(l.a) == UINT64_MAX);
+	TCT_TRUE(tc_tcp_next_deadline(l.b) == UINT64_MAX);
+
+	TCT_CASE("and no deadline anywhere is ever left in the past");
+	/* The general form of the same invariant, over a whole connection's
+	 * life: after a tick at now, the next deadline is in the future, or the
+	 * tick had something to do and did it. */
+	link_t k;
+	link_init(&k, 56);
+	TCT_TRUE(establish(&k));
+	int stale = 0;
+	for (int i = 0; i < 4000; i++) {
+		link_step(&k);
+		uint64_t da = tc_tcp_next_deadline(k.a);
+		uint64_t db = tc_tcp_next_deadline(k.b);
+		if ((da != UINT64_MAX && da < k.now) ||
+		    (db != UINT64_MAX && db < k.now))
+			stale++;
+	}
+	TCT_EQ_INT(stale, 0);
+	link_done(&k);
+	link_done(&l);
+}
+
 int main(void)
 {
 	test_handshake();
@@ -615,5 +837,8 @@ int main(void)
 	test_flow_control();
 	test_reset();
 	test_segment_size();
+	test_idle_detection();
+	test_answers_a_zero_length_probe();
+	test_a_finished_connection_has_no_deadline();
 	return tct_report("tcp");
 }

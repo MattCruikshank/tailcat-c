@@ -234,8 +234,23 @@ $(BUILD)/test_%: tests/test_%.c $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Itests $< $(LIB_OBJS) $(LDFLAGS) -o $@
 
+# Names what failed, at the end.
+#
+# The previous version set a flag and exited non-zero, which meant a failure
+# inside a fifteen-minute diagnostic showed up as "Makefile:NNN: test Error 1"
+# with the useful output scrolled past -- and a binary that died without
+# printing left nothing at all. A summary that names the binary and its exit
+# status is the difference between a bug report and a shrug.
 test: $(TEST_BINS) $(CLI) check-fat
-	@fail=0; for t in $(TEST_BINS); do ./$$t || fail=1; done; exit $$fail
+	@fail=""; \
+	for t in $(TEST_BINS); do \
+		./$$t || fail="$$fail $$t($$?)"; \
+	done; \
+	if [ -n "$$fail" ]; then \
+		echo; \
+		echo "FAILED test binaries:$$fail" >&2; \
+		exit 1; \
+	fi
 
 # Only meaningful for cosmocc output; skipped for host-compiler builds.
 check-fat: $(TEST_BINS) $(CLI)

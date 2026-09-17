@@ -31,6 +31,16 @@
 /* build_map makes a map of n regions, region IDs 101, 102, ... Each node
  * carries a documentation-range IPv4 address and, when v6 is set, an IPv6
  * one, so a test can control exactly which probes get built. */
+/* A monotonic millisecond clock, for the one test that measures duration.
+ * CLOCK_MONOTONIC cannot step, which is the entire reason to prefer it here. */
+static uint64_t mono_ms(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
 static void build_map(tc_derp_map *m, size_t n, bool v6)
 {
 	memset(m, 0, sizeof *m);
@@ -737,11 +747,19 @@ static void test_run_loop(void)
 	 * must not cost the timeout on top of everything else. */
 	kill(c1, SIGKILL);
 	waitpid(c1, NULL, 0);
-	uint64_t t0 = (uint64_t)time(NULL);
+	/* Monotonic, not time(NULL). The wall clock can step backwards -- WSL
+	 * resynchronises to the Windows host, and NTP does it anywhere -- and
+	 * this failed about one run in fifteen with an elapsed time of
+	 * 18446744073709551615, which is what a one-second step back looks like
+	 * after an unsigned subtraction. A flake in a test whose whole subject
+	 * is elapsed time is worse than useless: it trains you to rerun it. */
+	uint64_t t0 = mono_ms();
 	TCT_EQ_INT(tc_netcheck_run(&rep, &m, &u, &o, NULL, NULL), TC_OK);
-	uint64_t elapsed = (uint64_t)time(NULL) - t0;
-	if (elapsed > 5)
-		TCT_FAILF("a 2000ms check took %llus", (unsigned long long)elapsed);
+	uint64_t t1 = mono_ms();
+	uint64_t elapsed_ms = t1 > t0 ? t1 - t0 : 0;
+	if (elapsed_ms > 5000)
+		TCT_FAILF("a 2000ms check took %llums",
+		          (unsigned long long)elapsed_ms);
 	tct_checks++;
 	TCT_EQ_INT(rep.regions[0].rtt_v4_ms, -1);
 	TCT_TRUE(rep.regions[1].rtt_v4_ms >= 0);

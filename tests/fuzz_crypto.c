@@ -204,7 +204,12 @@ int main(int argc, char **argv)
 	if (argc > 1)
 		iters = strtoul(argv[1], NULL, 10);
 	if (argc > 2)
-		rng_state = strtoull(argv[2], NULL, 10) | 1u;
+		/* Mixed rather than used raw: `seed | 1` maps 2 and 3 to the same
+		 * state, so half of every seed sweep repeated the run before it
+		 * -- which looked like twice the coverage and was not. The odd
+		 * bit is forced last because xorshift64 is stuck at zero. */
+		rng_state = strtoull(argv[2], NULL, 10) * 0x9e3779b97f4a7c15ull |
+		            1u;
 
 	/* X25519 is orders of magnitude slower than the rest, so run it less
 	 * often; the cheap properties get the bulk of the iterations. */

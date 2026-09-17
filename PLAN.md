@@ -702,9 +702,12 @@ discovery were not actually being made.
    APE assimilation is needed. After that: qemu-system, then hardware.
 2. **Decide the SSH licence question** (see 5.4) and then write the subset.
    Ed25519 is done, so the crypto it needs is all in hand.
-4. **TCP keepalive / idle timeout**, now the oldest thing on the list. A
-   direct path notices silence and falls back, but that is the path, not the
-   connection: a relayed connection to a peer that vanished still hangs.
+3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
+   they cover the peer that vanishes. They do not cover the peer that is
+   alive, answers every probe, and simply never sends its FIN: nothing bounds
+   that state, exactly as on any stack that has not added a
+   `tcp_fin_timeout`. Small, and the table it protects holds sixty-four
+   entries.
 
 WebAssembly is last on purpose, and possibly never: it is a second artifact
 for a project whose premise is one file, and a browser cannot open a UDP

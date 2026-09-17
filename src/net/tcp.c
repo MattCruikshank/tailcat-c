@@ -123,7 +123,9 @@ struct tc_tcp_conn {
 	uint64_t rto_deadline;  /* 0 = no retransmission timer */
 	uint64_t delack_deadline;
 	uint64_t timewait_deadline;
+	uint64_t ka_deadline; /* next keepalive probe, 0 = idle timer off */
 	unsigned rto_backoff;
+	unsigned ka_unacked; /* probes sent since anything was last received */
 
 	bool fin_queued;   /* the caller has asked to close the write side */
 	bool fin_sent;     /* our FIN has gone out */
@@ -642,6 +644,25 @@ static void handle_ack(tc_tcp_conn *c, uint32_t ack, uint64_t now)
 		c->cwnd = TC_TCP_SNDBUF;
 }
 
+/* ka_active says whether the idle timer means anything in this state.
+ *
+ * The timer is re-armed by every segment that arrives, in whatever state the
+ * connection is in, but it is only acted on in the synchronised states:
+ * everything earlier is already covered by the retransmission timer, and
+ * TIME_WAIT has a deadline of its own.
+ *
+ * The tick and tc_tcp_next_deadline must agree about that, and share this
+ * rather than each testing separately, because disagreeing is a busy loop
+ * rather than a wrong answer: next_deadline would report a time the tick
+ * declines to act on, so the deadline never advances, and a caller that
+ * sleeps until the next deadline spins instead. */
+static bool ka_active(const tc_tcp_conn *c)
+{
+	return c->ka_deadline != 0 &&
+	       (c->state == TC_TCP_ESTABLISHED || c->state == TC_TCP_FIN_WAIT_2 ||
+	        c->state == TC_TCP_CLOSE_WAIT);
+}
+
 int tc_tcp_input(tc_tcp_conn *c, const uint8_t *ip_pkt, size_t len,
                  uint64_t now_ms)
 {
@@ -695,6 +716,14 @@ int tc_tcp_input(tc_tcp_conn *c, const uint8_t *ip_pkt, size_t len,
 	size_t data_len = payload_total - doff;
 
 	c->stats.segs_received++;
+
+	/* Any segment that gets this far is proof the peer is still there, which
+	 * is exactly what the idle timer asks about. Reset here rather than at
+	 * the top of the function, because a flood of corrupt packets says
+	 * nothing about whether the connection is still alive and must not be
+	 * able to hold a dead one open. */
+	c->ka_deadline = now_ms + TC_TCP_KEEPALIVE_IDLE_MS;
+	c->ka_unacked = 0;
 
 	if (flags & TH_RST) {
 		/* Only a reset that fits the window counts, otherwise an off-path
@@ -790,6 +819,20 @@ int tc_tcp_input(tc_tcp_conn *c, const uint8_t *ip_pkt, size_t len,
 		}
 	}
 
+	/* A segment carrying no data, before rcv_nxt, is a keepalive probe.
+	 * RFC 793's acceptability test rejects it and then asks for an
+	 * acknowledgement in reply -- and the payload branch above answers only
+	 * segments that carry data, which a probe deliberately does not. Without
+	 * this, a peer probing an idle connection gets silence and concludes we
+	 * are gone: a Linux kernel on the other end of the tunnel does exactly
+	 * that by default, and so did our own probes until this was here.
+	 *
+	 * No storm results: the ACK it draws carries a current sequence number,
+	 * which is not old, so it draws nothing back. */
+	if (data_len == 0 && !(flags & (TH_FIN | TH_SYN)) &&
+	    seq_gt(c->rcv_nxt, seq))
+		send_ack(c, now_ms);
+
 	/* FIN counts only once everything before it has been received. */
 	if ((flags & TH_FIN) && seq_le(seq + (uint32_t)data_len, c->rcv_nxt) &&
 	    !c->fin_received) {
@@ -854,6 +897,25 @@ int tc_tcp_tick(tc_tcp_conn *c, uint64_t now_ms)
 	if (c->delack_deadline != 0 && now_ms >= c->delack_deadline)
 		send_ack(c, now_ms);
 
+	/* Probe an idle connection, and give up on one that never answers. */
+	if (ka_active(c) && now_ms >= c->ka_deadline) {
+		if (c->ka_unacked >= TC_TCP_KEEPALIVE_PROBES) {
+			c->state = TC_TCP_CLOSED;
+			c->reset = true;
+			c->ka_deadline = 0;
+			return TC_ERR_TIMEOUT;
+		}
+		/* RFC 1122 4.2.3.6: a probe carries a sequence number one before
+		 * the next, so the peer sees a byte it already has and
+		 * re-acknowledges rather than accepting anything. The garbage octet
+		 * is what makes it a segment with data, which is what every stack
+		 * answers; a zero-length probe is answered by fewer of them. */
+		uint8_t garbage = 0;
+		send_segment(c, c->snd_nxt - 1, TH_ACK, &garbage, 1, now_ms);
+		c->ka_unacked++;
+		c->ka_deadline = now_ms + TC_TCP_KEEPALIVE_INTVL_MS;
+	}
+
 	if (c->rto_deadline != 0 && now_ms >= c->rto_deadline) {
 		if (c->rto_backoff >= MAX_RETRIES) {
 			c->state = TC_TCP_CLOSED;
@@ -905,6 +967,11 @@ uint64_t tc_tcp_next_deadline(const tc_tcp_conn *c)
 		d = c->delack_deadline;
 	if (c->timewait_deadline != 0 && c->timewait_deadline < d)
 		d = c->timewait_deadline;
+	/* Without this an event loop that sleeps until the next deadline never
+	 * wakes to probe, and the idle timer above would only fire on a tick
+	 * some other connection happened to cause. */
+	if (ka_active(c) && c->ka_deadline < d)
+		d = c->ka_deadline;
 	return d;
 }
 

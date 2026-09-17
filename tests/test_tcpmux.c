@@ -1017,6 +1017,74 @@ static void test_accept_filter(void)
 	link_done(&l);
 }
 
+/* ---- a SYN that fails validation ------------------------------------- */
+
+static uint8_t cap_pkt[2048];
+static size_t cap_len;
+
+static int capture_out(void *ctx, const uint8_t *p, size_t n)
+{
+	(void)ctx;
+	if (n <= sizeof cap_pkt) {
+		memcpy(cap_pkt, p, n);
+		cap_len = n;
+	}
+	return TC_OK;
+}
+
+/* The mux checks a SYN's flags and ports before opening a connection for it,
+ * but the connection then validates the whole segment again -- checksum, data
+ * offset, addresses -- and rejects a bad one by dropping it, which leaves its
+ * state untouched. So a corrupt SYN produced a connection sitting in LISTEN,
+ * holding nothing. It never reached CLOSED, so the reaper could never free
+ * it, and the table slot was gone for good: TC_TCP_MAX_CONNS of them and the
+ * listener stopped answering entirely. It was handed to the application by
+ * tc_tcp_mux_accept as well, as a connection that would never establish.
+ *
+ * The fuzzer found this by running out of table. The check here is direct,
+ * and deliberately sends more corrupt SYNs than the table could ever hold. */
+static void test_a_corrupt_syn_leaves_nothing_behind(void)
+{
+	TCT_CASE("a SYN that fails validation costs no table slot");
+
+	tc_tcp_mux *src = tc_tcp_mux_new(kIpB, kIpA, capture_out, NULL);
+	tc_tcp_mux *m = tc_tcp_mux_new(kIpA, kIpB, sink_out, NULL);
+	TCT_TRUE(src != NULL && m != NULL);
+	TCT_EQ_INT(tc_tcp_mux_listen(m, 7), TC_OK);
+
+	for (int i = 0; i < TC_TCP_MAX_CONNS * 2; i++) {
+		tc_tcp_conn *c = NULL;
+		cap_len = 0;
+		if (tc_tcp_mux_connect(src, 7, 0, &c) != TC_OK || cap_len == 0) {
+			TCT_FAILF("could not produce a SYN (attempt %d)", i);
+			break;
+		}
+		uint8_t pkt[sizeof cap_pkt];
+		size_t len = cap_len;
+		memcpy(pkt, cap_pkt, len);
+		tc_tcp_mux_close(src, c, 0); /* keep the source table free */
+
+		pkt[TC_IPV6_HEADER_LEN + 16] ^= 0xff; /* wreck the checksum */
+		tc_tcp_mux_input(m, pkt, len, 0);
+	}
+	tct_checks++;
+	TCT_EQ_INT((int)tc_tcp_mux_count(m), 0);
+	TCT_EQ_INT((int)tc_tcp_mux_pending(m), 0);
+	TCT_TRUE(tc_tcp_mux_accept(m) == NULL);
+
+	TCT_CASE("and the listener still works afterwards");
+	tc_tcp_conn *good = NULL;
+	cap_len = 0;
+	TCT_EQ_INT(tc_tcp_mux_connect(src, 7, 0, &good), TC_OK);
+	TCT_TRUE(cap_len > 0);
+	tc_tcp_mux_input(m, cap_pkt, cap_len, 0);
+	TCT_EQ_INT((int)tc_tcp_mux_count(m), 1);
+	TCT_TRUE(tc_tcp_mux_accept(m) != NULL);
+
+	tc_tcp_mux_free(src);
+	tc_tcp_mux_free(m);
+}
+
 int main(void)
 {
 	test_concurrent_streams(0, 0, 1, "many streams at once on a clean link");
@@ -1037,5 +1105,6 @@ int main(void)
 	test_two_destinations_one_port_pair();
 	test_exit_node_still_serves_itself();
 	test_exit_node_api();
+	test_a_corrupt_syn_leaves_nothing_behind();
 	return tct_report("tcpmux");
 }

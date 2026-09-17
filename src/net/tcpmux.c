@@ -349,7 +349,21 @@ static void accept_syn(tc_tcp_mux *m,
 	 * what makes this connection findable from here on. */
 	(void)tc_tcp_input(c, pkt, len, now_ms);
 
-	if (tc_tcp_get_state(c) == TC_TCP_CLOSED) {
+	/* tc_tcp_input validates the segment again -- checksum, data offset,
+	 * addresses -- and a segment that fails any of those is dropped by
+	 * returning without touching the state. So a corrupt SYN leaves this
+	 * connection exactly as it was created: in LISTEN, holding nothing.
+	 *
+	 * Testing for CLOSED alone let that through, and it was not merely
+	 * untidy. A connection in LISTEN has no timer and never reaches CLOSED,
+	 * so tc_tcp_mux_reap could never free it -- every corrupt SYN cost a
+	 * table slot permanently, and TC_TCP_MAX_CONNS of them shut the listener
+	 * for good. It was also handed to the caller by tc_tcp_mux_accept as a
+	 * connection that would never establish and never close.
+	 *
+	 * SYN_RECEIVED is the one state a bare SYN can produce here, so that is
+	 * what is required, rather than enumerating the ways it can fail. */
+	if (tc_tcp_get_state(c) != TC_TCP_SYN_RECEIVED) {
 		drop_at(m, m->num_conns - 1); /* it refused the segment */
 		return;
 	}
