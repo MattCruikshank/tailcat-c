@@ -138,7 +138,9 @@ static void usage(FILE *f)
 	        "  tailcat-c parse <tc-address>            describe an address\n"
 	        "  tailcat-c netcheck                      report UDP, NAT and relay\n"
 	        "                                          latency\n"
-	        "  tailcat-c genkey --key <name> [--client] [--region N]\n"
+	        "  tailcat-c genkey --key <name> [--client] [--region N|code]\n"
+	        "                                          --region auto is the default;\n"
+	        "                                          --fixed-region measures one now\n"
 	        "  tailcat-c printpub                      the client key that "
 	        "would be used\n"
 	        "  tailcat-c version\n"
@@ -2391,7 +2393,8 @@ static int list_keys(void)
 
 static int cmd_genkey(const char *key_spec, bool client, bool force,
                       bool delete_it, bool list, const char *region,
-                      bool psk, bool insecure, const char *derpmap_url)
+                      bool fixed_region, bool psk, bool insecure,
+                      const char *derpmap_url)
 {
 	if (list)
 		return list_keys();
@@ -2432,6 +2435,47 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 	}
 
 	int64_t region_id = 0;
+
+	/* --fixed-region and --region name the same field by different means, so
+	 * taking both is an instruction with two answers. */
+	if (fixed_region && region != NULL && strcmp(region, "auto") != 0) {
+		fprintf(stderr, "tailcat-c: --fixed-region and --region both choose "
+		                "the relay; pick one\n");
+		return 2;
+	}
+	if (fixed_region && client) {
+		/* A client key has no region: it never listens, so there is nothing
+		 * for a region to pin. */
+		fprintf(stderr, "tailcat-c: --fixed-region makes no sense for a "
+		                "client key, which has no relay of its own\n");
+		return 2;
+	}
+
+	if (fixed_region && !client) {
+		/* Measure once, now, and write the winner into the file.
+		 *
+		 * Without this a saved key records no region, which means "choose at
+		 * startup by latency" -- fine for a key used from one place, and
+		 * wrong for an address published in DNS or written into a service
+		 * file, because the address a client holds names a region and a
+		 * server that re-chose would be listening somewhere else. Pinning it
+		 * costs one netcheck here and removes that failure entirely. */
+		static tc_derp_map fm;
+		if (tc_derpmap_fetch(&fm, derpmap_url, insecure, 15000) != TC_OK) {
+			fprintf(stderr, "tailcat-c: %s\n", tc_derpmap_error_string());
+			return 1;
+		}
+		const tc_derp_region *best = pick_region(&fm, 5000, insecure);
+		if (best == NULL) {
+			fprintf(stderr, "tailcat-c: could not measure a nearest relay; "
+			                "name one with --region\n");
+			return 1;
+		}
+		region_id = best->region_id;
+		vlogf("fixed region %lld (%s)", (long long)region_id,
+		      best->region_code);
+	}
+
 	if (region != NULL && strcmp(region, "auto") != 0 && !client) {
 		if (strcmp(region, "list") == 0) {
 			static tc_derp_map m;
@@ -4785,8 +4829,23 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 			return 1;
 		}
 	} else {
-		/* No relay named: fetch the map and probe for a quick one. */
-		ci.region_id = -1;
+		/* No relay named: use the region the saved key recorded, and probe
+		 * only when there is not one.
+		 *
+		 * This line used to be an unconditional `ci.region_id = -1`, which
+		 * threw away what the key file said and re-measured on every start.
+		 * The effect was not subtle: `genkey --region tok` printed an
+		 * address naming region 304, and `serve` with that same key then
+		 * listened on 301, so every client holding the address dialled a
+		 * relay the server was not on. Upstream, given the identical key
+		 * file, comes up on 304. The whole promise of a saved key is that
+		 * the address does not change, and the region is part of the
+		 * address.
+		 *
+		 * Zero means the file named no region, which is the same as
+		 * upstream's -1: choose by latency at startup. */
+		if (ci.region_id == 0)
+			ci.region_id = -1;
 		if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
 			return 1;
 		if (ci.regions[0].num_nodes > 2)
@@ -4838,7 +4897,17 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 
 	/* The address goes to stderr: stdout is the data pipe. */
 	fprintf(stderr, "# relay %s\n", relay_host);
-	fprintf(stderr, "# listening with new address: %s\n", addr);
+	/* Which kind of identity this is, because it decides whether the
+	 * address is safe to share once or is one that may already be in
+	 * somebody's notes. Upstream prints the same distinction for the
+	 * same reason. */
+	if (have_saved && key_spec != NULL)
+		fprintf(stderr, "# listening with saved key \"%s\": %s\n",
+		        key_spec, addr);
+	else if (have_saved)
+		fprintf(stderr, "# listening with a saved key: %s\n", addr);
+	else
+		fprintf(stderr, "# listening with new address: %s\n", addr);
 	fflush(stderr);
 
 	int status = 1;
@@ -5194,6 +5263,7 @@ int main(int argc, char **argv)
 	const char *key_spec = "";
 	bool gk_client = false, gk_force = false, gk_delete = false;
 	bool gk_list = false, gk_psk = true;
+	bool gk_fixed_region = false;
 	const char *gk_region = "auto";
 	/* Upstream's default address names a region by number; --full-address
 	 * embeds the relay so a client needs no DERP map at all. */
@@ -5365,6 +5435,8 @@ int main(int argc, char **argv)
 			gk_psk = BOOL_VAL(true);
 		} else if (strcmp(a, "--no-psk") == 0) {
 			gk_psk = !BOOL_VAL(true);
+		} else if (strcmp(a, "--fixed-region") == 0) {
+			gk_fixed_region = BOOL_VAL(true);
 		} else if (strcmp(a, "--bind") == 0) {
 			NEED_VAL();
 			bind_addr = val;
@@ -5633,7 +5705,8 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(args[0], "genkey") == 0) {
 		return cmd_genkey(key_spec, gk_client, gk_force, gk_delete, gk_list,
-		                  gk_region, gk_psk, insecure, derpmap_url);
+		                  gk_region, gk_fixed_region, gk_psk, insecure,
+		                  derpmap_url);
 	}
 	if (strcmp(args[0], "printpub") == 0)
 		return cmd_printpub(key_spec);

@@ -966,10 +966,10 @@ In rough order of what they cost:
    routing through `tc_nat64_wrap` as `forward` does. Both refuse it by name
    today rather than connecting somewhere else -- see bug 34 for why that
    sentence had to be written.
-4. **`genkey --fixed-region` and `genkey --region=<relay-hostname>`.**
-   `--relay` already pins a relay for one `serve`. What is missing is baking
-   the choice into a *saved key*, which is what lets a published address
-   survive a restart. The key file format would gain a field.
+4. ~~**`genkey --fixed-region`**~~: done, 6.5 -- and it found that saved
+   regions were not honoured at all. **`genkey --region=<relay-hostname>`**
+   is still open: `--relay` does it for one `serve`, and what is missing is
+   recording a self-hosted relay's hostname in a saved key.
 5. **`socks` recognising a tailcat address as a URL hostname**, which is what
    makes its address argument optional. Our SOCKS server already ignores the
    requested hostname except for `server.tailcat`; this means parsing it as
@@ -1069,6 +1069,33 @@ wrong" -- and only the second found this. And a harness has a *shape*, not
 just a size: a kilobyte buffer cannot express the input that matters here, so
 no number of iterations would have helped.
 
+### 6.5 `genkey --fixed-region`, and what it uncovered ✅ · ~120 lines
+
+The flag itself is small: measure the nearest relay once, now, with the
+netcheck `serve` already uses, and write the winner's region into the key
+file. Without it a saved key records no region, meaning "choose by latency at
+startup" -- fine for a key used from one machine, wrong for an address
+published in DNS or written into a service file.
+
+Then it turned out saved regions were not honoured anyway. `cmd_serve` set
+`ci.region_id = -1` before choosing a relay, discarding what the key file
+said, so `genkey --region tok` printed an address for region 304 and `serve`
+with that key listened on 301. Upstream, same file, comes up on 304. README
+bug 35.
+
+The part worth keeping is why nothing caught it. `live-genkey` already
+compared addresses across both implementations in both directions, byte for
+byte -- a strong check -- and it pinned `--region 301`, which is the nearest
+relay from where it runs. The server re-probed, chose 301, and the addresses
+matched. **A pinned value that matches the default pins nothing.** It now
+asks netcheck for the preferred region and pins a different one, which is
+self-adjusting for whoever runs it, and reintroducing the bug makes it fail.
+
+Also fixed here: `serve` said "listening with new address" whether the key
+was ephemeral or saved. Upstream distinguishes, and documents why -- the line
+tells you whether you are about to share a single-use address or re-listen on
+one that may already be in somebody's notes.
+
 ---
 
 ## Cross-cutting
@@ -1136,6 +1163,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 6.1 — walking upstream’s README | ~450 | ✅ done |
 | 6.3 — DNS names and the safety probe | ~560 | ✅ done |
 | 6.4 — fuzzing and mutating the DERP codec | ~380 | ✅ done |
+| 6.5 — `--fixed-region`, and bugs 35 and 36 | ~120 | ✅ done |
 | 6.2 — the gaps it found | ? | ⏸ not started |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 

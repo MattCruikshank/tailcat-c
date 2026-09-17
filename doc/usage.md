@@ -108,6 +108,7 @@ Without a saved key a server's address changes on every restart, which makes
 it useless in a script or a service file.
 
     tailcat-c genkey --key default
+    tailcat-c genkey --key default --fixed-region   # pin the nearest relay
     tailcat-c serve --key default
     tailcat-c printpub --key default
 

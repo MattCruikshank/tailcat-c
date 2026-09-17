@@ -127,6 +127,7 @@ const char tc_usage_text[] =
 	"it useless in a script or a service file.\n"
 	"\n"
 	"    tailcat-c genkey --key default\n"
+	"    tailcat-c genkey --key default --fixed-region   # pin the nearest relay\n"
 	"    tailcat-c serve --key default\n"
 	"    tailcat-c printpub --key default\n"
 	"\n"

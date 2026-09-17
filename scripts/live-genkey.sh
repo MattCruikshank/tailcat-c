@@ -29,9 +29,41 @@ trap cleanup EXIT
 
 MSG="saved-key-works"
 
+# The region pinned below must be one this machine would *not* have chosen.
+#
+# This test used --region 301 and passed throughout the entire period in which
+# a saved key's region was thrown away on every start (bug 35). 301 is the
+# nearest relay from where it runs, so the server re-probed, landed on 301
+# anyway, and the two addresses matched -- for the wrong reason. A test that
+# pins the answer the system would have guessed is not testing the pin.
+#
+# So ask netcheck which region is preferred here and deliberately pin a
+# different one. Self-adjusting, because "the nearest relay" depends on who is
+# running this.
+PREFERRED=$("$CLI" netcheck 2>/dev/null |
+	sed -n 's/^ *\([0-9][0-9]*\) .*<- preferred.*/\1/p' | head -1)
+REGION=""
+for cand in $("$CLI" genkey --key "$WORK/probe.private.json" --region list \
+	2>/dev/null | awk '{print $1}'); do
+	case "$cand" in
+	'' | *[!0-9]*) continue ;;
+	esac
+	if [ "$cand" != "${PREFERRED:-none}" ]; then
+		REGION="$cand"
+		break
+	fi
+done
+rm -f "$WORK/probe.private.json"
+if [ -z "$REGION" ]; then
+	echo "live-genkey: found no region other than the preferred one" >&2
+	exit 1
+fi
+echo "preferred region here is ${PREFERRED:-unknown}; pinning $REGION instead,"
+echo "so a server that re-probed would visibly land somewhere else"
+
 # ---- a key we wrote, used by the Go binary --------------------------------
-echo "\$ tailcat-c genkey --key $WORK/ours.private.json --region 301"
-OUR_ADDR=$("$CLI" genkey --key "$WORK/ours.private.json" --region 301)
+echo "\$ tailcat-c genkey --key $WORK/ours.private.json --region $REGION"
+OUR_ADDR=$("$CLI" genkey --key "$WORK/ours.private.json" --region "$REGION")
 echo "    address: $(printf '%s' "$OUR_ADDR" | cut -c1-28)..."
 
 PERMS=$(ls -l "$WORK/ours.private.json" | cut -c1-10)
@@ -94,9 +126,9 @@ SRV_PID=""
 
 # ---- a key the Go binary wrote, used by us --------------------------------
 echo
-echo "\$ tailcat genkey --key $WORK/theirs.private.json --region 301"
+echo "\$ tailcat genkey --key $WORK/theirs.private.json --region $REGION"
 THEIR_ADDR=$("$UPSTREAM" genkey --key "$WORK/theirs.private.json" \
-	--region 301 2>/dev/null)
+	--region "$REGION" 2>/dev/null)
 
 echo "\$ tailcat-c serve --key $WORK/theirs.private.json"
 "$CLI" -v --key "$WORK/theirs.private.json" serve > "$WORK/ours.out" \

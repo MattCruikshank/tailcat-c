@@ -111,10 +111,9 @@ own feature list:
 
 - **`socks` recognising a tailcat address as a URL hostname**, which is what
   makes the address argument optional there.
-- **`genkey --fixed-region`** and **`genkey --region=<relay-hostname>`**.
-  `--relay` pins a relay for `serve`, so what is missing is baking the choice
-  into a *saved key* -- which is what makes a published address keep working
-  across restarts.
+- **`genkey --region=<relay-hostname>`**, for a relay you run yourself.
+  `--relay` does this for one `serve`; what is missing is recording it in a
+  *saved key*. `--fixed-region` and a numbered or named region already are.
 - **Reaching a third address from the pipe form or `ssh -p ip:port`.**
   `forward` does this and `serve exit-node` is implemented, so this is
   plumbing an existing path into two more commands. Until then both refuse
@@ -216,7 +215,7 @@ direct peer-to-peer paths.
 | the DNS safety probe | ✅ | ✅ |
 | `socks` with the address omitted | ❌ | ✅ (tc-addr as a URL hostname) |
 
-| `genkey --fixed-region` | ❌ (`--relay` pins one for `serve`) | ✅ |
+| `genkey --fixed-region` | ✅ | ✅ |
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
 | reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
 | `serve` services: `ssh`, `no-auth-ssh`, `exec`, `files` | ❌ | ✅ |
@@ -1169,6 +1168,44 @@ accepting a prefix and discarding the rest. The lesson is not about
 `strtoul`. It is that **every one of them still ran**, and the only visible
 difference between right and wrong was a number nobody had a reason to
 check.
+
+**35. A saved key's region was thrown away on every start.** *(Phase 6.5,
+found while testing `--fixed-region`, which exists to prevent exactly this.)*
+`cmd_serve` set `ci.region_id = -1` unconditionally before choosing a relay,
+discarding whatever the key file recorded. So `genkey --key k --region tok`
+printed an address naming region 304, and `serve --key k` then re-measured,
+listened on 301, and printed a different address. A client holding the first
+one dialled a relay the server was not on.
+
+Upstream, given the identical key file, comes up on 304. The whole promise of
+a saved key is that the address does not change across restarts, and the
+region is part of the address -- so this was not a cosmetic difference but
+the feature not working.
+
+**The test that should have caught it was already there, and passed.**
+`live-genkey` generates a key with a pinned region, runs each implementation
+against the other's key file, and requires the addresses to match byte for
+byte. It used `--region 301`. From where it runs, 301 *is* the nearest relay,
+so the server re-probed, landed on 301 anyway, and the two addresses agreed
+for the wrong reason.
+
+It now asks netcheck which region is preferred and deliberately pins a
+different one, so a server that re-probes visibly lands somewhere else.
+Confirmed by reintroducing the bug: the addresses then differ in their final
+character, which is the region.
+
+That is the third time in this project a test has passed by accident -- after
+bug 13 and the `has_signature` mutation -- and the shape is the same every
+time: **the test supplied the answer the code would have guessed anyway.**
+A pinned value that matches the default pins nothing.
+
+**36. `serve` would not say which kind of key it was using.** *(Same
+investigation.)* It printed "listening with new address" whether the identity
+was ephemeral or loaded from disk. Upstream prints `listening with saved key
+"name"` and documents why: the line exists so you know whether you are
+starting a fresh single-use server or re-listening on an address you may have
+shared with people months ago. Ours told you nothing, which is worst in the
+case that matters.
 
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
