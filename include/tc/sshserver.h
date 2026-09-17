@@ -15,18 +15,20 @@
  * The refusals are answered rather than ignored, because a client waiting for
  * a reply it will never get cannot tell that from a hung server.
  *
- * There is no rekeying, and that bites in two places rather than one.
+ * Rekeying is implemented, but only as a responder: a peer may start a key
+ * exchange at any point and we will complete it, and we never start one
+ * ourselves. That covers the case that actually arises, because OpenSSH
+ * rekeys on its own schedule and a server has no reason to insist on its
+ * own. The session id stays fixed across a rekey, which is what binds the
+ * new keys to the identity proven at the start.
  *
- * The obvious one is the sequence number, which is the cipher nonce and so
- * must never wrap: tc_ssh_server_run stops at 2^32 packets rather than
- * letting it. For a file drop box that is unreachable in practice.
- *
- * The one that actually happens is a peer asking to rekey. OpenSSH starts a
- * key exchange on its own schedule, and RFC 4253 section 9 has the initiator
- * wait for a KEXINIT in reply -- so a server that ignores the request leaves
- * the client blocked until its own timeout, with nothing to say why. This
- * server answers with SSH_MSG_DISCONNECT instead, which is still a refusal
- * but a legible one. Implementing the exchange properly is the real fix.
+ * What remains bounded is the sequence number, which is the cipher nonce and
+ * so must never wrap: tc_ssh_server_run stops at 2^32 packets rather than
+ * letting it. A peer that rekeys on any sane schedule never gets near it; a
+ * peer that refuses to rekey at all would, and stopping is the only safe
+ * answer left at that point. Initiating would remove even that, at the cost
+ * of buffering channel data between our KEXINIT and the peer's reply, which
+ * RFC 4253 section 7.1 requires us to keep accepting.
  */
 #ifndef TC_SSHSERVER_H_
 #define TC_SSHSERVER_H_
@@ -92,5 +94,11 @@ int tc_ssh_server_exit(tc_ssh_server *s, uint32_t status);
  * session -- an audit record, a per-session key -- should use it rather than
  * inventing one. */
 const uint8_t *tc_ssh_server_session_id(const tc_ssh_server *s);
+
+/* tc_ssh_server_rekeys is how many key exchanges have happened after the
+ * first. It exists so a test can assert that a rekey really occurred: a
+ * transfer that succeeds proves nothing about rekeying if the client never
+ * asked for one. */
+unsigned tc_ssh_server_rekeys(const tc_ssh_server *s);
 
 #endif /* TC_SSHSERVER_H_ */

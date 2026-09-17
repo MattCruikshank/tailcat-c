@@ -51,7 +51,21 @@ struct tc_ssh_server {
 	const uint8_t *pending;
 	size_t pending_len;
 	bool peer_eof;
+
+	/* True while a key exchange is running. recv_packet handles a KEXINIT by
+	 * starting a rekey, so without this the exchange's own messages would
+	 * start another one, recursively. */
+	bool in_kex;
+	/* Cleared once the first exchange has produced a session id, which is
+	 * what distinguishes a rekey from the opening handshake. */
+	bool kex_done;
+	/* Exchanges after the first. Exposed so a test can assert that a rekey
+	 * actually happened rather than that the transfer merely succeeded --
+	 * a client that ignored RekeyLimit would pass every other check. */
+	unsigned rekeys;
 };
+
+static int kex_exchange(tc_ssh_server *s);
 
 /* ---- stream helpers ---------------------------------------------------- */
 
@@ -177,6 +191,26 @@ static int recv_packet(tc_ssh_server *s, size_t *out_len)
 			continue;
 		case TC_SSH_MSG_DISCONNECT:
 			return TC_ERR_CLOSED;
+		case TC_SSH_MSG_KEXINIT:
+			/* Handled here rather than in each caller, for the same reason
+			 * IGNORE is: a peer may start a key exchange at any moment, and a
+			 * state machine that only tolerates one where it expects one
+			 * works against one implementation and hangs against the next.
+			 *
+			 * During an exchange this is the message the exchange itself is
+			 * waiting for, so it is passed through. */
+			if (s->in_kex || !s->kex_done) {
+				*out_len = n;
+				return TC_OK;
+			}
+			if (n > sizeof s->i_client)
+				return TC_ERR_TOOMANY;
+			memcpy(s->i_client, s->payload, n);
+			s->i_client_len = n;
+			rc = kex_exchange(s);
+			if (rc != TC_OK)
+				return rc;
+			continue;
 		default:
 			*out_len = n;
 			return TC_OK;
@@ -200,33 +234,73 @@ static int send_unimplemented(tc_ssh_server *s, uint32_t seq)
 
 /* ---- key exchange ------------------------------------------------------ */
 
+/* do_kex runs the opening handshake: we offer first, then read theirs. */
 static int do_kex(tc_ssh_server *s)
 {
 	int rc = tc_ssh_kexinit_build(s->i_server, sizeof s->i_server,
 	                              &s->i_server_len);
 	if (rc != TC_OK)
 		return rc;
+	s->in_kex = true;
 	rc = send_packet(s, s->i_server, s->i_server_len);
 	if (rc != TC_OK)
-		return rc;
+		goto out;
 
 	size_t n = 0;
 	rc = recv_packet(s, &n);
 	if (rc != TC_OK)
-		return rc;
-	if (s->payload[0] != TC_SSH_MSG_KEXINIT)
-		return TC_ERR_INVAL;
-	if (n > sizeof s->i_client)
-		return TC_ERR_TOOMANY;
+		goto out;
+	if (s->payload[0] != TC_SSH_MSG_KEXINIT) {
+		rc = TC_ERR_INVAL;
+		goto out;
+	}
+	if (n > sizeof s->i_client) {
+		rc = TC_ERR_TOOMANY;
+		goto out;
+	}
 	/* Kept verbatim: the signature covers the bytes the client sent, not a
 	 * re-encoding of what we understood them to mean. */
 	memcpy(s->i_client, s->payload, n);
 	s->i_client_len = n;
+	s->in_kex = false;
+
+	return kex_exchange(s);
+out:
+	s->in_kex = false;
+	return rc;
+}
+
+/* kex_exchange runs one exchange, with both KEXINIT payloads already in hand.
+ *
+ * The opening handshake and a rekey differ in exactly two places, and both
+ * are marked below: the session id is set only the first time, and a rekey
+ * has already read the peer's KEXINIT before getting here. Everything else --
+ * the exchange, the signature, the derivation -- is identical, which is why
+ * it is one function rather than two that drift. */
+static int kex_exchange(tc_ssh_server *s)
+{
+	int rc;
+	size_t n = 0;
+	bool first = !s->kex_done;
+
+	s->in_kex = true;
+
+	/* A rekey we did not start: the peer's KEXINIT arrived first, so ours
+	 * goes out now. RFC 4253 7.1 requires a reply before anything else. */
+	if (!first) {
+		rc = tc_ssh_kexinit_build(s->i_server, sizeof s->i_server,
+		                          &s->i_server_len);
+		if (rc != TC_OK)
+			goto out;
+		rc = send_packet(s, s->i_server, s->i_server_len);
+		if (rc != TC_OK)
+			goto out;
+	}
 
 	tc_ssh_negotiated neg;
 	rc = tc_ssh_kexinit_parse(&neg, s->i_client, s->i_client_len);
 	if (rc != TC_OK)
-		return rc;
+		goto out;
 
 	if (neg.first_kex_packet_follows && neg.guess_was_wrong) {
 		/* RFC 4253 7.1: the guessed packet is discarded. Reading it as the
@@ -234,14 +308,19 @@ static int do_kex(tc_ssh_server *s)
 		 * different algorithm's message. */
 		rc = recv_packet(s, &n);
 		if (rc != TC_OK)
-			return rc;
+			goto out;
 	}
 
 	rc = recv_packet(s, &n);
 	if (rc != TC_OK)
-		return rc;
-	if (s->payload[0] != TC_SSH_MSG_KEX_ECDH_INIT)
-		return TC_ERR_INVAL;
+		goto out;
+	if (s->payload[0] != TC_SSH_MSG_KEX_ECDH_INIT) {
+		/* RFC 4253 7.1 allows only transport and kex messages between
+		 * KEXINIT and NEWKEYS, so anything else here is the peer breaking
+		 * the rule rather than something to tolerate. */
+		rc = TC_ERR_INVAL;
+		goto out;
+	}
 
 	tc_ssh_rbuf r;
 	tc_ssh_rbuf_init(&r, s->payload, n);
@@ -250,15 +329,17 @@ static int do_kex(tc_ssh_server *s)
 	const uint8_t *q_client = tc_ssh_get_string(&r, TC_SSH_X25519_LEN,
 	                                            &qc_len);
 	if (q_client == NULL || qc_len != TC_SSH_X25519_LEN ||
-	    !tc_ssh_rbuf_ok(&r))
-		return TC_ERR_INVAL;
+	    !tc_ssh_rbuf_ok(&r)) {
+		rc = TC_ERR_INVAL;
+		goto out;
+	}
 	uint8_t qc[TC_SSH_X25519_LEN];
 	memcpy(qc, q_client, sizeof qc);
 
 	uint8_t eph_priv[32], eph_pub[32];
 	rc = tc_x25519_keypair(eph_priv, eph_pub);
 	if (rc != TC_OK)
-		return rc;
+		goto out;
 
 	uint8_t secret[32];
 	/* tc_x25519 refuses a small-order peer key, which is the contributory
@@ -267,7 +348,7 @@ static int do_kex(tc_ssh_server *s)
 	rc = tc_x25519(secret, eph_priv, qc);
 	tc_memzero_explicit(eph_priv, sizeof eph_priv);
 	if (rc != TC_OK)
-		return rc;
+		goto out;
 
 	tc_ssh_exchange e;
 	memset(&e, 0, sizeof e);
@@ -317,13 +398,14 @@ static int do_kex(tc_ssh_server *s)
 	if (rc != TC_OK)
 		goto done;
 
-	uint8_t newkeys = TC_SSH_MSG_NEWKEYS;
-	rc = send_packet(s, &newkeys, 1);
-	if (rc != TC_OK)
-		goto done;
-
-	/* The session id is H from the first exchange and never changes. */
-	memcpy(s->session_id, h, sizeof s->session_id);
+	/* The session id is H from the *first* exchange and never changes after
+	 * it. That is what ties a rekey to the identity originally proven: the
+	 * derivation below folds it in, so new keys are bound to the same
+	 * session rather than to a fresh anonymous one. Overwriting it here
+	 * would let an attacker who forced a rekey start again with a session
+	 * whose id they had influenced. */
+	if (first)
+		memcpy(s->session_id, h, sizeof s->session_id);
 
 	uint8_t c2s[TC_SSH_CIPHER_KEY_LEN], s2c[TC_SSH_CIPHER_KEY_LEN];
 	rc = tc_ssh_derive_keys(c2s, s2c, secret, sizeof secret, h,
@@ -331,9 +413,21 @@ static int do_kex(tc_ssh_server *s)
 	if (rc != TC_OK)
 		goto done;
 
-	/* The client's NEWKEYS is still unencrypted, so it must be read before
-	 * the receive key is installed. Installing both at once here would mean
-	 * trying to decrypt a plaintext packet. */
+	/* Order matters in both directions and they are not symmetric.
+	 *
+	 * Ours: everything after our NEWKEYS must use the new send key, so the
+	 * key goes in immediately after the message goes out.
+	 *
+	 * Theirs: their NEWKEYS is still under the *old* receive key -- it is
+	 * the last message that is -- so the new receive key can only go in once
+	 * that message has been read. Installing both at once would mean trying
+	 * to decrypt their NEWKEYS with a key they had not started using. */
+	uint8_t newkeys = TC_SSH_MSG_NEWKEYS;
+	rc = send_packet(s, &newkeys, 1);
+	if (rc != TC_OK)
+		goto keys_done;
+	tc_ssh_cipher_set_key(&s->out, s2c);
+
 	rc = recv_packet(s, &n);
 	if (rc != TC_OK)
 		goto keys_done;
@@ -341,9 +435,16 @@ static int do_kex(tc_ssh_server *s)
 		rc = TC_ERR_INVAL;
 		goto keys_done;
 	}
-
 	tc_ssh_cipher_set_key(&s->in, c2s);
-	tc_ssh_cipher_set_key(&s->out, s2c);
+
+	/* The sequence numbers deliberately do not reset. RFC 4253 6.4: the
+	 * count is never reset, even when keys are renegotiated -- and since it
+	 * is also the cipher nonce, resetting it would repeat a nonce under the
+	 * new key on the very first packet. tc_ssh_cipher_set_key leaves it
+	 * alone for exactly this reason. */
+	if (!first)
+		s->rekeys++;
+	s->kex_done = true;
 	rc = TC_OK;
 
 keys_done:
@@ -351,6 +452,8 @@ keys_done:
 	tc_memzero_explicit(s2c, sizeof s2c);
 done:
 	tc_memzero_explicit(secret, sizeof secret);
+out:
+	s->in_kex = false;
 	return rc;
 }
 
@@ -520,28 +623,6 @@ int tc_ssh_server_read(tc_ssh_server *s, void *buf, size_t cap, size_t *nread)
 			s->peer_eof = true;
 			s->ch.closed = true;
 			return TC_ERR_DONE;
-		case TC_SSH_MSG_KEXINIT:
-			/* The peer wants to rekey. We cannot, and the important part is
-			 * that we say so: RFC 4253 9 has the initiator wait for our
-			 * KEXINIT in reply, so ignoring this leaves the client blocked
-			 * until its own timeout with no indication why. OpenSSH starts a
-			 * rekey on its own schedule, so this is reachable in any session
-			 * that lives long enough -- far sooner than the sequence number
-			 * could wrap.
-			 *
-			 * A disconnect turns an indefinite hang into a named failure.
-			 * Implementing the rekey properly is the real answer and is on
-			 * the list; until then this fails honestly. */
-			{
-				uint8_t bye[128];
-				size_t bye_len = 0;
-				if (tc_ssh_disconnect_build(
-				        bye, sizeof bye, &bye_len,
-				        TC_SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
-				        "rekeying is not implemented") == TC_OK)
-					(void)send_packet(s, bye, bye_len);
-			}
-			return TC_ERR_UNSUPPORTED;
 		case TC_SSH_MSG_CHANNEL_REQUEST: {
 			/* A request mid-session, such as a window-change. Refused, but
 			 * answered if it wants an answer. */
@@ -601,6 +682,11 @@ int tc_ssh_server_exit(tc_ssh_server *s, uint32_t status)
 const uint8_t *tc_ssh_server_session_id(const tc_ssh_server *s)
 {
 	return s == NULL ? NULL : s->session_id;
+}
+
+unsigned tc_ssh_server_rekeys(const tc_ssh_server *s)
+{
+	return s == NULL ? 0u : s->rekeys;
 }
 
 static int do_session(tc_ssh_server *s)

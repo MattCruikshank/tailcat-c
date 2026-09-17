@@ -100,7 +100,11 @@ static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 		total += got;
 	}
 
-	n = snprintf(line, sizeof line, "received %zu bytes\n", total);
+	/* The rekey count goes back to the client so the script can require that
+	 * one actually happened. A transfer that merely succeeded proves nothing
+	 * about rekeying if the peer never asked for one. */
+	n = snprintf(line, sizeof line, "received %zu bytes after %u rekeys\n",
+	             total, tc_ssh_server_rekeys(s));
 	if (n > 0)
 		(void)tc_ssh_server_write(s, line, (size_t)n);
 

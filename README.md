@@ -856,6 +856,37 @@ packet layer's vectors were produced by Go written from the same OpenSSH
 document as the C, so both sides could be -- and in this respect both were --
 wrong in the same way. Only a peer written from neither could tell.
 
+**23. A rekey request was ignored, and the client hung.** *(Phase 5.4,
+found by being asked where the limitation was written down.)* The sequence
+number is the cipher nonce, so it must never wrap, and the server stopped at
+2^32 packets rather than letting it. That much was recorded -- in the
+README's TODO list, though not in PLAN.md -- and it was the harmless half.
+
+The half that actually happens is a peer *asking* to rekey. OpenSSH starts a
+key exchange on its own schedule, and RFC 4253 section 9 has the initiator
+wait for a KEXINIT in reply. `tc_ssh_server_read` had no case for KEXINIT, so
+the request fell through to `default: break;` and was dropped in silence. The
+client then waited for a reply that was never coming: measured with
+`-o RekeyLimit=16K` over 200KB, `ssh` was killed by `timeout` after 12 seconds
+having printed **nothing at all** to stderr.
+
+Rekeying is now implemented as a responder, and three details in it are each
+a silent corruption rather than a clean failure if wrong: the session id must
+*not* change, the sequence number must *not* reset, and the two NEWKEYS
+messages are not symmetric -- our send key goes in after ours goes out, their
+receive key only after theirs comes in. All three are caught by mutation.
+
+The lesson is about the documentation rather than the code. The limitation
+had been written down, which felt like diligence, and what was written down
+described the unreachable half of it accurately and missed the half that
+happens in every long session. Being asked "is that in the plan?" was what
+produced the second reading.
+
+The test is written accordingly: it fails if the transfer is corrupted, if
+`ssh` hangs, *and* if no rekey actually took place -- because a client that
+ignored `RekeyLimit` would otherwise pass it, which is the same shape of
+mistake as a fuzzer that stopped reaching the code it was aimed at.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -1118,15 +1149,14 @@ Roughly in the order they should be picked up.
 - [ ] Consider making the address-parser limits runtime-configurable.
 - [ ] **Refresh the DERP map cache in the background** rather than only on a
       miss, so a long-lived process does not pay a fetch mid-session.
-- [ ] **Rekeying for the SSH server**, which is a live limitation rather
-      than a theoretical one. The sequence number is the cipher nonce and
-      must never wrap, so `tc_ssh_server_run` stops at 2^32 packets -- that
-      part is unreachable for a drop box. What is reachable is a peer asking
-      to rekey: OpenSSH does so on its own schedule, and until a handler was
-      added this server ignored the request, leaving the client blocked
-      until its own timeout with nothing in stderr. It now answers with a
-      disconnect, so a long transfer ends by name instead of hanging, but
-      ending is not succeeding. PLAN.md 5.4.7 has the detail.
+- [x] **Rekeying for the SSH server.** Done as a responder: a peer may
+      start a key exchange at any point and we complete it, keeping the
+      session id fixed so the new keys stay bound to the identity proven at
+      the start. `make live-sshd` moves 2MB with `RekeyLimit=16K`, which is
+      about 120 exchanges, and requires the byte count to survive all of
+      them. We never initiate, so the sequence number wrapping at 2^32
+      packets is still a hard stop -- unreachable against any peer that
+      rekeys at all. See bug 23.
 - [ ] **Fuzz the DERP frame codec.** It parses attacker-influenced lengths
       straight off a socket, which is the same shape as the TCP reassembly
       queue, and that is where bugs 20 and 21 came from. It has vectors and

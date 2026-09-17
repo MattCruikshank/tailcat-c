@@ -132,17 +132,21 @@ fi
 # message ssh reports 255.
 echo "ok   live-sshd               real OpenSSH completed a session against our server"
 
-# ---- and a rekey is refused, not ignored ---------------------------------
+# ---- and a rekey works, repeatedly ---------------------------------------
 #
-# OpenSSH starts a key exchange on its own schedule. RFC 4253 section 9 has
-# the initiator wait for a KEXINIT in reply, so a server that ignores the
-# request leaves the client blocked until its own timeout with nothing in
-# stderr to say why -- which is what this server did until the handler was
-# added. RekeyLimit forces the case in a second rather than in a gigabyte.
+# OpenSSH starts a key exchange on its own schedule, and RFC 4253 section 9
+# has the initiator wait for a KEXINIT in reply -- so a server that ignores
+# the request leaves the client blocked until its own timeout with nothing in
+# stderr to say why. That is what this server did before rekeying was
+# implemented, and `timeout` is what catches it: a hang and a failure look
+# alike to a check that only tests the exit status.
 #
-# The check is deliberately "named failure, quickly" rather than "success":
-# we cannot rekey, and the point is that we say so.
-echo "== forcing a rekey =="
+# RekeyLimit=16K over 2MB forces on the order of a hundred exchanges, so this
+# covers the repeated case and not just the first one. The byte count is the
+# integrity check across all of them: sequence numbers do not reset at a
+# rekey, and keys that came out wrong would corrupt the stream rather than
+# stop it.
+echo "== forcing repeated rekeys =="
 port2=$((port + 1))
 "$SSHD" "$port2" "$host_seed" "$pub_hex" > "$tmp/srv2.out" 2> "$tmp/srv2.err" &
 srv_pid=$!
@@ -153,7 +157,7 @@ done
 
 start=$(date +%s)
 set +e
-head -c 200000 /dev/zero | tr '\0' 'x' | timeout 20 ssh \
+out2=$(head -c 2000000 /dev/zero | tr '\0' 'x' | timeout 60 ssh \
 	-i "$tmp/id" \
 	-o StrictHostKeyChecking=no \
 	-o UserKnownHostsFile=/dev/null \
@@ -162,7 +166,7 @@ head -c 200000 /dev/zero | tr '\0' 'x' | timeout 20 ssh \
 	-o BatchMode=yes \
 	-o LogLevel=ERROR \
 	-o RekeyLimit=16K \
-	-p "$port2" tester@127.0.0.1 "uptime" > /dev/null 2> "$tmp/rekey.err"
+	-p "$port2" tester@127.0.0.1 "uptime" 2> "$tmp/rekey.err")
 rc=$?
 set -e
 elapsed=$(( $(date +%s) - start ))
@@ -170,14 +174,33 @@ kill "$srv_pid" 2>/dev/null || true
 srv_pid=""
 
 if [ "$rc" -eq 124 ]; then
-	echo "live-sshd: FAIL -- the client hung for ${elapsed}s on a rekey" >&2
-	echo "  A rekey request must be answered, even to refuse it." >&2
+	echo "live-sshd: FAIL -- the client hung for ${elapsed}s during a rekey" >&2
+	echo "  A rekey request must be answered. Before it was implemented the" >&2
+	echo "  request was dropped and the client waited here for ever." >&2
 	exit 1
 fi
-if ! grep -q 'rekeying is not implemented' "$tmp/rekey.err"; then
-	echo "live-sshd: FAIL -- a rekey did not draw our disconnect" >&2
+if [ "$rc" -ne 0 ]; then
+	echo "live-sshd: FAIL -- ssh exited $rc across a rekey" >&2
 	cat "$tmp/rekey.err" >&2
 	cat "$tmp/srv2.err" >&2
 	exit 1
 fi
-echo "ok   live-sshd               a rekey is refused by name in ${elapsed}s, not ignored"
+
+# Every byte, across every rekey.
+if ! printf '%s' "$out2" | grep -q 'received 2000000 bytes'; then
+	echo "live-sshd: FAIL -- data was lost or corrupted across a rekey" >&2
+	printf '%s\n' "$out2" >&2
+	exit 1
+fi
+
+# And a rekey must actually have happened. Without this the check passes on a
+# client that quietly ignored RekeyLimit, which is the same shape of mistake
+# as a fuzzer that stopped reaching the code it was aimed at.
+rekeys=$(printf '%s' "$out2" | sed -n 's/.*after \([0-9][0-9]*\) rekeys.*/\1/p')
+if [ -z "$rekeys" ] || [ "$rekeys" -lt 1 ]; then
+	echo "live-sshd: FAIL -- no rekey took place, so this proved nothing" >&2
+	printf '%s\n' "$out2" >&2
+	exit 1
+fi
+
+echo "ok   live-sshd               2MB across $rekeys rekeys, intact, in ${elapsed}s"

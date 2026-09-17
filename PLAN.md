@@ -586,34 +586,34 @@ does not match" and nothing more specific.
       *is* counted. Every vector we had was encrypted, so every handshake
       packet was four bytes out of alignment and OpenSSH rejected all of
       them. See bug 22.
-- [ ] **5.4.7 rekeying** · ~150 lines · the one piece of 5.4 that is not
-      done, and it is a real gap rather than a theoretical one.
+- [x] **5.4.7 rekeying** · 135 lines · as a responder. A peer may start a
+      key exchange at any point and we complete it; we never start one.
 
-      Two things go wrong without it. The sequence number is the cipher
-      nonce, so it must never wrap; `tc_ssh_server_run` stops at 2^32
-      packets, which for a drop box is unreachable. That is the harmless
-      half.
+      Handled in `recv_packet` rather than in each caller, for the same
+      reason SSH_MSG_IGNORE is: a peer may rekey at any moment, and a state
+      machine that only tolerates one where it expects one works against one
+      implementation and hangs against the next. `do_kex` and the rekey path
+      now share one `kex_exchange`, differing in exactly two places -- who
+      sent KEXINIT first, and whether the session id is set.
 
-      The half that actually happens is a peer *asking* to rekey. OpenSSH
-      starts a key exchange on its own schedule, and RFC 4253 section 9 has
-      the initiator wait for a KEXINIT in reply -- so a server that ignores
-      the request leaves the client blocked until its own timeout with
-      nothing in stderr to say why. That is what this server did until the
-      handler was added; `ssh -o RekeyLimit=16K` reproduces it in about a
-      second, and before the fix the client sat there for the full timeout
-      and printed nothing at all.
+      Three details that are each a silent corruption if wrong, and all
+      three are caught by mutation:
+      - The **session id does not change**. It is H from the first exchange
+        and the derivation folds it into every later key, which is what
+        binds new keys to the identity proven at the start.
+      - The **sequence number does not reset** (RFC 4253 6.4). It is also
+        the cipher nonce, so resetting it would repeat a nonce under the new
+        key on the very first packet after the rekey.
+      - **NEWKEYS is not symmetric.** Our send key goes in immediately after
+        our NEWKEYS goes out; their receive key can only go in *after* their
+        NEWKEYS has been read, because that message is the last one still
+        under the old key.
 
-      It now answers with SSH_MSG_DISCONNECT, which is still a refusal but a
-      legible one, and `make live-sshd` checks both that the refusal arrives
-      and that it arrives *quickly* -- a hang and a refusal look identical to
-      a test that only asserts non-zero exit.
-
-      Doing it properly means re-running the exchange mid-session while
-      keeping the session id fixed, which is what ties the new keys to the
-      identity originally proven. The awkward part is not the kex: it is
-      that channel data may be in flight in both directions when the KEXINIT
-      arrives, and RFC 4253 allows only transport messages between KEXINIT
-      and NEWKEYS.
+      What remains bounded is the sequence number wrapping at 2^32 packets,
+      which a peer that rekeys on any sane schedule never approaches.
+      Initiating ourselves would remove even that, at the cost of buffering
+      channel data between our KEXINIT and the peer's reply -- RFC 4253 7.1
+      requires us to keep accepting it. Not worth it for a drop box.
 
 The decision and its alternatives remain recorded below, because a decision
 whose reasoning is thrown away is one that gets relitigated. Full detail is in the README under
@@ -787,7 +787,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.1, 5.2 — datagrams, NAT64, exit nodes | ~990 | ✅ done |
 | 5.1 — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
 | 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
-| 5.4 — SSH subset (transport, kex, auth, channels, server) | 2,513 | ✅ done |
+| 5.4 — SSH subset (transport, kex, auth, channels, server, rekey) | 2,648 | ✅ done |
 | 5.5 — SFTP (and `recv`, `ls`) | ~1,500 | ⏸ next |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
@@ -831,10 +831,7 @@ discovery were not actually being made.
 2. **Write the SFTP subset** (5.5). The SSH side is done and verified
    against a real OpenSSH, and `subsystem` already delivers the request, so
    what remains is the file protocol and `recv`'s write-only discipline.
-3. **SSH rekeying** (5.4.7). Currently refused by name rather than
-   implemented. Refusing is honest and a long transfer will hit it: OpenSSH
-   rekeys on its own schedule, so any session that moves enough data ends
-   with a disconnect the user did not ask for.
+3. **Bound `FIN_WAIT_2`** — see below; unchanged by any of the SSH work.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is
    alive, answers every probe, and simply never sends its FIN: nothing bounds
