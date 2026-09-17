@@ -107,7 +107,7 @@ largest thing we add is the 181 KB CA bundle.
 | Region choice by latency | ✅ (netcheck) | ✅ (netcheck) |
 | Multiple concurrent connections | ✅ | ✅ |
 | Multiple concurrent clients | ✅ (8) | ✅ |
-| UDP forwarding | ❌ | ✅ |
+| UDP forwarding | the tunnel layer only | ✅ |
 | IPv4 into the tunnel via NAT64 | ❌ | ✅ |
 | TLS to the relay | 1.2 | 1.2 + 1.3 |
 | **Commands** | | |

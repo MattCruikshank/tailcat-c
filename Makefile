@@ -172,6 +172,7 @@ LIB_SRCS := \
 	src/net/path.c \
 	src/net/tcp.c \
 	src/net/tcpmux.c \
+	src/net/udpmux.c \
 	src/net/proxy.c \
 	src/net/http.c \
 	src/net/tls.c \

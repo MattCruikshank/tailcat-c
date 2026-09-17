@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"encoding/binary"
+	"net"
 	"net/netip"
 	"encoding/hex"
 	"flag"
@@ -28,6 +29,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
 	"tailscale.com/disco"
@@ -653,6 +656,79 @@ func main() {
 			netip.MustParseAddrPort("[2001:db8::1]:41641"),
 		}}).AppendMarshal(nil)
 		b.line("\t{ %q, %q },", "cmm-three", h(cm1))
+	}
+	b.line("};")
+	b.line("")
+
+	// ---- UDP over IPv6 -----------------------------------------------
+	//
+	// Complete IPv6+UDP packets, built and checksummed by gopacket rather
+	// than by anything of ours. The checksum is the whole point: over IPv6
+	// it is mandatory (RFC 8200 s8.1) and it covers a pseudo-header, so a
+	// wrong one is invisible in a loopback test and fatal against anything
+	// real. A vector computed by our own arithmetic would only prove we
+	// agree with ourselves.
+	b.line("/* IPv6 + UDP packets, via gopacket. */")
+	b.line("static const struct {")
+	b.line("\tconst char *name, *src, *dst;")
+	b.line("\tunsigned sport, dport;")
+	b.line("\tconst char *payload, *want;")
+	b.line("} kUdp6Vectors[] = {")
+	{
+		type udpCase struct {
+			name     string
+			src, dst string
+			sport    uint16
+			dport    uint16
+			payload  []byte
+		}
+		cases := []udpCase{
+			{"hello", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", 49152, 53,
+				[]byte("hello")},
+			// A zero-length datagram is legal and is a real thing on the
+			// wire: it is how some keepalives are sent.
+			{"empty", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", 49152, 53,
+				nil},
+			// An odd length, so the checksum's trailing-byte padding is
+			// exercised rather than only its even path.
+			{"odd", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", 1024, 65535,
+				[]byte("abc")},
+			{"one", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", 1, 1,
+				[]byte{0x00}},
+			// High bytes everywhere, which is where a sum that is folded
+			// wrongly shows up.
+			{"ff", "fd7a:115c:a1e0::dead:beef", "fd7a:115c:a1e0::2",
+				65535, 65534, bytes.Repeat([]byte{0xff}, 31)},
+			{"big", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", 49152, 7,
+				bytes.Repeat([]byte{0x5a}, 1152)},
+		}
+		for _, c := range cases {
+			ip := &layers.IPv6{
+				Version:    6,
+				NextHeader: layers.IPProtocolUDP,
+				HopLimit:   64,
+				SrcIP:      net.ParseIP(c.src),
+				DstIP:      net.ParseIP(c.dst),
+			}
+			udp := &layers.UDP{
+				SrcPort: layers.UDPPort(c.sport),
+				DstPort: layers.UDPPort(c.dport),
+			}
+			if err := udp.SetNetworkLayerForChecksum(ip); err != nil {
+				panic(err)
+			}
+			sbuf := gopacket.NewSerializeBuffer()
+			opts := gopacket.SerializeOptions{
+				FixLengths:       true,
+				ComputeChecksums: true,
+			}
+			if err := gopacket.SerializeLayers(sbuf, opts, ip, udp,
+				gopacket.Payload(c.payload)); err != nil {
+				panic(err)
+			}
+			b.line("\t{ %q, %q, %q, %d, %d, %q, %q },", c.name, c.src, c.dst,
+				c.sport, c.dport, h(c.payload), h(sbuf.Bytes()))
+		}
 	}
 	b.line("};")
 	b.line("")

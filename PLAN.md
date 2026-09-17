@@ -410,9 +410,45 @@ probes.
 
 ## Phase 5 — the long tail
 
-### 5.1 UDP through the tunnel · ~200 lines · low risk
-Datagram forwarding, plus `DialUDP`. The tunnel carries IP, so this is a UDP
-header and a demux entry.
+### 5.1 UDP through the tunnel · the mux ✅ · 466 lines
+
+**Done: `udpmux`**, the layer itself. Building and parsing IPv6+UDP through
+the tunnel, listeners, NAT-style bindings for replies, and a bounded receive
+queue.
+
+The wire format is checked against packets built by **gopacket**, in both
+directions, because the checksum is the part that cannot be checked any other
+way. It covers an IPv6 pseudo-header, so a wrong one is completely invisible
+to a loopback test — our sender and our receiver would agree perfectly and
+nothing else in the world would accept a single packet. That is the same
+shape as the IPv6 formatter bug (16), so this time the anchor came first.
+
+Two rules worth stating, both easy to get wrong:
+
+- Over IPv6 the UDP checksum is **mandatory** (RFC 8200 §8.1), because IPv6
+  has no header checksum of its own. A zero checksum is malformed, not
+  unprotected — applying IPv4's rule here would accept unverified datagrams.
+- A checksum that *computes* to zero must be sent as `0xFFFF`, equal in
+  ones-complement arithmetic, so zero keeps its meaning of "absent". Getting
+  this wrong yields a datagram that is correct 65535 times in 65536. The test
+  searches for a payload that lands on it rather than assuming the branch is
+  unreachable.
+
+Bindings expire after two minutes idle, per RFC 4787 REQ-5; shorter breaks
+request-response protocols that wait longer than that between packets.
+
+Eleven mutations were applied and all eleven are caught — though two of them
+had to be rewritten first. One was a false catch (it failed to compile), and
+one modelled the wrong bug: removing the zero-checksum rejection merely falls
+through to verification, which fails anyway. The hazard is IPv4's rule on
+IPv6, where zero means "skip verification"; written that way it is caught. A
+mutation that survives is a gap in the tests, but a mutation that is *caught*
+is only useful if it was the right mutation.
+
+**Still to do:** wiring it to the CLI — `forward` and `serve` accepting UDP
+port specs, and a local UDP socket pumped in both directions. The tunnel
+plumbing (routing an arriving IP packet to the TCP or the UDP mux by its next
+header) is one branch, since `tc_udp_mux_is_udp` exists for it.
 
 ### 5.2 NAT64 for IPv4 · ~100 lines · low risk
 Map IPv4 destinations into the NAT64 prefix, as upstream does, so IPv4

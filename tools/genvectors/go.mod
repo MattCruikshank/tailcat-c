@@ -3,6 +3,7 @@ module tailcatc/tools/genvectors
 go 1.27.1
 
 require (
+	github.com/google/gopacket v1.1.19
 	github.com/tailscale/wireguard-go v0.0.0-20260911194433-e3222a3340cd
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/crypto v0.57.0
