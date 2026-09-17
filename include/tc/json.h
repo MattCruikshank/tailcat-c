@@ -102,4 +102,32 @@ int tc_json_string_copy(const tc_json_event *ev, char *out, size_t cap);
  * escapes. Convenient and avoids a buffer at every call site. */
 bool tc_json_key_is(const tc_json_event *ev, const char *name);
 
+/* ---- writing ----------------------------------------------------------- */
+
+/* tc_json_escape writes s into out as the *contents* of a JSON string --
+ * escaped, NUL-terminated, without the surrounding quotes.
+ *
+ * `tailcat-c parse` prints JSON built from a tailcat address, and an address
+ * is something a stranger hands you. The hostnames and region names inside
+ * one are attacker-chosen strings going straight into a document someone is
+ * about to pipe to jq. Quoting them by hand is how that goes wrong.
+ *
+ * The escaping deliberately matches Go's encoding/json byte for byte,
+ * because the output is checked against the real `tailcat parse` and any
+ * difference would be a test failure rather than a judgement call:
+ *
+ *   - `"` and `\` are backslash-escaped; newline, return and tab get their
+ *     short forms; every other control byte becomes \u00XX.
+ *   - `<`, `>` and `&` become <, > and &. Go escapes these by
+ *     default so that JSON can be embedded in HTML without closing a tag.
+ *   - U+2028 and U+2029 are escaped: they are line terminators to a
+ *     JavaScript parser but not to a JSON one.
+ *   - Invalid UTF-8 becomes �, one escape per bad byte, so the result
+ *     is always a well-formed JSON string whatever the input was.
+ *
+ * Returns TC_ERR_NOSPACE if it does not fit, in which case out is
+ * unspecified. Worst case is six bytes of output per input byte, plus the
+ * NUL. */
+int tc_json_escape(char *out, size_t cap, const char *s);
+
 #endif /* TC_JSON_H_ */

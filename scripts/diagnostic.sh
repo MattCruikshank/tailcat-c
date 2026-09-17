@@ -295,6 +295,7 @@ if [ "$LEVEL" -le 3 ]; then
 		 done; exit \$fail"
 
 	stage "differential crosscheck against Go" "make interop"
+	stage "parse prints what the real tailcat prints" "make parse-interop"
 fi
 
 # ---- level 1 only: generated files, and the network ---------------------

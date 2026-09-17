@@ -108,6 +108,22 @@ typedef struct {
  * *out is fully overwritten on success and left unspecified on failure. */
 int tc_addr_parse(tc_conn_info *out, const char *addr, size_t addr_len);
 
+/* tc_addr_parse_raw is tc_addr_parse without the restoration: the fields the
+ * encoder elided are left zero and empty rather than derived.
+ *
+ * It exists for `tailcat-c parse`, which reports what an address *contains*.
+ * Upstream draws the same distinction -- its parse command calls
+ * ParseAddrRaw -- and it matters, because the restored values are guesses
+ * that happen to be right. A region with no ID encoded gets its 1-based
+ * index; printing "RegionID: 1" would claim the address said something it
+ * did not. Every other caller wants tc_addr_parse, because connecting needs
+ * the derived values and does not care where they came from.
+ *
+ * The result must not be handed to tc_addr_encode expecting a byte-identical
+ * round trip of a *restored* structure -- but a raw parse re-encodes to the
+ * same address, because eliding what was never there is a no-op. */
+int tc_addr_parse_raw(tc_conn_info *out, const char *addr, size_t addr_len);
+
 /* tc_addr_encode writes the address form of *ci to out as a NUL-terminated
  * string, storing the length excluding the NUL in *out_len when non-NULL.
  *

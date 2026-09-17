@@ -389,6 +389,145 @@ static void test_truncation_everywhere(void)
 	}
 }
 
+/* ---- writing ------------------------------------------------------------
+ *
+ * `tailcat-c parse` builds JSON out of a tailcat address, which is a string
+ * a stranger hands you. These are the inputs that turn a naive writer's
+ * output into something other than one JSON string.
+ */
+
+static const char *esc(const char *in)
+{
+	static char out[512];
+	int rc = tc_json_escape(out, sizeof out, in);
+	TCT_EQ_INT(rc, TC_OK);
+	return out;
+}
+
+static void test_escape_basics(void)
+{
+	TCT_CASE("ordinary text is unchanged");
+	TCT_EQ_STR(esc("derp1.example.com"), "derp1.example.com");
+	TCT_EQ_STR(esc(""), "");
+
+	TCT_CASE("the two characters that would end the string early");
+	TCT_EQ_STR(esc("a\"b"), "a\\\"b");
+	TCT_EQ_STR(esc("a\\b"), "a\\\\b");
+
+	TCT_CASE("a closing quote followed by structure");
+	/* The whole point. Unescaped, this ends the string and adds members. */
+	TCT_EQ_STR(esc("x\", \"Evil\": \"yes"),
+	           "x\\\", \\\"Evil\\\": \\\"yes");
+
+	TCT_CASE("control characters get their short forms");
+	TCT_EQ_STR(esc("a\nb"), "a\\nb");
+	TCT_EQ_STR(esc("a\rb"), "a\\rb");
+	TCT_EQ_STR(esc("a\tb"), "a\\tb");
+
+	TCT_CASE("and every other control byte becomes \\u00XX");
+	/* RFC 8259 forbids them raw, and a bare 0x1b is a terminal escape
+	 * sequence in whatever is reading the output. */
+	TCT_EQ_STR(esc("a\x01" "b"), "a\\u0001b");
+	TCT_EQ_STR(esc("\x1b[31m"), "\\u001b[31m");
+	TCT_EQ_STR(esc("\x7f"), "\x7f"); /* DEL is not escaped, as in Go */
+
+	TCT_CASE("Go escapes the three HTML characters by default");
+	/* Matching byte for byte matters: parse's output is compared against
+	 * the real tailcat's in scripts/parse-interop.sh. */
+	TCT_EQ_STR(esc("<script>"), "\\u003cscript\\u003e");
+	TCT_EQ_STR(esc("a&b"), "a\\u0026b");
+}
+
+static void test_escape_utf8(void)
+{
+	TCT_CASE("valid UTF-8 passes through");
+	TCT_EQ_STR(esc("caf\xc3\xa9"), "caf\xc3\xa9");
+	TCT_EQ_STR(esc("\xe6\x97\xa5\xe6\x9c\xac"), "\xe6\x97\xa5\xe6\x9c\xac");
+	TCT_EQ_STR(esc("\xf0\x9f\x90\x88"), "\xf0\x9f\x90\x88");
+
+	TCT_CASE("the JavaScript line terminators are escaped");
+	/* U+2028 and U+2029 are valid in JSON and end a line in JavaScript, so
+	 * output embedded in a script would break there. Go escapes them. */
+	TCT_EQ_STR(esc("a\xe2\x80\xa8" "b"), "a\\u2028b");
+	TCT_EQ_STR(esc("a\xe2\x80\xa9" "b"), "a\\u2029b");
+
+	TCT_CASE("invalid UTF-8 becomes one replacement per bad byte");
+	/* A writer that passed these through would emit a document its own
+	 * reader rejects. */
+	/* Split literal: "a\xffb" is one hex escape, because b is a hex
+	 * digit. The compiler reads 0xffb and truncates. */
+	TCT_EQ_STR(esc("a\xff" "b"), "a\\ufffdb");
+	TCT_EQ_STR(esc("\xc3"), "\\ufffd");          /* truncated two-byte */
+	TCT_EQ_STR(esc("\xe6\x97"), "\\ufffd\\ufffd"); /* truncated three-byte */
+	TCT_EQ_STR(esc("\x80"), "\\ufffd");          /* lone continuation */
+
+	TCT_CASE("an overlong encoding is not valid UTF-8");
+	/* 0xc0 0xaf is a second spelling of '/'. Accepting it lets a string
+	 * mean one thing to us and another to whatever reads the JSON. */
+	TCT_EQ_STR(esc("\xc0\xaf"), "\\ufffd\\ufffd");
+
+	TCT_CASE("a surrogate half is not valid UTF-8 either");
+	/* ED A0 80 is U+D800, which CBOR text should never carry. */
+	TCT_EQ_STR(esc("\xed\xa0\x80"), "\\ufffd\\ufffd\\ufffd");
+
+	TCT_CASE("and neither is anything above U+10FFFF");
+	TCT_EQ_STR(esc("\xf5\x80\x80\x80"), "\\ufffd\\ufffd\\ufffd\\ufffd");
+}
+
+static void test_escape_bounds(void)
+{
+	char out[8];
+
+	TCT_CASE("a result that does not fit is refused, not truncated");
+	TCT_EQ_INT(tc_json_escape(out, sizeof out, "abcdefghij"), TC_ERR_NOSPACE);
+
+	TCT_CASE("the worst case is six bytes per input byte");
+	/* Every byte of this expands to �, so a caller sizing a buffer at
+	 * 6n+1 is sized correctly and one at 5n+1 is not. */
+	char big[6 * 4 + 1];
+	TCT_EQ_INT(tc_json_escape(big, sizeof big, "\xff\xff\xff\xff"), TC_OK);
+	TCT_EQ_STR(big, "\\ufffd\\ufffd\\ufffd\\ufffd");
+	char small[5 * 4 + 1];
+	TCT_EQ_INT(tc_json_escape(small, sizeof small, "\xff\xff\xff\xff"),
+	           TC_ERR_NOSPACE);
+
+	TCT_CASE("exactly-fitting output");
+	char exact[4];
+	TCT_EQ_INT(tc_json_escape(exact, sizeof exact, "abc"), TC_OK);
+	TCT_EQ_STR(exact, "abc");
+	TCT_EQ_INT(tc_json_escape(exact, sizeof exact, "abcd"), TC_ERR_NOSPACE);
+
+	TCT_CASE("NULL arguments and a zero-length buffer");
+	TCT_EQ_INT(tc_json_escape(NULL, 16, "a"), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_json_escape(out, 0, "a"), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_json_escape(out, sizeof out, NULL), TC_ERR_INVAL);
+}
+
+static void test_escape_roundtrip(void)
+{
+	TCT_CASE("everything we emit parses back as one JSON string");
+	/* The property that matters, checked with our own reader rather than by
+	 * eye: whatever went in, the output is a well-formed string value. */
+	static const char *const inputs[] = {
+		"plain", "with \"quotes\"", "back\\slash", "tab\there",
+		"nl\nhere", "\x01\x02\x03", "<&>", "caf\xc3\xa9",
+		"bad\xff\xfe", "\xe2\x80\xa8", "\xed\xa0\x80", "",
+	};
+	for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+		char doc[1024];
+		char body[512];
+		TCT_EQ_INT(tc_json_escape(body, sizeof body, inputs[i]), TC_OK);
+		int n = snprintf(doc, sizeof doc, "\"%s\"", body);
+		TCT_TRUE(n > 0 && (size_t)n < sizeof doc);
+
+		tc_json_reader r;
+		tc_json_event ev;
+		tc_json_reader_init(&r, doc, (size_t)n);
+		TCT_EQ_INT(tc_json_next(&r, &ev), TC_OK);
+		TCT_EQ_INT((int)ev.type, (int)TC_JSON_STRING);
+	}
+}
+
 int main(void)
 {
 	test_accepts();
@@ -399,5 +538,9 @@ int main(void)
 	test_skip();
 	test_derpmap_shape();
 	test_truncation_everywhere();
+	test_escape_basics();
+	test_escape_utf8();
+	test_escape_bounds();
+	test_escape_roundtrip();
 	return tct_report("json");
 }

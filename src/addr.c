@@ -204,7 +204,8 @@ static void restore_elided(tc_conn_info *ci)
 	}
 }
 
-int tc_addr_parse(tc_conn_info *out, const char *addr, size_t addr_len)
+static int parse_into(tc_conn_info *out, const char *addr,
+                      size_t addr_len, bool restore)
 {
 	if (out == NULL || (addr == NULL && addr_len != 0))
 		return TC_ERR_INVAL;
@@ -305,9 +306,20 @@ int tc_addr_parse(tc_conn_info *out, const char *addr, size_t addr_len)
 		return TC_ERR_INVAL;
 	}
 
-	restore_elided(out);
+	if (restore)
+		restore_elided(out);
 	tc_memzero_explicit(cbor, sizeof cbor);
 	return TC_OK;
+}
+
+int tc_addr_parse(tc_conn_info *out, const char *addr, size_t addr_len)
+{
+	return parse_into(out, addr, addr_len, true);
+}
+
+int tc_addr_parse_raw(tc_conn_info *out, const char *addr, size_t addr_len)
+{
+	return parse_into(out, addr, addr_len, false);
 }
 
 /* ---- encoding -------------------------------------------------------- */

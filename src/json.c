@@ -523,3 +523,142 @@ int tc_json_skip_value(tc_json_reader *r)
 	}
 	return TC_OK;
 }
+
+/* ---- writing ----------------------------------------------------------- */
+
+static const char hexdig[] = "0123456789abcdef";
+
+/* utf8_len decodes one UTF-8 sequence at p, returning its length in bytes and
+ * storing the code point, or 0 if the bytes are not valid UTF-8.
+ *
+ * Strict on purpose: overlong encodings, surrogates and anything above
+ * U+10FFFF are rejected, because each of those is a way to smuggle a
+ * character past a check that decoded more leniently than the next reader
+ * does. */
+static size_t utf8_len(const unsigned char *p, size_t avail, uint32_t *cp)
+{
+	if (avail == 0)
+		return 0;
+	unsigned char c = p[0];
+	size_t n;
+	uint32_t v;
+
+	if (c < 0x80u) {
+		*cp = c;
+		return 1;
+	} else if ((c & 0xe0u) == 0xc0u) {
+		n = 2;
+		v = c & 0x1fu;
+	} else if ((c & 0xf0u) == 0xe0u) {
+		n = 3;
+		v = c & 0x0fu;
+	} else if ((c & 0xf8u) == 0xf0u) {
+		n = 4;
+		v = c & 0x07u;
+	} else {
+		return 0;
+	}
+	if (avail < n)
+		return 0;
+	for (size_t i = 1; i < n; i++) {
+		if ((p[i] & 0xc0u) != 0x80u)
+			return 0;
+		v = (v << 6) | (uint32_t)(p[i] & 0x3fu);
+	}
+	/* Overlong, surrogate, or out of range. */
+	if ((n == 2 && v < 0x80u) || (n == 3 && v < 0x800u) ||
+	    (n == 4 && v < 0x10000u))
+		return 0;
+	if (v >= 0xd800u && v <= 0xdfffu)
+		return 0;
+	if (v > 0x10ffffu)
+		return 0;
+	*cp = v;
+	return n;
+}
+
+int tc_json_escape(char *out, size_t cap, const char *s)
+{
+	size_t w = 0;
+
+	if (out == NULL || cap == 0 || s == NULL)
+		return TC_ERR_INVAL;
+
+#define PUT(ch)                                                               \
+	do {                                                                      \
+		if (w + 1 >= cap)                                                     \
+			return TC_ERR_NOSPACE;                                            \
+		out[w++] = (ch);                                                      \
+	} while (0)
+#define PUT2(a, b)                                                            \
+	do {                                                                      \
+		PUT(a);                                                               \
+		PUT(b);                                                               \
+	} while (0)
+
+	const unsigned char *p = (const unsigned char *)s;
+	size_t len = strlen(s);
+	for (size_t i = 0; i < len;) {
+		unsigned char c = p[i];
+
+		if (c < 0x80u) {
+			i++;
+			switch (c) {
+			case '"':
+				PUT2('\\', '"');
+				continue;
+			case '\\':
+				PUT2('\\', '\\');
+				continue;
+			case '\n':
+				PUT2('\\', 'n');
+				continue;
+			case '\r':
+				PUT2('\\', 'r');
+				continue;
+			case '\t':
+				PUT2('\\', 't');
+				continue;
+			default:
+				break;
+			}
+			/* Go escapes these three by default so that the result can sit
+			 * inside a <script> without ending it. */
+			if (c >= 0x20u && c != '<' && c != '>' && c != '&') {
+				PUT((char)c);
+				continue;
+			}
+			PUT2('\\', 'u');
+			PUT2('0', '0');
+			PUT2(hexdig[(c >> 4) & 0xfu], hexdig[c & 0xfu]);
+			continue;
+		}
+
+		uint32_t cp = 0;
+		size_t n = utf8_len(p + i, len - i, &cp);
+		if (n == 0) {
+			/* One replacement per bad byte, as Go does, so the output stays
+			 * a valid JSON string no matter what arrived. */
+			PUT2('\\', 'u');
+			PUT2('f', 'f');
+			PUT2('f', 'd');
+			i++;
+			continue;
+		}
+		if (cp == 0x2028u || cp == 0x2029u) {
+			PUT2('\\', 'u');
+			PUT2('2', '0');
+			PUT2('2', hexdig[cp & 0xfu]);
+			i += n;
+			continue;
+		}
+		for (size_t k = 0; k < n; k++)
+			PUT((char)p[i + k]);
+		i += n;
+	}
+
+#undef PUT
+#undef PUT2
+	out[w] = '\0';
+	return TC_OK;
+}
