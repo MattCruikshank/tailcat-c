@@ -191,7 +191,7 @@ direct peer-to-peer paths.
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
-| aarch64 | built; arithmetic verified, instructions pending qemu | ✅ |
+| aarch64 | ✅ all 36 test binaries pass on real aarch64 instructions (qemu-user) | ✅ |
 | Browser (WebAssembly) | ❌ | ✅ |
 | Persistent keys on disk | ✅ | ✅ |
 
@@ -330,7 +330,8 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-36 test binaries, 9,979 assertions, under two toolchains. The method matters
+36 test binaries, 9,979 assertions, under two toolchains and on both
+architectures. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
 
@@ -1251,9 +1252,11 @@ Roughly in the order they should be picked up.
       relays, and pointing a robot at someone else's infrastructure on every
       push is not a reasonable default.
 - [ ] **Run the aarch64 half.** `check-fat` proves it compiles, links and is
-      present in every binary; for a long time nothing had ever *executed*
-      it, which made it the largest untested claim here. Two of the four
-      rungs are now done and the remaining two need hardware or a package.
+      present in every binary; for most of this project's life nothing had
+      ever *executed* it, which made it the largest untested claim here.
+      **Three of the four rungs are now done and the suite passes on aarch64
+      instructions**; the last one needs hardware, or a full-system emulator
+      to exercise Cosmopolitan's own aarch64 runtime rather than only ours.
       - [x] **Build x86_64 with `-funsigned-char`** and run the whole suite —
             `make test-unsigned-char`, and a level 1 stage.
 
@@ -1276,18 +1279,32 @@ Roughly in the order they should be picked up.
             into a plain ELF. **It does not.** cosmocc already leaves a plain
             statically-linked aarch64 ELF beside each binary as
             `<name>.aarch64.elf`, and qemu-user runs those directly — no APE
-            loader, no binfmt registration. The target is written and waiting;
-            it has not been *run* here, because installing the package needs a
-            password this session does not have.
+            loader, no binfmt registration.
+
+            **Run, and it passes.** All 36 test binaries and 9,979 assertions,
+            on real aarch64 instructions under qemu-user 8.2.2, first attempt,
+            including the parts most likely to be architecture-sensitive:
+            Ed25519's 1,511 checks of bignum arithmetic, 842 of Noise, 1,241
+            of the UDP mux, and the whole SSH and SFTP stack.
+
+            Two of everything, both halves executed. Until this ran, half of
+            every binary in this repository had been compiled and never once
+            invoked, and the case for it resting on `-funsigned-char` above
+            was an argument rather than a measurement.
+
+            Ubuntu ships the emulator as `qemu-aarch64-static` and not
+            `qemu-aarch64`, which is why the level 1 stage accepts either
+            name.
       - [ ] **qemu-system** with a real aarch64 Linux: slow, but the only
             option that exercises Cosmopolitan's own aarch64 runtime rather
             than just our instructions. qemu-user translates syscalls to the
             host kernel, so it tests our code and not Cosmopolitan's.
       - [ ] **Real hardware** beats all of the above if any is to hand.
-- [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
-      covered; the other four targets are not, and the aarch64 half is
-      verified only for its arithmetic. With the feature work done this is
-      now the largest untested claim in the project.
+- [ ] **Test on macOS and the BSDs.** Both architectures now execute their
+      own instructions, so what is left is the *operating systems*: Linux and
+      Windows are covered and the other four are not. That is now the largest
+      untested claim in the project, and unlike the aarch64 half it cannot be
+      closed with an emulator and a package — it needs the machines.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
       that callers must serialise it. Nothing here is threaded today — the
       SSH server and client are blocking state machines driven by an event

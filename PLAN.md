@@ -874,14 +874,18 @@ These are already in the README's TODO list and do not depend on any feature.
   checks locally in three tiers; see the README. Hosted CI was rejected
   deliberately -- the live tests dial Tailscale's production relays, and that
   is not something to automate on every push.
-- **Test on macOS, the BSDs, and aarch64.** Two of six target operating
-  systems are covered, both x86_64. The aarch64 half is no longer wholly
-  unexecuted: `make test-unsigned-char` runs the entire suite under aarch64's
-  character signedness and passes, which clears the largest *class* of risk,
-  and `make test-aarch64` runs real aarch64 instructions under qemu-user but
-  needs `qemu-user-static` installed. qemu-system and real hardware are the
-  rungs above. The four remaining operating systems are still the largest
-  untested claim.
+- ~~**aarch64**~~: done. `make test-aarch64` runs all 36 test binaries on
+  real aarch64 instructions under qemu-user, and they pass -- 9,979
+  assertions, first attempt. Both halves of every fat binary now execute
+  their own instructions, where for most of this project's life one half had
+  been compiled and never invoked. `make test-unsigned-char` remains as the
+  cheap check that needs no emulator. Above this: qemu-system, which would
+  exercise Cosmopolitan's own aarch64 runtime rather than only our code
+  (qemu-user translates syscalls to the host kernel), and then hardware.
+- **Test on macOS and the BSDs.** Two of six target operating systems are
+  covered. With aarch64 executing, what is left is the operating systems,
+  and that is now the largest untested claim -- and the one an emulator and
+  a package cannot close.
 - **Extend fuzzing** to the DERP frame codec, which is the last of the three
   originally listed here — the JSON parser and the TCP input path both have
   harnesses now. The frame codec parses attacker-influenced lengths straight
