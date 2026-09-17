@@ -100,7 +100,7 @@ largest thing we add is the 181 KB CA bundle.
 | Pre-shared key layer | ✅ | ✅ |
 | DERP relay transport | ✅ | ✅ |
 | Bring your own relay | ✅ | ✅ |
-| Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ❌ | ✅ |
+| Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ✅ | ✅ |
 | Rekeying / session renewal | ✅ | ✅ |
 | Cookie reply (DoS mitigation) | ✅ | ✅ |
 | DERP map fetch | ✅ | ✅ |
@@ -505,6 +505,19 @@ RFC 5952's rules and then feeds our own output back through `inet_pton`,
 because a formatter checked only against a parser I also wrote proves that
 the two agree, not that either is right.
 
+**17. The server dropped the direct traffic it had just been sent.**
+*(Phase 4.4, found by the first end-to-end run.)* The two sides of a session
+decide independently where to send their own packets, so one routinely proves
+a direct path seconds before the other does -- the design says so explicitly.
+The receive side then demultiplexed arriving datagrams by asking "is this the
+path *I* chose?", which is false for exactly that window, so the client
+upgraded, sent its traffic directly, and the server threw it away. Every unit
+test passed: the state machine was right, and the code that consumed its
+answers asked the wrong question. Fixed with `tc_path_knows`, which asks
+whether the address belongs to this peer at all rather than whether we agree
+about it. The lesson is not about NATs -- it is that a component can be
+correct and still be wired up against a rule it states in its own header.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -539,12 +552,14 @@ Current, and deliberate unless noted.
 
 ### Protocol scope
 
-- **Relay-only, for now.** Every packet still goes through DERP. The pieces a
-  direct path is made of are here and tested -- a UDP transport, a STUN
-  client, netcheck, and the disco protocol -- but nothing yet probes candidate
-  paths, scores them, or moves a live session off the relay. Until that lands
-  this means higher latency than real tailcat wherever it would have gone
-  direct.
+- **Direct paths, with limits.** A session starts on the relay and moves to a
+  direct path once one has been proven, falling back if it stops working. What
+  is missing is the rest of what `magicsock` does: no relay-to-relay
+  discovery, no UDP relay allocation (disco `0x04` and up), no path MTU
+  discovery, and no interface preference beyond the round trip it produces.
+  Two peers that both sit behind symmetric NATs will stay on the relay, which
+  is the correct answer rather than a limitation -- but upstream has a UDP
+  relay for that case and we do not.
 - **One pipe at a time.** The data path is real — WireGuard, userspace TCP,
   and interop with the Go binary in both directions — but a session carries a
   single stream of bytes. The port-based commands all wait on the

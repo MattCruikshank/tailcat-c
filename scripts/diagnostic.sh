@@ -121,6 +121,7 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: DERP relay round trip and reconnection" "make live"
 	stage "live: STUN binding exchange" "make live-stun"
 	stage "live: netcheck against the real relay list" "make live-netcheck"
+	stage "live: a direct path between two of ours" "make live-direct"
 	stage "live: wireguard-go handshake" "make live-wg"
 	stage "live: real tailcat server" "make live-tailcat"
 	stage "live: CLI to a Go server" "make live-cli"

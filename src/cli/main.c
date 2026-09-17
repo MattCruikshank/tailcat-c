@@ -33,6 +33,8 @@
 #include "tc/fwdspec.h"
 #include "tc/keyfile.h"
 #include "tc/netcheck.h"
+#include "tc/path.h"
+#include "tc/udp.h"
 #include "tc/portset.h"
 #include "tc/shquote.h"
 #include "tc/proxy.h"
@@ -511,6 +513,15 @@ typedef struct {
 	 * and the stream unusable. The event loop acts on it; the callback
 	 * cannot, since it has no way to report upwards. */
 	bool relay_stalled;
+
+	/* Path discovery. Both NULL means relay-only, which is what everything
+	 * did before Phase 4.4 and what it falls back to whenever a direct path
+	 * has not been proven. */
+	tc_udp *udp;
+	tc_path *path;
+	/* So the upgrade and the fallback each get logged once rather than on
+	 * every packet. */
+	bool was_direct;
 } pump;
 
 /* wg_out is how the WireGuard layer reaches the wire: everything it emits --
@@ -519,6 +530,23 @@ typedef struct {
 static int wg_out(void *vctx, const uint8_t *pkt, size_t len)
 {
 	pump *p = (pump *)vctx;
+
+	/* The whole of the upgrade, from the data path's point of view: one
+	 * question asked per packet, and a different address if the answer has
+	 * changed. Nothing is renegotiated and no state moves, because the
+	 * WireGuard session does not know or care which way its packets
+	 * travelled. */
+	if (p->path != NULL && p->udp != NULL) {
+		tc_endpoint dst;
+		if (tc_path_best(p->path, &dst, now_ms()) == TC_PATH_DIRECT) {
+			if (tc_udp_send(p->udp, &dst, pkt, len) == TC_OK)
+				return TC_OK;
+			/* A send that failed outright -- no route, a dead interface --
+			 * is not worth losing the packet over when the relay is sitting
+			 * there working. */
+		}
+	}
+
 	/* A failed relay write is packet loss, which both WireGuard and TCP above
 	 * already handle by retrying. A write that *times out* is different: the
 	 * frame is half-sent and the stream is no longer parseable, so the loop
@@ -527,6 +555,201 @@ static int wg_out(void *vctx, const uint8_t *pkt, size_t len)
 	if (tc_derp_send(p->derp, p->server_key, pkt, len) == TC_ERR_TIMEOUT)
 		p->relay_stalled = true;
 	return TC_OK;
+}
+
+/* ---- path discovery ---------------------------------------------------- */
+
+/* Where disco probes go: straight out of the UDP socket, addressed to a
+ * candidate. */
+static int path_udp_out(void *vctx, const tc_endpoint *dst,
+                        const uint8_t *pkt, size_t len)
+{
+	pump *p = (pump *)vctx;
+	if (p->udp == NULL)
+		return TC_ERR_INVAL;
+	return tc_udp_send(p->udp, dst, pkt, len);
+}
+
+/* And where CallMeMaybe goes: through the relay, which is the one path known
+ * to work before any other has been proven. */
+static int path_relay_out(void *vctx, const uint8_t *pkt, size_t len)
+{
+	pump *p = (pump *)vctx;
+	if (p->derp == NULL)
+		return TC_ERR_INVAL;
+	return tc_derp_send(p->derp, p->server_key, pkt, len);
+}
+
+/* pump_log_path reports an upgrade or a fallback once, rather than on every
+ * packet. It is the only outward sign any of this is happening. */
+static void pump_log_path(pump *p)
+{
+	if (p->path == NULL)
+		return;
+	bool direct = tc_path_best(p->path, NULL, now_ms()) == TC_PATH_DIRECT;
+	if (direct == p->was_direct)
+		return;
+	char line[160];
+	if (tc_path_describe(line, sizeof line, p->path, now_ms()) == TC_OK)
+		vlogf("path: %s", line);
+	p->was_direct = direct;
+}
+
+/* pump_service_udp drains whatever has arrived on the UDP socket.
+ *
+ * Two kinds of thing share it. Disco belongs to the path layer; everything
+ * else is tunnel traffic that came directly, and is fed to WireGuard exactly
+ * as a relayed packet would be -- the session does not distinguish them.
+ *
+ * Non-blocking and bounded: this runs inside an event loop that has other
+ * work, and a peer sending faster than we drain must not be able to hold the
+ * loop here.
+ */
+static void pump_service_udp(pump *p, tc_tcp_mux *mux)
+{
+	if (p->udp == NULL || p->path == NULL)
+		return;
+
+	for (int i = 0; i < 32; i++) {
+		tc_endpoint src;
+		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+		size_t n = 0;
+		if (tc_udp_recv(p->udp, &src, buf, sizeof buf, &n, 0) != TC_OK)
+			break;
+
+		if (tc_path_input_disco(p->path, &src, buf, n, now_ms()) == TC_OK)
+			continue;
+
+		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
+		size_t inner_len = 0;
+		if (tc_wg_peer_input(p->peer, buf, n, inner, sizeof inner, &inner_len,
+		                     now_ms()) != TC_OK)
+			continue;
+
+		/* Only a payload that actually decrypted counts as proof this path
+		 * is alive. tc_wg_peer_input reports success for anything it
+		 * declined to act on too -- replays, forgeries, packets for a
+		 * keypair we no longer hold -- and treating those as liveness would
+		 * let anyone who can guess the address keep a dead path trusted by
+		 * spraying noise at it. */
+		if (inner_len > 0) {
+			tc_path_note_recv(p->path, &src, now_ms());
+			if (mux != NULL)
+				tc_tcp_mux_input(mux, inner, inner_len, now_ms());
+		}
+	}
+
+	tc_path_tick(p->path, now_ms());
+	pump_log_path(p);
+}
+
+/* pump_relay_disco takes a packet that arrived through the relay and gives it
+ * to the path layer if that is what it is.
+ *
+ * Returns true when the packet has been dealt with. CallMeMaybe is the only
+ * disco message that belongs on this channel, and path.c enforces that; the
+ * job here is only to keep it out of WireGuard's input, where it would be
+ * one more malformed packet to discard. */
+static bool pump_relay_disco(pump *p, const uint8_t *buf, size_t len)
+{
+	if (p->path == NULL || !tc_disco_looks_like(buf, len))
+		return false;
+	(void)tc_path_input_relay(p->path, buf, len, now_ms());
+	return true;
+}
+
+/* ---- bringing up path discovery ---------------------------------------- */
+
+/* path_bring_up opens the UDP socket a direct path would use, works out what
+ * addresses to offer the peer, and starts probing.
+ *
+ * Everything here is best-effort. A machine with no UDP, a network that
+ * blocks it, a peer with no disco key: each means no direct path, and no
+ * direct path means the relay, which is what was happening before any of this
+ * existed. Nothing in this function can break a session.
+ *
+ * The netcheck runs on *this* socket rather than a throwaway one. The mapped
+ * address a NAT hands out belongs to the socket that earned it, so an address
+ * learned on any other socket is an address the peer cannot use.
+ */
+/* path_local_list works out what addresses to offer a peer: this machine's
+ * own, plus whatever a netcheck on this very socket says the world sees.
+ *
+ * Computed once per socket rather than once per peer -- the answer is a
+ * property of the socket, and a server with eight clients should not run
+ * eight netchecks to learn the same thing eight times. */
+static size_t path_local_list(tc_udp *udp, const tc_derp_map *map,
+                              tc_endpoint *eps, size_t cap)
+{
+	size_t n = tc_udp_local_endpoints(udp, eps, cap);
+
+	if (map != NULL) {
+		tc_netcheck_opts o;
+		memset(&o, 0, sizeof o);
+		o.timeout_ms = 1500;
+		o.max_regions = 2; /* enough to learn the mapping; not a survey */
+		tc_netcheck_report rep;
+		if (tc_netcheck_run(&rep, map, udp, &o, NULL, NULL) == TC_OK) {
+			if (rep.global_v4.ip_len != 0 && n < cap)
+				eps[n++] = rep.global_v4;
+			if (rep.global_v6.ip_len != 0 && n < cap)
+				eps[n++] = rep.global_v6;
+			if (rep.mapping_varies_known && rep.mapping_varies)
+				/* Worth saying once. The address we are about to advertise
+				 * is the one the relay's STUN server sees, and a symmetric
+				 * NAT gives every destination a different one -- so the
+				 * probing that follows will almost certainly fail, and the
+				 * relay is where this session is going to stay. */
+				vlogf("this NAT maps by destination; a direct path is "
+				      "unlikely");
+		}
+	}
+	return n;
+}
+
+/* path_attach starts probing for one peer on an already-open socket. */
+static bool path_attach(pump *ctx, tc_udp *udp, tc_path *path,
+                        const uint8_t our_disco_priv[32],
+                        const uint8_t our_disco_pub[32],
+                        const uint8_t peer_disco_pub[32],
+                        const tc_endpoint *eps, size_t n)
+{
+	if (tc_path_init(path, our_disco_priv, our_disco_pub, peer_disco_pub,
+	                 path_udp_out, path_relay_out, ctx) != TC_OK)
+		return false;
+	tc_path_set_local(path, eps, n);
+	ctx->udp = udp;
+	ctx->path = path;
+	(void)tc_path_start(path, now_ms());
+	vlogf("probing for a direct path (%zu of our addresses offered)", n);
+	return true;
+}
+
+/* path_bring_up is the single-peer case: open the socket, work out the
+ * addresses, start probing.
+ *
+ * Everything here is best-effort. A machine with no UDP, a network that
+ * blocks it, a peer with no disco key: each means no direct path, and no
+ * direct path means the relay, which is what was happening before any of this
+ * existed. Nothing in this function can break a session. */
+static bool path_bring_up(pump *ctx, tc_udp *udp, tc_path *path,
+                          const uint8_t our_disco_priv[32],
+                          const uint8_t our_disco_pub[32],
+                          const uint8_t peer_disco_pub[32],
+                          const tc_derp_map *map)
+{
+	if (tc_udp_open(udp, 0) != TC_OK) {
+		vlogf("no UDP socket; staying on the relay");
+		return false;
+	}
+	tc_endpoint eps[TC_PATH_MAX_LOCAL];
+	size_t n = path_local_list(udp, map, eps, TC_PATH_MAX_LOCAL);
+	if (!path_attach(ctx, udp, path, our_disco_priv, our_disco_pub,
+	                 peer_disco_pub, eps, n)) {
+		tc_udp_close(udp);
+		return false;
+	}
+	return true;
 }
 
 static int tcp_out(void *vctx, const uint8_t *ip_pkt, size_t len)
@@ -658,7 +881,8 @@ static bool write_all(int fd, const uint8_t *p, size_t n)
 static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
                     tc_tcp_mux *mux, tc_tcp_conn *tcp,
                     const uint8_t peer_key[32], const uint8_t *reintroduce,
-                    size_t reintroduce_len, bool *stall, uint64_t deadline)
+                    size_t reintroduce_len, bool *stall, uint64_t deadline,
+                    pump *pm)
 {
 	/* Non-blocking stdin, so the loop never stalls on a slow writer while
 	 * the tunnel has work to do. */
@@ -689,6 +913,8 @@ static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
 		 * rekey age must start renewing before TCP tries to send under it. */
 		tc_wg_peer_tick(peer, t);
 		tc_tcp_mux_tick(mux, t);
+		if (pm != NULL)
+			pump_service_udp(pm, mux);
 
 		/* Serving: the connection arrives rather than being dialled. Only
 		 * the first is taken -- a pipe has one stdin to give it. */
@@ -830,6 +1056,8 @@ static int run_pipe(tc_derp_client *derp, tc_wg_peer *peer,
 		}
 		if (memcmp(src, peer_key, 32) != 0 || len == 0)
 			continue;
+		if (pm != NULL && pump_relay_disco(pm, buf, len))
+			continue;
 
 		/* Every WireGuard message goes here, not just transport packets:
 		 * a rekey initiation from the peer arrives on this same path and
@@ -946,9 +1174,12 @@ static bool accept_any_port(void *ctx, uint16_t port)
 typedef struct {
 	bool used;
 	uint8_t key[TC_NODE_KEY_LEN];
+	uint8_t disco[TC_DISCO_KEY_LEN]; /* from the meow; how disco is demuxed */
 	tc_wg_peer peer;
 	tc_tcp_mux *mux;
 	pump ctx; /* per client: wg_out has to address this peer's node key */
+	tc_path path;
+	bool has_path;
 	uint64_t last_seen_ms;
 } serve_client;
 
@@ -961,6 +1192,16 @@ typedef struct {
 	tc_proxy *proxy;
 	uint64_t refused;
 	uint64_t served;
+
+	/* One UDP socket for every client. A socket is a NAT mapping, and one
+	 * mapping shared by all peers is both fewer holes to keep open and the
+	 * only way the address we advertise means the same thing to each of
+	 * them. */
+	tc_udp udp;
+	bool have_udp;
+	uint8_t disco_priv[32], disco_pub[32];
+	tc_endpoint local[TC_PATH_MAX_LOCAL];
+	size_t num_local;
 } serve_state;
 
 static size_t client_count(const serve_state *st)
@@ -998,7 +1239,7 @@ static void drop_client(serve_state *st, serve_client *sc)
 }
 
 static serve_client *add_client(serve_state *st, const uint8_t key[32],
-                                uint64_t now)
+                                const uint8_t disco[32], uint64_t now)
 {
 	serve_client *sc = NULL;
 	for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
@@ -1017,6 +1258,7 @@ static serve_client *add_client(serve_state *st, const uint8_t key[32],
 
 	memset(sc, 0, sizeof *sc);
 	memcpy(sc->key, key, 32);
+	memcpy(sc->disco, disco, 32);
 	sc->ctx.derp = st->derp;
 	memcpy(sc->ctx.server_key, key, 32);
 	if (tc_wg_peer_init(&sc->peer, &st->me, key, st->psk, wg_out, &sc->ctx) !=
@@ -1036,6 +1278,11 @@ static serve_client *add_client(serve_state *st, const uint8_t key[32],
 	}
 	tc_tcp_mux_set_accept_filter(sc->mux, port_is_served,
 	                             (void *)(uintptr_t)st->ports);
+
+	if (st->have_udp)
+		sc->has_path =
+		    path_attach(&sc->ctx, &st->udp, &sc->path, st->disco_priv,
+		                st->disco_pub, sc->disco, st->local, st->num_local);
 
 	sc->used = true;
 	sc->last_seen_ms = now;
@@ -1057,7 +1304,7 @@ static void handle_meow(serve_state *st, const uint8_t src[32],
 
 	serve_client *sc = find_client(st, node);
 	if (sc == NULL) {
-		sc = add_client(st, node, now);
+		sc = add_client(st, node, disco, now);
 		if (sc == NULL) {
 			vlogf("refusing a new client: %d already connected",
 			      TC_SERVE_MAX_CLIENTS);
@@ -1074,6 +1321,81 @@ static void handle_meow(serve_state *st, const uint8_t src[32],
 	size_t ack_len = 0;
 	tc_meow_encode_meowed(ack, sizeof ack, &ack_len);
 	(void)tc_derp_send(st->derp, node, ack, ack_len);
+}
+
+/* serve_service_udp drains the shared socket and gives each datagram to the
+ * client it belongs to.
+ *
+ * Two different keys, because the two kinds of packet identify themselves
+ * differently. Disco names its sender in the clear, so a disco packet is
+ * matched on the peer's disco key -- and then opened, which is what proves
+ * the claim. Tunnel traffic names nothing, so it is matched on the address it
+ * came from, which works because we only ever send directly to a path that
+ * has been proven, and therefore only ever receive on one.
+ *
+ * Not tried against every client in turn: feeding one client's packets to
+ * another's WireGuard peer would be eight chances to get a replay counter or
+ * a handshake attributed to the wrong session, in exchange for nothing.
+ */
+static void serve_service_udp(serve_state *st)
+{
+	if (!st->have_udp)
+		return;
+
+	for (int i = 0; i < 64; i++) {
+		tc_endpoint src;
+		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+		size_t n = 0;
+		if (tc_udp_recv(&st->udp, &src, buf, sizeof buf, &n, 0) != TC_OK)
+			break;
+
+		uint8_t claimed[32];
+		if (tc_disco_source(buf, n, claimed) == TC_OK) {
+			for (size_t k = 0; k < TC_SERVE_MAX_CLIENTS; k++) {
+				serve_client *sc = &st->c[k];
+				if (!sc->used || !sc->has_path)
+					continue;
+				if (memcmp(sc->disco, claimed, 32) != 0)
+					continue;
+				(void)tc_path_input_disco(&sc->path, &src, buf, n, now_ms());
+				break;
+			}
+			continue;
+		}
+
+		for (size_t k = 0; k < TC_SERVE_MAX_CLIENTS; k++) {
+			serve_client *sc = &st->c[k];
+			if (!sc->used || !sc->has_path)
+				continue;
+			/* Any address we associate with this client, not only the
+			 * one we happen to be sending to. The two sides decide
+			 * independently and a peer routinely proves the path first, so
+			 * requiring agreement here would drop exactly the traffic that
+			 * shows the upgrade worked. */
+			if (!tc_path_knows(&sc->path, &src))
+				continue;
+
+			static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
+			size_t inner_len = 0;
+			if (tc_wg_peer_input(&sc->peer, buf, n, inner, sizeof inner,
+			                     &inner_len, now_ms()) != TC_OK)
+				break;
+			if (inner_len > 0) {
+				tc_path_note_recv(&sc->path, &src, now_ms());
+				sc->last_seen_ms = now_ms();
+				tc_tcp_mux_input(sc->mux, inner, inner_len, now_ms());
+			}
+			break;
+		}
+	}
+
+	for (size_t k = 0; k < TC_SERVE_MAX_CLIENTS; k++) {
+		serve_client *sc = &st->c[k];
+		if (sc->used && sc->has_path) {
+			(void)tc_path_tick(&sc->path, now_ms());
+			pump_log_path(&sc->ctx);
+		}
+	}
 }
 
 /* expire_idle drops clients that are gone: no keys, no connections, and
@@ -1110,6 +1432,7 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 
 	while (now_ms() < deadline) {
 		uint64_t t = now_ms();
+		serve_service_udp(st);
 
 		/* A relay write that timed out leaves a half-written frame, so the
 		 * connection has to be rebuilt before anything else uses it. Any
@@ -1258,6 +1581,9 @@ static int run_serve_multi(serve_state *st, uint64_t deadline)
 		if (sc == NULL)
 			continue;
 		sc->last_seen_ms = now_ms();
+
+		if (sc->has_path && pump_relay_disco(&sc->ctx, buf, len))
+			continue;
 
 		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
 		size_t inner_len = 0;
@@ -1598,6 +1924,9 @@ typedef struct {
 	tc_wg_peer peer;
 	pump ctx;
 	tc_tcp_mux *mux;
+	tc_udp udp;
+	tc_path path;
+	bool have_udp;
 	/* Kept so the relay can be re-introduced to us after a reconnection: the
 	 * relay forgets who is talking to whom, the tunnel does not. */
 	uint8_t ping[TC_MEOW_PING_LEN];
@@ -1615,6 +1944,11 @@ static void client_down(tc_client *cl)
 		log_wg_summary(&cl->peer);
 	tc_wg_peer_clear(&cl->peer);
 	tc_derp_close(&cl->derp);
+	if (cl->have_udp) {
+		tc_udp_close(&cl->udp);
+		cl->have_udp = false;
+	}
+	tc_memzero_explicit(&cl->path, sizeof cl->path);
 	tc_memzero_explicit(&cl->me, sizeof cl->me);
 }
 
@@ -1644,7 +1978,7 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 	if (load_key(&saved, key_spec, true, &have_saved) != TC_OK)
 		return 1;
 
-	uint8_t disco_pub[32];
+	uint8_t disco_pub[32], disco_priv[32];
 	if (have_saved) {
 		if (tc_wg_identity_from_private(&cl->me, saved.private_key) != TC_OK) {
 			fprintf(stderr, "tailcat-c: the saved key is not usable\n");
@@ -1654,7 +1988,8 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 		fprintf(stderr, "tailcat-c: could not generate keys\n");
 		return 1;
 	}
-	if (tc_disco_key_for_node(NULL, disco_pub, cl->me.private_key) != TC_OK) {
+	if (tc_disco_key_for_node(disco_priv, disco_pub, cl->me.private_key) !=
+	    TC_OK) {
 		fprintf(stderr, "tailcat-c: could not derive the disco key\n");
 		return 1;
 	}
@@ -1758,6 +2093,27 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 	}
 	vlogf("tunnel up");
 
+	/* The relay carries the session from here whatever happens next; this
+	 * only looks for something quicker. It needs the peer's disco key, which
+	 * a self-contained address carries and a short one does not always. */
+	if (cl->ci.has_disco_public) {
+		/* A one-region map holding the relay we are already talking to. Its
+		 * STUN server is the one whose answer matters: the mapped address we
+		 * advertise should come from the same direction our traffic does. */
+		static tc_derp_map one;
+		memset(&one, 0, sizeof one);
+		if (cl->ci.num_regions > 0) {
+			one.regions[0] = cl->ci.regions[0];
+			one.num_regions = 1;
+		}
+		cl->have_udp = path_bring_up(&cl->ctx, &cl->udp, &cl->path, disco_priv,
+		                             disco_pub, cl->ci.server_disco_public,
+		                             one.num_regions > 0 ? &one : NULL);
+	}
+	else
+		vlogf("the address carries no disco key; staying on the relay");
+	tc_memzero_explicit(disco_priv, sizeof disco_priv);
+
 	uint8_t our_ip[TC_TUNNEL_ADDR_LEN], their_ip[TC_TUNNEL_ADDR_LEN];
 	tc_tunnel_addr_for_key(our_ip, cl->me.public_key);
 	tc_tunnel_addr_for_key(their_ip, cl->ci.server_public);
@@ -1797,7 +2153,7 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 
 	int status = run_pipe(&cl.derp, &cl.peer, cl.mux, tcp,
 	                      cl.ci.server_public, cl.ping, cl.ping_len,
-	                      &cl.ctx.relay_stalled, deadline);
+	                      &cl.ctx.relay_stalled, deadline, &cl.ctx);
 
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
@@ -2127,6 +2483,8 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				(void)poll(pfds, nfds, wait_ms);
 		}
 
+		pump_service_udp(&cl->ctx, cl->mux);
+
 		uint8_t src[32];
 		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
 		size_t len = 0;
@@ -2156,6 +2514,8 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 			return 1;
 		}
 		if (memcmp(src, cl->ci.server_public, 32) != 0 || len == 0)
+			continue;
+		if (pump_relay_disco(&cl->ctx, buf, len))
 			continue;
 
 		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
@@ -2303,6 +2663,7 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	}
 
 out:
+
 	/* Order matters: the proxy refers to connections the mux owns. */
 	tc_proxy_free(proxy);
 	client_down(&cl);
@@ -2651,6 +3012,12 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		return 1;
 	}
 
+	/* Declared before the first goto out, so the cleanup there never reads
+	 * an indeterminate flag. */
+	tc_udp udp;
+	tc_path path;
+	bool have_udp = false;
+
 	tc_derp_dial_opts opts;
 	memset(&opts, 0, sizeof opts);
 	opts.hostname = relay_host;
@@ -2708,7 +3075,31 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		}
 		tc_derp_set_write_timeout(&derp, 15000);
 
+		/* One socket and one netcheck for every client. The addresses we
+		 * advertise are a property of the socket, so working them out once
+		 * is not only cheaper, it is the only way each client is told the
+		 * same thing. */
+		if (tc_disco_key_for_node(st.disco_priv, st.disco_pub,
+		                          me.private_key) == TC_OK &&
+		    tc_udp_open(&st.udp, 0) == TC_OK) {
+			static tc_derp_map one;
+			memset(&one, 0, sizeof one);
+			if (ci.num_regions > 0) {
+				one.regions[0] = ci.regions[0];
+				one.num_regions = 1;
+			}
+			st.num_local = path_local_list(
+			    &st.udp, one.num_regions > 0 ? &one : NULL, st.local,
+			    TC_PATH_MAX_LOCAL);
+			st.have_udp = true;
+		} else {
+			vlogf("no UDP socket; every client stays on the relay");
+		}
+
 		status = run_serve_multi(&st, deadline);
+		if (st.have_udp)
+			tc_udp_close(&st.udp);
+		tc_memzero_explicit(st.disco_priv, sizeof st.disco_priv);
 
 		for (size_t i = 0; i < TC_SERVE_MAX_CLIENTS; i++) {
 			if (st.c[i].used)
@@ -2719,7 +3110,7 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		return status;
 	}
 
-	uint8_t client_key[32];
+	uint8_t client_key[32], client_disco[32];
 	bool have_client = false;
 	bool up = false;
 
@@ -2746,6 +3137,7 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 				continue; /* the relay's idea of the sender must agree */
 			if (!have_client) {
 				memcpy(client_key, node, 32);
+				memcpy(client_disco, disco, 32);
 				have_client = true;
 				vlogf("client introduced itself");
 			} else if (memcmp(client_key, node, 32) != 0) {
@@ -2776,6 +3168,25 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 				goto out;
 			}
 			ctx.peer = &peer;
+
+			/* The client's disco key came in the meow, so a direct path can
+			 * be looked for from here. The server probes too rather than
+			 * waiting to be found: whichever side is easier to reach, the
+			 * probes have to cross for a hole to open. */
+			uint8_t sd_priv[32], sd_pub[32];
+			if (tc_disco_key_for_node(sd_priv, sd_pub, me.private_key) ==
+			    TC_OK) {
+				static tc_derp_map one;
+				memset(&one, 0, sizeof one);
+				if (ci.num_regions > 0) {
+					one.regions[0] = ci.regions[0];
+					one.num_regions = 1;
+				}
+				have_udp = path_bring_up(&ctx, &udp, &path, sd_priv, sd_pub,
+				                         client_disco,
+				                         one.num_regions > 0 ? &one : NULL);
+				tc_memzero_explicit(sd_priv, sizeof sd_priv);
+			}
 		}
 
 		size_t ignored = 0;
@@ -2816,11 +3227,13 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 	 * introduced to rather than introducing, so it has nothing to re-send
 	 * after a reconnection: the client re-meows and we answer. */
 	status = run_pipe(&derp, &peer, mux, NULL, client_key, NULL, 0,
-	                  &ctx.relay_stalled, deadline);
+	                  &ctx.relay_stalled, deadline, &ctx);
 	if (status != 0 && now_ms() >= deadline)
 		fprintf(stderr, "tailcat-c: timed out after %u seconds\n", timeout_s);
 
 out:
+	if (have_udp)
+		tc_udp_close(&udp);
 	/* Order matters: the proxy refers to connections the mux owns. */
 	tc_proxy_free(proxy);
 	tc_tcp_mux_free(mux);

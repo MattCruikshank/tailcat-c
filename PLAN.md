@@ -332,17 +332,47 @@ Verified against `tailscale.com/disco` in both directions — our messages
 against theirs, and their bytes through our parser — using inner payloads as
 vectors, since the outer nonce is random and cannot be compared.
 
-### 4.4 Path discovery and upgrade · ~600 lines · **high risk**
+### 4.4 Path discovery and upgrade ✅ · 954 lines
 
-The actual hard part, and the reason the original scope excluded it. Probing
-candidate paths, scoring them, switching a live session from DERP to direct
-without dropping packets, detecting a dead direct path and falling back, and
-handling both peers doing this at once. This is the heart of what
-`magicsock` spends 11,000 lines on.
+The hard one, and the reason the original scope excluded it.
 
-Testable the same way the TCP stack was — a simulated network with
-configurable NAT behaviour — but the failure modes are timing-dependent and
-the interop surface is large.
+**The rule everything rests on:** a path is usable only when a Ping we sent
+along it has been answered. Not when we have an address for it, not when a
+packet arrived from it, not when it looks plausible. Only a Pong proves the
+path carries traffic *inbound*, through whatever NAT is in the way. Every
+other signal can be produced by an attacker or by a NAT that will drop the
+next packet, and acting on one means sending a live session into a hole.
+
+Switching is only a change to where the next packet is addressed. Nothing is
+renegotiated and no state moves, because the WireGuard session is the same
+session either way; the new path is proven before it is used and the old one
+keeps working while the new one is probed, so there is no moment at which a
+packet can be lost. Coming back is the dangerous direction and gets the
+conservative treatment: a direct path that goes quiet is abandoned after
+`TC_PATH_TRUST_MS` and the relay, which never stopped working, takes over.
+
+Both peers doing this at once needs no leader and no agreement. Each side
+decides where its own packets go, so the two directions can differ for a
+while — A direct, B still relayed. That asymmetry is correct and closes on
+its own.
+
+Tested against a simulated network where the NAT behaviour, the loss, the
+delay and the clock are all arguments: two public hosts, two ordinary NATs
+punching through, a symmetric NAT that can never work, symmetric-to-public
+(which works, but only via the inbound probe), a path dying under a live
+session, a path recovering, 40% loss, 100% loss, and a peer flooding the
+candidate table. A minute of protocol time costs no wall clock.
+
+Ten mutations of the decision logic were applied. Six survived the first
+pass, which is the whole reason for doing it — in particular *nothing* was
+testing the one rule above, because no scenario had one-way reachability.
+After adding that scenario and four others, nine of ten are caught and the
+tenth is an equivalent mutant.
+
+Not implemented, deliberately: relay-to-relay discovery, UDP relay allocation
+(disco 0x04 and up), path MTU discovery, and any interface preference beyond
+the round trip it produces. Upstream's `magicsock` spends about eleven
+thousand lines on all of it.
 
 ### 4.5 netcheck ✅ · 620 lines
 
@@ -374,8 +404,7 @@ Not implemented, deliberately: hairpinning, UPnP/PMP/PCP, captive portal
 detection. Each is a separate mechanism rather than a reading of these
 probes.
 
-**Phase 4 total: ~1,950 lines.** Realistically the longest phase in calendar
-time regardless of line count.
+**Phase 4 done: 2,801 lines.** The longest phase, as expected.
 
 ---
 

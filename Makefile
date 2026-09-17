@@ -169,6 +169,7 @@ LIB_SRCS := \
 	src/net/udp.c \
 	src/net/disco.c \
 	src/net/netcheck.c \
+	src/net/path.c \
 	src/net/tcp.c \
 	src/net/tcpmux.c \
 	src/net/proxy.c \
@@ -183,7 +184,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct diag1 diag3 diag5
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -308,6 +309,11 @@ $(BUILD)/livenetcheck: tests/livenetcheck.c $(LIB_OBJS)
 
 live-netcheck: $(BUILD)/livenetcheck
 	./$(BUILD)/livenetcheck
+
+# A tailcat-c client and a tailcat-c server finding a direct path between
+# them, which is the half of Phase 4.4 a simulated network cannot check.
+live-direct: $(CLI)
+	CLI=$(CLI) sh scripts/live-direct.sh
 
 live-cli: $(CLI)
 	CLI=$(CLI) sh scripts/live-cli.sh
