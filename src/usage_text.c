@@ -140,6 +140,7 @@ const char tc_usage_text[] =
 	"    tailcat-c parse <tc-addr>       # describe an address\n"
 	"    tailcat-c resolve <tc-addr>     # embed the relay, for offline use\n"
 	"    tailcat-c ping <tc-addr>        # time the round trip\n"
+	"    tailcat-c ping --until-direct <tc-addr>   # and wait for a direct path\n"
 	"    tailcat-c netcheck              # UDP, NAT type and relay latency\n"
 	"    tailcat-c version\n"
 	"\n"

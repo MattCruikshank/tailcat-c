@@ -117,14 +117,6 @@ own feature list:
   it public and the server must then authenticate clients itself.
 - **`socks` recognising a tailcat address as a URL hostname**, which is what
   makes the address argument optional there.
-- **`ping --until-direct`**, which keeps pinging until a direct path works
-  and exits non-zero if none does. Larger than it sounds, and larger than
-  this list first claimed: `ping` here is relay-only. It opens a DERP
-  connection, sends a meow ping and waits for the reply, and never attempts
-  a direct path at all -- so there is nothing to loop on. The flag needs
-  `ping` rebuilt on the client stack the pipe uses, which does have path
-  discovery. That would also close the cosmetic gap where upstream reports
-  `pong … via 203.0.113.7:41641` and we can only ever name the relay.
 - **`genkey --fixed-region`** and **`genkey --region=<relay-hostname>`**.
   `--relay` pins a relay for `serve`, so what is missing is baking the choice
   into a *saved key* -- which is what makes a published address keep working
@@ -209,7 +201,8 @@ direct peer-to-peer paths.
 | `serve` | ports, ranges, `all`; many clients | full |
 | `parse` | ✅ (byte-identical JSON) | ✅ |
 | `version` | ✅ | ✅ |
-| `ping` | ✅ | ✅ (`--until-direct`) |
+| `ping` | ✅ | ✅ |
+| `ping --until-direct` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
 | `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, one server | ✅ (many servers) |
@@ -228,7 +221,6 @@ direct peer-to-peer paths.
 | addresses in DNS TXT records | ❌ | ✅ (`tailcat ssh example.com`) |
 | `socks` with the address omitted | ❌ | ✅ (tc-addr as a URL hostname) |
 
-| `ping --until-direct` | ❌ | ✅ |
 | `genkey --fixed-region` | ❌ (`--relay` pins one for `serve`) | ✅ |
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
 | reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |

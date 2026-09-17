@@ -918,23 +918,31 @@ In rough order of what they cost:
    got in bug 32 -- `socks <addr> python3 x.py --from-env 18082` had
    `--from-env` read as ours -- which is the third subcommand to want it and
    an argument for making that the rule rather than the exception.
-2. **`ping --until-direct`.** Bigger than this list first said, and the
-   correction is the useful part: it claimed "path discovery already reports
-   which path a reply arrived on, so this is a loop and an exit code". That
-   is false. `ping` here is relay-only -- it opens a DERP connection, sends a
-   meow ping, waits for the reply -- and never attempts a direct path, so
-   there is nothing to loop on and the flag could only ever fail.
+2. ~~**`ping --until-direct`**~~: done, and it cost about what the second
+   estimate said rather than the first. The first estimate -- "a loop and an
+   exit code" -- was wrong because plain `ping` is relay-only: a DERP
+   connection, a meow ping, a reply, and no attempt at a direct path. There
+   was nothing to loop on.
 
-   Doing it properly means rebuilding `ping` on the client stack the pipe
-   uses: `client_up` for the tunnel, `path_bring_up` for discovery, a pump
-   loop to drive them, and `tc_path_best` to ask which way the last reply
-   came. Every piece exists; none of them is currently wired into `ping`,
-   and the pump is the fiddliest code in the project. Call it a day's work
-   touching the part with the worst failure modes, not an hour.
+   What it actually needed was already written and pointed at a different
+   command. `client_up` brings the tunnel up *including* path discovery;
+   `ls_pump_once` was a general client turn wearing a specific name, now
+   `client_pump_once`; `tc_path_describe` already renders the endpoint and
+   the round trip. So `--until-direct` is client_up, that pump in a loop, and
+   `tc_path_best` as the exit condition. Plain `ping` is untouched, which
+   kept the blast radius to a new function.
 
-   It would also close the cosmetic gap in the walkthrough: upstream's ping
-   names the direct path it used, and ours can only ever name a relay
-   because a relay is all it has.
+   Two things fell out of writing it. `--timeout 0` means "no deadline"
+   everywhere else here, and the first draft quietly turned it into ten
+   seconds -- the same class of surprise as bugs 33 and 34, caught before it
+   shipped. And the "no direct path is possible" branch cannot be reached
+   against our own server, because our addresses always carry a disco key; it
+   was verified by forcing the condition, the way a mutation test does.
+
+   Still open from this item: plain `ping` remains relay-only, so it reports
+   `via tc301a.ipn.dev` where upstream reports `via 203.0.113.7:41641`. The
+   machinery to fix that is now wired in and one call away, but changing
+   what plain `ping` prints is a separate decision.
 3. **Reaching a third address from the pipe form and `ssh -p ip:port`.**
    `forward` parses `local:ip:port` and `serve exit-node` serves it, so both
    ends exist; what is missing is accepting the syntax in two more places and

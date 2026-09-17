@@ -128,8 +128,10 @@ static void usage(FILE *f)
 	        "  tailcat-c ssh [-p PORT] [user@]<tc-addr> [cmd...]\n"
 	        "  tailcat-c cp [-r] <src>... <dst>        copy via scp, paths as "
 	        "<tc-addr>:path\n"
-	        "  tailcat-c ping <tc-address>             time the round trip to "
-	        "a server\n"
+	        "  tailcat-c ping [--until-direct] <tc-address>\n"
+	        "                                          time the round trip; with\n"
+	        "                                          --until-direct, wait for a\n"
+	        "                                          peer-to-peer path\n"
 	        "  tailcat-c resolve <tc-address>          embed the relay, for "
 	        "offline use\n"
 	        "  tailcat-c parse <tc-address>            describe an address\n"
@@ -151,6 +153,8 @@ static void usage(FILE *f)
 	        "clients need no map\n"
 	        "      --allow KEYS      comma-separated client nodekey: list "
 	        "for serve, or \"none\"\n"
+	        "      --until-direct    for ping: wait for a peer-to-peer path,\n"
+	        "                        and fail if there is not one\n"
 	        "      --open-browser    for forward: open a browser at the "
 	        "local listener, as browse does\n"
 	        "      --bind ADDR       listen address for forward and socks "
@@ -569,9 +573,25 @@ static int cmd_resolve(const char *addr_str, const char *derpmap_url,
 /* cmd_ping times the meow round trip: reach the relay, introduce ourselves,
  * and wait to be acknowledged. That is the same exchange the pipe mode does
  * first, so it measures exactly the path a real connection would take. */
+/* Defined below, after the client stack it is built on. `ping` sits up here
+ * with the other address commands; the tunnel does not exist yet. */
+static int ping_until_direct(const char *addr_str, bool insecure,
+                             unsigned timeout_s, const char *derpmap_url,
+                             const char *key_spec);
+
 static int cmd_ping(const char *addr_str, bool insecure, unsigned timeout_s,
-                    const char *derpmap_url)
+                    const char *derpmap_url, const char *key_spec,
+                    bool until_direct)
 {
+	/* A different question, answered by different machinery. The loop below
+	 * is a DERP round trip and nothing else: it proves the server is there,
+	 * and it can never report a direct path because it never looks for one.
+	 * "Can these two reach each other without the relay?" needs the whole
+	 * client stack, because finding a direct path is what that stack does. */
+	if (until_direct)
+		return ping_until_direct(addr_str, insecure, timeout_s, derpmap_url,
+		                         key_spec);
+
 	static tc_conn_info ci;
 	int rc = tc_addr_parse(&ci, addr_str, strlen(addr_str));
 	if (rc != TC_OK) {
@@ -2835,8 +2855,11 @@ typedef struct {
 	uint64_t deadline;
 } ls_io;
 
-/* ls_pump_once services the tunnel for one turn. */
-static int ls_pump_once(tc_client *cl, uint64_t deadline)
+/* client_pump_once services the tunnel for one turn: the relay, the
+ * direct-path probes, the WireGuard timers and the muxes. Named for
+ * `ls` until `ping --until-direct` wanted exactly the same turn,
+ * which is the usual sign that a name was too specific. */
+static int client_pump_once(tc_client *cl, uint64_t deadline)
 {
 	uint64_t t = now_ms();
 
@@ -2908,6 +2931,82 @@ static int ls_pump_once(tc_client *cl, uint64_t deadline)
 	return 0;
 }
 
+/* ping_until_direct waits for a direct path and reports whether it got one.
+ *
+ * It brings the tunnel up exactly as the pipe does -- client_up already runs
+ * path discovery -- and then watches tc_path, which is the part that knows.
+ * Exits non-zero when no direct path appears before the deadline, because the
+ * flag exists for a script that wants the answer rather than a description.
+ */
+static int ping_until_direct(const char *addr_str, bool insecure,
+                             unsigned timeout_s, const char *derpmap_url,
+                             const char *key_spec)
+{
+	static tc_client cl;
+	/* 0 means "no deadline" everywhere else in this program, so it means it
+	 * here too. Waiting indefinitely for a direct path is a reasonable thing
+	 * to ask for, and quietly turning it into ten seconds would be the same
+	 * class of surprise as bugs 33 and 34. */
+	uint64_t deadline = (timeout_s == 0)
+	                        ? UINT64_MAX
+	                        : now_ms() + (uint64_t)timeout_s * 1000u;
+
+	if (client_up(&cl, addr_str, insecure, derpmap_url, key_spec, deadline) !=
+	    TC_OK)
+		return 1;
+
+	if (!cl.have_udp) {
+		/* Either the address carries no disco key or the UDP socket would
+		 * not open. Both mean no direct path is possible at all, and saying
+		 * so now beats waiting out the deadline to report the same thing. */
+		fprintf(stderr, "tailcat-c: no direct path is possible here: %s\n",
+		        cl.ci.has_disco_public
+		            ? "no UDP socket"
+		            : "the address carries no path-discovery key");
+		client_down(&cl);
+		return 1;
+	}
+
+	char line[160], last[160];
+	last[0] = '\0';
+	int status = 1;
+
+	while (now_ms() < deadline) {
+		if (client_pump_once(&cl, deadline) != 0)
+			break;
+
+		if (tc_path_describe(line, sizeof line, &cl.path, now_ms()) != TC_OK)
+			continue;
+		/* One line per change rather than per turn: this loop runs many
+		 * times a second and the interesting events are rare. */
+		if (strcmp(line, last) != 0) {
+			printf("%s\n", line);
+			(void)fflush(stdout);
+			(void)snprintf(last, sizeof last, "%s", line);
+		}
+		if (tc_path_best(&cl.path, NULL, now_ms()) == TC_PATH_DIRECT) {
+			status = 0;
+			break;
+		}
+	}
+
+	if (status != 0) {
+		/* The counters, because "no direct path" has more than one cause and
+		 * they look different here: no probes sent means the peer never said
+		 * where it was, probes sent with none answered means they went out
+		 * and nothing came back, which is a NAT or a firewall. */
+		tc_path_stats st;
+		tc_path_get_stats(&cl.path, &st);
+		fprintf(stderr,
+		        "tailcat-c: no direct path within %us "
+		        "(%llu probes sent, %llu answered)\n",
+		        timeout_s, (unsigned long long)st.pings_sent,
+		        (unsigned long long)st.pongs_received);
+	}
+	client_down(&cl);
+	return status;
+}
+
 /* The connection can be reaped by the pump, so a pointer held across it has
  * to be re-found. Same hazard as bug 11. */
 static bool ls_conn_alive(const ls_io *io)
@@ -2933,7 +3032,7 @@ static int ls_read(void *ctx, uint8_t *buf, size_t cap, size_t *nread)
 			return TC_ERR_CLOSED;
 		if (now_ms() > io->deadline)
 			return TC_ERR_TIMEOUT;
-		if (ls_pump_once(io->cl, io->deadline) != 0)
+		if (client_pump_once(io->cl, io->deadline) != 0)
 			return TC_ERR_CLOSED;
 	}
 }
@@ -2955,7 +3054,7 @@ static int ls_write(void *ctx, const uint8_t *buf, size_t len)
 			break;
 		if (now_ms() > io->deadline)
 			return TC_ERR_TIMEOUT;
-		if (ls_pump_once(io->cl, io->deadline) != 0)
+		if (client_pump_once(io->cl, io->deadline) != 0)
 			return TC_ERR_CLOSED;
 	}
 	return TC_OK;
@@ -4970,6 +5069,7 @@ int main(int argc, char **argv)
 	 * server through it -- so it has to be asked for. */
 	const char *bind_addr = "127.0.0.1";
 	bool open_browser = false;
+	bool until_direct = false;
 	/* The server port ssh and cp reach through the tunnel. */
 	const char *ssh_port = "22";
 	/* An empty --key means "the saved default if there is one", which is how
@@ -5147,6 +5247,8 @@ int main(int argc, char **argv)
 			bind_addr = val;
 		} else if (strcmp(a, "--open-browser") == 0) {
 			open_browser = BOOL_VAL(true);
+		} else if (strcmp(a, "--until-direct") == 0) {
+			until_direct = BOOL_VAL(true);
 		} else if (strcmp(a, "--derpmap-url") == 0) {
 			NEED_VAL();
 			derpmap_url = val;
@@ -5222,7 +5324,8 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: ping needs an address\n");
 			return 2;
 		}
-		return cmd_ping(args[1], insecure, timeout_s, derpmap_url);
+		return cmd_ping(args[1], insecure, timeout_s, derpmap_url, key_spec,
+		                until_direct);
 	}
 	if (strcmp(args[0], "serve") == 0) {
 		if (nargs == 1) {

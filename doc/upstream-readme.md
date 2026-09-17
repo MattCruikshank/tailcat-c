@@ -76,6 +76,7 @@ and `hello` appears on the server. Works.
 | `socks <addr> -- curl …` | ✅ |
 | `socks <addr> curl …` (no `--`) | ✅ since the walk |
 | `socks curl http://<tc-addr>:8081/` | ❌ Upstream's SOCKS proxy recognises a tailcat address used as a hostname, so the address argument is optional. Not implemented. |
+| `ping --until-direct <addr>` | ✅ brings the tunnel up and waits on path discovery; non-zero if no direct path appears |
 | `ping <addr>` | ✅ Works in both directions with the real tailcat — verified. Wording differs: ours `meowed in 68 ms (1 ping) via tc301a.ipn.dev`, upstream `pong in 220µs via 172.17.0.1:58860`. |
 
 One retest worth recording: upstream's `ping` first appeared to fail against
@@ -197,7 +198,6 @@ walkthrough. PLAN.md 6.2 has what each would cost.
 | addresses in DNS TXT records | `tailcat ssh example.com` | paste the address |
 | the DNS safety probe | `--skip-dns-safety-check` | nothing to guard yet |
 | tc-addr as a URL hostname | `socks curl http://<tc-addr>:8081/` | `socks <addr> -- curl …` |
-| ping until a direct path | `ping --until-direct <addr>` | nothing: `ping` here is relay-only |
 | a relay baked into a saved key | `genkey --fixed-region`, `genkey --region=host` | `serve --relay host` |
 | a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
 | shell, forced command, file server | `serve ssh`, `no-auth-ssh`, `exec`, `files` | `recv`, `ls` |

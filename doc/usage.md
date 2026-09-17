@@ -121,6 +121,7 @@ Restrict who may connect, by client node key:
     tailcat-c parse <tc-addr>       # describe an address
     tailcat-c resolve <tc-addr>     # embed the relay, for offline use
     tailcat-c ping <tc-addr>        # time the round trip
+    tailcat-c ping --until-direct <tc-addr>   # and wait for a direct path
     tailcat-c netcheck              # UDP, NAT type and relay latency
     tailcat-c version
 
