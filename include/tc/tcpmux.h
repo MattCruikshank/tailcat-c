@@ -13,9 +13,12 @@
  * is re-validated by it. This layer only chooses the recipient.
  *
  * The tunnel is point to point -- one local address, one remote -- so the
- * addresses are fixed at construction and the key is just (local port, remote
- * port). A packet for a port pair nobody owns is answered with a reset,
- * rather than dropped, so a peer dialling a closed port learns immediately.
+ * remote address is fixed at construction. The *local* one is not, once exit
+ * node mode is on: a peer may address a packet to somewhere beyond us, and
+ * then the destination it named is what distinguishes one flow from another.
+ * The key is therefore (local address, local port, remote port). A packet for
+ * a key nobody owns is answered with a reset, rather than dropped, so a peer
+ * dialling a closed port learns immediately.
  *
  * Usage mirrors tcp.h, with the caller still driving the clock:
  *
@@ -106,6 +109,29 @@ int tc_tcp_mux_connect(tc_tcp_mux *m, uint16_t remote_port, uint64_t now_ms,
 /* tc_tcp_mux_connect_from is the same with the local port chosen by the
  * caller, for tests that need a predictable pair. TC_ERR_EXIST if that port
  * pair is already in use. */
+/* tc_tcp_mux_set_exit_node decides whether connections addressed to somewhere
+ * other than our own tunnel address are accepted.
+ *
+ * Off by default, and it must stay that way unless asked for: an exit node
+ * will dial anything its peer names, which turns a tunnel endpoint into a
+ * proxy for everything the machine can reach -- other hosts on its LAN, its
+ * own loopback services, its cloud metadata endpoint. That is a useful thing
+ * to be and a terrible thing to become by accident, which is why upstream
+ * gates it behind an explicit `exit-node` service and so do we.
+ *
+ * The mux only accepts the connection; where it goes is the caller's
+ * decision, made with tc_tcp_local_addr on the accepted connection. */
+void tc_tcp_mux_set_exit_node(tc_tcp_mux *m, bool on);
+
+/* tc_tcp_mux_connect_to dials a destination beyond the peer, which the peer
+ * must be willing to act as an exit node for.
+ *
+ * dst_ip is an IPv6 address; an IPv4 destination is carried inside one, see
+ * nat64.h. */
+int tc_tcp_mux_connect_to(tc_tcp_mux *m, const uint8_t dst_ip[16],
+                          uint16_t remote_port, uint64_t now_ms,
+                          tc_tcp_conn **out);
+
 int tc_tcp_mux_connect_from(tc_tcp_mux *m, uint16_t local_port,
                             uint16_t remote_port, uint64_t now_ms,
                             tc_tcp_conn **out);

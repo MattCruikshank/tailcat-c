@@ -44,6 +44,9 @@ struct tc_tcp_mux {
 	 * predictable port pair is half of what blind injection needs. */
 	uint16_t next_port;
 
+	/* See tc_tcp_mux_set_exit_node. Off unless asked for. */
+	bool exit_node;
+
 	tc_tcp_mux_stats stats;
 };
 
@@ -54,13 +57,37 @@ static uint16_t rd16(const uint8_t *p)
 
 /* ---- table ----------------------------------------------------------- */
 
-static tc_tcp_conn *find_conn(const tc_tcp_mux *m, uint16_t local_port,
+/* A connection is identified by the whole four-tuple, not just the port pair.
+ *
+ * Once a destination beyond the peer is possible, the ports alone stop being
+ * unique: every exit-node flow goes to port 443 of somewhere different, so two
+ * of them would collide -- and the symptom is not an error, it is one
+ * connection quietly receiving the other's segments.
+ *
+ * NULL for either address means "any", which is what the ordinary
+ * point-to-point callers want. */
+static tc_tcp_conn *find_conn(const tc_tcp_mux *m,
+                              const uint8_t local_ip[TC_IPV6_ADDR_LEN],
+                              uint16_t local_port,
+                              const uint8_t remote_ip[TC_IPV6_ADDR_LEN],
                               uint16_t remote_port)
 {
 	for (size_t i = 0; i < m->num_conns; i++) {
-		if (tc_tcp_local_port(m->conns[i]) == local_port &&
-		    tc_tcp_remote_port(m->conns[i]) == remote_port)
-			return m->conns[i];
+		if (tc_tcp_local_port(m->conns[i]) != local_port ||
+		    tc_tcp_remote_port(m->conns[i]) != remote_port)
+			continue;
+		uint8_t have[TC_IPV6_ADDR_LEN];
+		if (local_ip != NULL) {
+			tc_tcp_local_addr(m->conns[i], have);
+			if (memcmp(have, local_ip, TC_IPV6_ADDR_LEN) != 0)
+				continue;
+		}
+		if (remote_ip != NULL) {
+			tc_tcp_remote_addr(m->conns[i], have);
+			if (memcmp(have, remote_ip, TC_IPV6_ADDR_LEN) != 0)
+				continue;
+		}
+		return m->conns[i];
 	}
 	return NULL;
 }
@@ -197,7 +224,7 @@ int tc_tcp_mux_connect_from(tc_tcp_mux *m, uint16_t local_port,
 	*out = NULL;
 	if (m->num_conns >= TC_TCP_MAX_CONNS)
 		return TC_ERR_TOOMANY;
-	if (find_conn(m, local_port, remote_port) != NULL)
+	if (find_conn(m, m->local_ip, local_port, NULL, remote_port) != NULL)
 		return TC_ERR_EXIST;
 
 	tc_tcp_conn *c = tc_tcp_new(m->local_ip, m->remote_ip, m->out, m->out_ctx);
@@ -217,6 +244,54 @@ int tc_tcp_mux_connect_from(tc_tcp_mux *m, uint16_t local_port,
 	m->stats.dialled++;
 	*out = c;
 	return TC_OK;
+}
+
+void tc_tcp_mux_set_exit_node(tc_tcp_mux *m, bool on)
+{
+	if (m != NULL)
+		m->exit_node = on;
+}
+
+int tc_tcp_mux_connect_to(tc_tcp_mux *m, const uint8_t dst_ip[16],
+                          uint16_t remote_port, uint64_t now_ms,
+                          tc_tcp_conn **out)
+{
+	if (m == NULL || dst_ip == NULL || out == NULL || remote_port == 0)
+		return TC_ERR_INVAL;
+	*out = NULL;
+	if (m->num_conns >= TC_TCP_MAX_CONNS)
+		return TC_ERR_TOOMANY;
+
+	const uint32_t span = TC_TCP_EPHEMERAL_HI - TC_TCP_EPHEMERAL_LO + 1u;
+	for (uint32_t tries = 0; tries < span; tries++) {
+		uint16_t port = m->next_port;
+		m->next_port = (port >= TC_TCP_EPHEMERAL_HI)
+		                   ? (uint16_t)TC_TCP_EPHEMERAL_LO
+		                   : (uint16_t)(port + 1);
+		if (local_port_in_use(m, port) || tc_tcp_mux_is_listening(m, port))
+			continue;
+
+		/* The source stays ours and the destination is the one asked for, so
+		 * the peer sees a packet from us to somewhere else -- which is
+		 * exactly what it must see to know to forward it. Getting these the
+		 * wrong way round produces packets addressed from a machine we are
+		 * not, to a peer that never asked. */
+		tc_tcp_conn *c =
+		    tc_tcp_new(m->local_ip, dst_ip, m->out, m->out_ctx);
+		if (c == NULL)
+			return TC_ERR_NOSPACE;
+		m->conns[m->num_conns++] = c;
+
+		int rc = tc_tcp_connect(c, port, remote_port, now_ms);
+		if (rc != TC_OK) {
+			drop_at(m, m->num_conns - 1);
+			return rc;
+		}
+		m->stats.dialled++;
+		*out = c;
+		return TC_OK;
+	}
+	return TC_ERR_TOOMANY;
 }
 
 int tc_tcp_mux_connect(tc_tcp_mux *m, uint16_t remote_port, uint64_t now_ms,
@@ -244,8 +319,10 @@ int tc_tcp_mux_connect(tc_tcp_mux *m, uint16_t remote_port, uint64_t now_ms,
 /* ---- input ----------------------------------------------------------- */
 
 /* accept_syn opens a connection for a SYN that arrived on a listening port. */
-static void accept_syn(tc_tcp_mux *m, uint16_t local_port, const uint8_t *pkt,
-                       size_t len, uint64_t now_ms)
+static void accept_syn(tc_tcp_mux *m,
+                       const uint8_t local_ip[TC_IPV6_ADDR_LEN],
+                       uint16_t local_port, const uint8_t *pkt, size_t len,
+                       uint64_t now_ms)
 {
 	if (m->num_conns >= TC_TCP_MAX_CONNS ||
 	    m->num_pending >= TC_TCP_BACKLOG) {
@@ -256,7 +333,7 @@ static void accept_syn(tc_tcp_mux *m, uint16_t local_port, const uint8_t *pkt,
 		return;
 	}
 
-	tc_tcp_conn *c = tc_tcp_new(m->local_ip, m->remote_ip, m->out, m->out_ctx);
+	tc_tcp_conn *c = tc_tcp_new(local_ip, m->remote_ip, m->out, m->out_ctx);
 	if (c == NULL) {
 		m->stats.rejected_full++;
 		(void)tc_tcp_reject(pkt, len, m->out, m->out_ctx);
@@ -296,12 +373,8 @@ int tc_tcp_mux_input(tc_tcp_mux *m, const uint8_t *ip_pkt, size_t len,
 	    TC_IPV6_HEADER_LEN + payload_total > len)
 		return TC_OK;
 
-	/* Both addresses must match the tunnel. Checking here as well as in
-	 * tc_tcp_input keeps a foreign packet from being answered with a reset
-	 * that names an address we do not own. */
-	if (memcmp(ip_pkt + 8, m->remote_ip, TC_IPV6_ADDR_LEN) != 0 ||
-	    memcmp(ip_pkt + 24, m->local_ip, TC_IPV6_ADDR_LEN) != 0)
-		return TC_OK;
+	const uint8_t *src_ip = ip_pkt + 8;
+	const uint8_t *dst_ip = ip_pkt + 24;
 
 	const uint8_t *th = ip_pkt + TC_IPV6_HEADER_LEN;
 	uint16_t sport = rd16(th + 0);
@@ -310,7 +383,7 @@ int tc_tcp_mux_input(tc_tcp_mux *m, const uint8_t *ip_pkt, size_t len,
 
 	enum { TH_SYN = 0x02, TH_RST = 0x04, TH_ACK = 0x10 };
 
-	tc_tcp_conn *c = find_conn(m, dport, sport);
+	tc_tcp_conn *c = find_conn(m, dst_ip, dport, src_ip, sport);
 
 	/* A bare SYN for a pair held by a connection in TIME_WAIT is the peer
 	 * reusing that port, not a straggler: a straggler would carry an ACK.
@@ -333,10 +406,34 @@ int tc_tcp_mux_input(tc_tcp_mux *m, const uint8_t *ip_pkt, size_t len,
 	if (c != NULL)
 		return tc_tcp_input(c, ip_pkt, len, now_ms);
 
-	if ((flags & TH_SYN) && !(flags & (TH_ACK | TH_RST)) &&
-	    tc_tcp_mux_is_listening(m, dport)) {
-		accept_syn(m, dport, ip_pkt, len, now_ms);
+	/* No flow owns it, so now the addresses have to be judged.
+	 *
+	 * Everything reaching this stack has already been authenticated by the
+	 * WireGuard session that carried it, and that session has exactly one
+	 * peer -- so these checks are not authentication. They decide what a
+	 * packet means, and in particular stop us answering for an address we do
+	 * not hold. */
+	bool from_peer = memcmp(src_ip, m->remote_ip, TC_IPV6_ADDR_LEN) == 0;
+	bool to_us = memcmp(dst_ip, m->local_ip, TC_IPV6_ADDR_LEN) == 0;
+
+	/* A packet from somewhere beyond the peer with no flow to own it is a
+	 * straggler for a connection we have already closed, or a peer that has
+	 * misunderstood. Dropped in silence: a reset would have to claim an
+	 * address we do not own. */
+	if (!from_peer)
 		return TC_OK;
+	if (!to_us && !m->exit_node)
+		return TC_OK;
+
+	if ((flags & TH_SYN) && !(flags & (TH_ACK | TH_RST))) {
+		/* Addressed to us, the listener set decides. Addressed beyond us,
+		 * the port belongs to the destination the peer named rather than to
+		 * anything of ours, so every port is open -- which is what being an
+		 * exit node means, and why it is off by default. */
+		if (to_us ? tc_tcp_mux_is_listening(m, dport) : m->exit_node) {
+			accept_syn(m, dst_ip, dport, ip_pkt, len, now_ms);
+			return TC_OK;
+		}
 	}
 
 	/* Nobody owns this pair. A reset says so; a RST needs no answer, and

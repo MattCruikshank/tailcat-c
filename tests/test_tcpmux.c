@@ -775,6 +775,195 @@ static bool accept_everything(void *ctx, uint16_t port)
 	return true;
 }
 
+/* ---- acting as an exit node -------------------------------------------- */
+
+/* Two destinations beyond B, reachable only if B forwards for us. */
+static const uint8_t kOut1[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+	                               0,    0,    0,    0,    0, 0, 0, 0x10 };
+static const uint8_t kOut2[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+	                               0,    0,    0,    0,    0, 0, 0, 0x11 };
+
+static void test_exit_node_is_off_by_default(void)
+{
+	TCT_CASE("a connection to somewhere beyond the peer is ignored");
+	/* An exit node will dial anything its peer names, which turns a tunnel
+	 * endpoint into a proxy for everything the machine can reach -- the rest
+	 * of its LAN, its own loopback services, its cloud metadata endpoint.
+	 * Becoming one has to be a decision, not a default.
+	 *
+	 * Ignored rather than reset: we do not own that address, and answering
+	 * with a reset that names it would be claiming we do. */
+	link_t l;
+	link_init(&l, 7);
+
+	tc_tcp_conn *c = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect_to(l.a, kOut1, 443, l.now, &c), TC_OK);
+	TCT_TRUE(c != NULL);
+
+	for (int i = 0; i < 200; i++)
+		link_step(&l);
+
+	TCT_TRUE(!tc_tcp_is_established(c));
+	TCT_TRUE(tc_tcp_mux_accept(l.b) == NULL);
+
+	tc_tcp_mux_stats st;
+	tc_tcp_mux_get_stats(l.b, &st);
+	TCT_EQ_INT((int)st.accepted, 0);
+	TCT_EQ_INT((int)st.rejected_port, 0); /* dropped, not reset */
+
+	link_done(&l);
+}
+
+static void test_exit_node_forwards(void)
+{
+	TCT_CASE("with it on, the connection is accepted and names its target");
+	link_t l;
+	link_init(&l, 8);
+	tc_tcp_mux_set_exit_node(l.b, true);
+
+	tc_tcp_conn *c = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect_to(l.a, kOut1, 443, l.now, &c), TC_OK);
+
+	for (int i = 0; i < 200 && !tc_tcp_is_established(c); i++)
+		link_step(&l);
+	TCT_TRUE(tc_tcp_is_established(c));
+
+	tc_tcp_conn *s2 = tc_tcp_mux_accept(l.b);
+	TCT_TRUE(s2 != NULL);
+
+	/* The destination the peer asked for is the accepted connection's local
+	 * address, and it is the only record of where the traffic was meant to
+	 * go -- the exit node has to read it to know what to dial. */
+	uint8_t dst[16];
+	tc_tcp_local_addr(s2, dst);
+	TCT_EQ_MEM(dst, kOut1, 16);
+	TCT_EQ_INT(tc_tcp_local_port(s2), 443);
+
+	TCT_CASE("and it carries bytes like any other connection");
+	static const char kMsg[] = "through the exit node";
+	size_t wrote = 0;
+	TCT_EQ_INT(tc_tcp_write(c, kMsg, sizeof kMsg - 1, &wrote, l.now), TC_OK);
+	for (int i = 0; i < 200; i++)
+		link_step(&l);
+	uint8_t got[64];
+	size_t n = 0;
+	TCT_EQ_INT(tc_tcp_read(s2, got, sizeof got, &n), TC_OK);
+	TCT_EQ_INT((int)n, (int)(sizeof kMsg - 1));
+	TCT_TRUE(memcmp(got, kMsg, n) == 0);
+
+	link_done(&l);
+}
+
+static void test_two_destinations_one_port_pair(void)
+{
+	TCT_CASE("flows to different destinations on one port pair do not mix");
+	/* The reason the connection key had to gain the destination address.
+	 * Every exit-node flow goes to port 443 of somewhere different, so
+	 * keying on the port pair alone would have two of them collide -- and
+	 * the symptom is not an error, it is one connection quietly receiving
+	 * the other's bytes. */
+	link_t l;
+	link_init(&l, 9);
+	tc_tcp_mux_set_exit_node(l.b, true);
+
+	tc_tcp_conn *c1 = NULL, *c2 = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect_to(l.a, kOut1, 443, l.now, &c1), TC_OK);
+	TCT_EQ_INT(tc_tcp_mux_connect_to(l.a, kOut2, 443, l.now, &c2), TC_OK);
+
+	for (int i = 0; i < 300 &&
+	                (!tc_tcp_is_established(c1) || !tc_tcp_is_established(c2));
+	     i++)
+		link_step(&l);
+	TCT_TRUE(tc_tcp_is_established(c1));
+	TCT_TRUE(tc_tcp_is_established(c2));
+
+	tc_tcp_conn *s1 = tc_tcp_mux_accept(l.b);
+	tc_tcp_conn *s2 = tc_tcp_mux_accept(l.b);
+	TCT_TRUE(s1 != NULL && s2 != NULL);
+	TCT_TRUE(s1 != s2);
+
+	/* Which is which, by the destination each names. */
+	uint8_t d1[16], d2[16];
+	tc_tcp_local_addr(s1, d1);
+	tc_tcp_local_addr(s2, d2);
+	TCT_TRUE(memcmp(d1, d2, 16) != 0);
+
+	tc_tcp_conn *to1 = (memcmp(d1, kOut1, 16) == 0) ? s1 : s2;
+	tc_tcp_conn *to2 = (to1 == s1) ? s2 : s1;
+	uint8_t check[16];
+	tc_tcp_local_addr(to1, check);
+	TCT_EQ_MEM(check, kOut1, 16);
+	tc_tcp_local_addr(to2, check);
+	TCT_EQ_MEM(check, kOut2, 16);
+
+	TCT_CASE("and each receives only what was sent to it");
+	size_t wrote = 0;
+	TCT_EQ_INT(tc_tcp_write(c1, "one", 3, &wrote, l.now), TC_OK);
+	TCT_EQ_INT(tc_tcp_write(c2, "two", 3, &wrote, l.now), TC_OK);
+	for (int i = 0; i < 300; i++)
+		link_step(&l);
+
+	uint8_t g1[16], g2[16];
+	size_t n1 = 0, n2 = 0;
+	TCT_EQ_INT(tc_tcp_read(to1, g1, sizeof g1, &n1), TC_OK);
+	TCT_EQ_INT(tc_tcp_read(to2, g2, sizeof g2, &n2), TC_OK);
+	TCT_EQ_INT((int)n1, 3);
+	TCT_EQ_INT((int)n2, 3);
+	TCT_TRUE(memcmp(g1, "one", 3) == 0);
+	TCT_TRUE(memcmp(g2, "two", 3) == 0);
+
+	link_done(&l);
+}
+
+static void test_exit_node_still_serves_itself(void)
+{
+	TCT_CASE("an exit node still answers its own listeners normally");
+	/* Turning it on must not make ordinary port forwarding behave
+	 * differently, and in particular must not make every port on the node
+	 * itself open. */
+	link_t l;
+	link_init(&l, 10);
+	tc_tcp_mux_set_exit_node(l.b, true);
+	TCT_EQ_INT(tc_tcp_mux_listen(l.b, 22), TC_OK);
+
+	tc_tcp_conn *c = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect(l.a, 22, l.now, &c), TC_OK);
+	for (int i = 0; i < 200 && !tc_tcp_is_established(c); i++)
+		link_step(&l);
+	TCT_TRUE(tc_tcp_is_established(c));
+	TCT_TRUE(tc_tcp_mux_accept(l.b) != NULL);
+
+	TCT_CASE("and a port on the node itself that nobody listens on is reset");
+	/* Not silently accepted. The exit-node rule applies to destinations
+	 * beyond us; our own address still belongs to our listener set. */
+	tc_tcp_conn *c2 = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect(l.a, 9999, l.now, &c2), TC_OK);
+	for (int i = 0; i < 200; i++)
+		link_step(&l);
+	TCT_TRUE(!tc_tcp_is_established(c2));
+	TCT_TRUE(tc_tcp_mux_accept(l.b) == NULL);
+	tc_tcp_mux_stats st;
+	tc_tcp_mux_get_stats(l.b, &st);
+	TCT_TRUE(st.rejected_port >= 1);
+
+	link_done(&l);
+}
+
+static void test_exit_node_api(void)
+{
+	TCT_CASE("null arguments to the exit-node calls");
+	tc_tcp_mux *m = tc_tcp_mux_new(kIpA, kIpB, sink_out, NULL);
+	tc_tcp_conn *c = NULL;
+	TCT_EQ_INT(tc_tcp_mux_connect_to(NULL, kOut1, 443, 0, &c), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_tcp_mux_connect_to(m, NULL, 443, 0, &c), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_tcp_mux_connect_to(m, kOut1, 0, 0, &c), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_tcp_mux_connect_to(m, kOut1, 443, 0, NULL), TC_ERR_INVAL);
+	tc_tcp_mux_set_exit_node(NULL, true);
+	uint8_t a[16];
+	tc_tcp_local_addr(NULL, a);
+	tc_tcp_mux_free(m);
+}
+
 static void test_accept_filter(void)
 {
 	TCT_CASE("a filter can accept ports no listener array could hold");
@@ -843,5 +1032,10 @@ int main(void)
 	test_ignores_foreign_packets();
 	test_same_port_pair_is_refused();
 	test_accept_filter();
+	test_exit_node_is_off_by_default();
+	test_exit_node_forwards();
+	test_two_destinations_one_port_pair();
+	test_exit_node_still_serves_itself();
+	test_exit_node_api();
 	return tct_report("tcpmux");
 }

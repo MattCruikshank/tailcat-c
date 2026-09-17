@@ -996,6 +996,20 @@ tc_tcp_state tc_tcp_get_state(const tc_tcp_conn *c)
 	return c == NULL ? TC_TCP_CLOSED : c->state;
 }
 
+void tc_tcp_local_addr(const tc_tcp_conn *c, uint8_t out[TC_IPV6_ADDR_LEN])
+{
+	if (c == NULL || out == NULL)
+		return;
+	memcpy(out, c->local_ip, TC_IPV6_ADDR_LEN);
+}
+
+void tc_tcp_remote_addr(const tc_tcp_conn *c, uint8_t out[TC_IPV6_ADDR_LEN])
+{
+	if (c == NULL || out == NULL)
+		return;
+	memcpy(out, c->remote_ip, TC_IPV6_ADDR_LEN);
+}
+
 uint16_t tc_tcp_local_port(const tc_tcp_conn *c)
 {
 	return c == NULL ? 0 : c->local_port;

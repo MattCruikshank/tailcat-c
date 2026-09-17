@@ -137,6 +137,19 @@ const char *tc_tcp_state_name(tc_tcp_state s);
 /* The port pair, which is what a demultiplexer keys a connection on. The
  * remote port is only meaningful once a listening connection has accepted. */
 uint16_t tc_tcp_local_port(const tc_tcp_conn *c);
+
+/* tc_tcp_local_addr copies the address this end of the connection carries.
+ *
+ * Ordinarily that is the tunnel address and the caller already knows it. It
+ * matters for an exit node, where the destination the peer asked for *is* the
+ * local address of the connection that answered, and is the only record of
+ * where the traffic was meant to go. */
+void tc_tcp_local_addr(const tc_tcp_conn *c, uint8_t out[TC_IPV6_ADDR_LEN]);
+
+/* tc_tcp_remote_addr copies the address at the far end. Ordinarily the peer's
+ * tunnel address; for a connection opened through an exit node, the
+ * destination beyond it. */
+void tc_tcp_remote_addr(const tc_tcp_conn *c, uint8_t out[TC_IPV6_ADDR_LEN]);
 uint16_t tc_tcp_remote_port(const tc_tcp_conn *c);
 
 /* tc_tcp_reject emits a RST in reply to a segment no connection wants, which
