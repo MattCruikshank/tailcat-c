@@ -109,12 +109,6 @@ identities, `browse` and `readme` are all here.
 found by typing upstream's README at this binary rather than by reading our
 own feature list:
 
-- **Addresses published as DNS TXT records.** `tailcat ssh example.com`
-  looks up a `tailcat=tc…` record. Ours says `bad address: malformed
-  input`, which is true and unhelpful. It needs a resolver, and with it
-  upstream's safety check -- probing a DNS-named server as a stranger would
-  and refusing if that login succeeds -- because publishing an address makes
-  it public and the server must then authenticate clients itself.
 - **`socks` recognising a tailcat address as a URL hostname**, which is what
   makes the address argument optional there.
 - **`genkey --fixed-region`** and **`genkey --region=<relay-hostname>`**.
@@ -218,7 +212,8 @@ direct peer-to-peer paths.
 | `--flag=value` as well as `--flag value` | ✅ | ✅ |
 | `--timeout` as a duration (`2m`, `1h30m`) | ✅ | ✅ |
 | **Not here** | | |
-| addresses in DNS TXT records | ❌ | ✅ (`tailcat ssh example.com`) |
+| addresses in DNS TXT records | ✅ | ✅ |
+| the DNS safety probe | ✅ | ✅ |
 | `socks` with the address omitted | ❌ | ✅ (tc-addr as a URL hostname) |
 
 | `genkey --fixed-region` | ❌ (`--relay` pins one for `serve`) | ✅ |

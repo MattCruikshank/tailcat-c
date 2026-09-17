@@ -188,6 +188,7 @@ LIB_SRCS := \
 	src/net/tcpmux.c \
 	src/net/udpmux.c \
 	src/net/nat64.c \
+	src/net/dnsaddr.c \
 	src/net/socks.c \
 	src/net/proxy.c \
 	src/net/http.c \

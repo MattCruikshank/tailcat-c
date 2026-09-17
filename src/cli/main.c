@@ -27,6 +27,7 @@
 #include "tc/addr.h"
 #include "tc/allowlist.h"
 #include "tc/browser.h"
+#include "tc/dnsaddr.h"
 #include "tc/dropbox.h"
 #include "tc/duration.h"
 #include "tc/sshclient.h"
@@ -153,6 +154,9 @@ static void usage(FILE *f)
 	        "clients need no map\n"
 	        "      --allow KEYS      comma-separated client nodekey: list "
 	        "for serve, or \"none\"\n"
+	        "      --skip-dns-safety-check\n"
+	        "                        for ssh: do not probe a DNS-named server for\n"
+	        "                        whether it admits strangers\n"
 	        "      --until-direct    for ping: wait for a peer-to-peer path,\n"
 	        "                        and fail if there is not one\n"
 	        "      --open-browser    for forward: open a browser at the "
@@ -3365,6 +3369,108 @@ static int cmd_ls(const char *arg, bool long_form, bool insecure,
 	return ls.status;
 }
 
+/* ---- the DNS safety check ----------------------------------------------
+ *
+ * A tailcat address is a bearer credential: holding it is what lets you
+ * connect. A DNS TXT record is public, world-readable and scanned
+ * continuously. Publishing one therefore hands that capability to everybody,
+ * and a server named in DNS has to authenticate its clients by something
+ * else -- `serve --allow` at the tunnel layer, or public keys above it.
+ *
+ * Getting that wrong produces a server that looks fine to its owner, because
+ * their own client works, while being open to anyone who reads the record.
+ * Nothing about it appears broken. So before `ssh` connects to a DNS-named
+ * destination it tries the thing an attacker would try: a fresh tunnel key
+ * and no SSH credentials at all. If that gets in, so would a stranger, and
+ * connecting is refused with an explanation rather than a warning nobody
+ * reads.
+ *
+ * It costs a tunnel bring-up, which is why --skip-dns-safety-check exists.
+ */
+
+static int probe_on_ready(void *ctx, tc_ssh_client *c)
+{
+	(void)c;
+	*(bool *)ctx = true;
+	/* Answered. Nothing is worth doing over this session. */
+	return TC_ERR_DONE;
+}
+
+/* dns_admits_strangers reports whether a login with no credentials worked.
+ *
+ * Fail-open on purpose: anything other than a successful login -- a refused
+ * tunnel, an unreachable relay, no SSH server on port 22 -- returns false and
+ * lets the real connection proceed and report its own errors. This is a
+ * safety net, not a gate, and a net that turned a flaky network into a
+ * refusal would be worse than no net at all. */
+static bool dns_admits_strangers(const char *addr, bool insecure,
+                                 const char *derpmap_url)
+{
+	static tc_client cl;
+	bool got_in = false;
+
+	/* The probe's failures are the good outcome, and client_up narrates its
+	 * own along the way -- "the server never acknowledged us" printed here
+	 * would read as the user's command failing when it is the check
+	 * succeeding. So stderr goes away for the duration and comes back
+	 * after; the real connection that follows says anything worth saying. */
+	int saved = dup(STDERR_FILENO);
+	int null = open("/dev/null", O_WRONLY);
+	if (null >= 0) {
+		(void)dup2(null, STDERR_FILENO);
+		(void)close(null);
+	}
+
+	/* "new" for the tunnel key: a saved client identity might be on the
+	 * server's allow list, and then the probe would be asking whether *we*
+	 * can get in, which is not the question. */
+	uint64_t deadline = now_ms() + 20000;
+	if (client_up(&cl, addr, insecure, derpmap_url, "new", deadline) ==
+	    TC_OK) {
+		tc_tcp_conn *tcp = NULL;
+		if (tc_tcp_mux_connect(cl.mux, 22, now_ms(), &tcp) == TC_OK) {
+			ls_io io;
+			io.cl = &cl;
+			io.conn = tcp;
+			io.deadline = deadline;
+
+			/* A throwaway key, because a stranger is not someone with no
+			 * key -- it is someone with a key of their own. Offering only
+			 * the `none` method asks a narrower question than the one that
+			 * matters, and gets a reassuring answer from a server that
+			 * accepts *any* key, which is exactly the configuration this
+			 * check exists to catch. Found by pointing the first version at
+			 * our own drop box, which admits anyone and which the probe
+			 * pronounced safe. */
+			uint8_t throwaway[32];
+			if (tc_random_bytes(throwaway, sizeof throwaway) != TC_OK) {
+				client_down(&cl);
+				goto restore;
+			}
+
+			tc_ssh_client_opts opts;
+			memset(&opts, 0, sizeof opts);
+			opts.user = "tailcat";
+			opts.user_seed = throwaway;
+			opts.subsystem = "sftp";
+			opts.read = ls_read;
+			opts.write = ls_write;
+			opts.io_ctx = &io;
+			opts.on_ready = probe_on_ready;
+			opts.app_ctx = &got_in;
+			(void)tc_ssh_client_run(&opts);
+		}
+		client_down(&cl);
+	}
+
+restore:
+	if (saved >= 0) {
+		(void)dup2(saved, STDERR_FILENO);
+		(void)close(saved);
+	}
+	return got_in;
+}
+
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
                     unsigned timeout_s, const char *derpmap_url,
                     const char *key_spec)
@@ -5016,6 +5122,50 @@ static bool port_arg(const char *s, uint16_t *out)
 	return false;
 }
 
+/* dest_arg turns a destination argument into a tailcat address.
+ *
+ * Anywhere an address is accepted a DNS name works instead, if its TXT
+ * records hold `tailcat=<address>`. Returns NULL having already said why not.
+ *
+ * `from_dns`, when given, reports whether the address came out of DNS, which
+ * `ssh` needs: a published address is a public one, so a server named that
+ * way has to authenticate its clients by something other than knowing it.
+ *
+ * The refusal that matters is inside tc_dns_classify, not here: an argument
+ * with a real address among its labels is never looked up, because a DNS
+ * query would hand that address to a resolver in cleartext. */
+static const char *dest_arg(const char *arg, bool *from_dns)
+{
+	static char resolved[TC_ADDR_STR_MAX];
+	char name[TC_DNS_NAME_LEN];
+	tc_dnsarg_kind kind;
+
+	if (from_dns != NULL)
+		*from_dns = false;
+	if (tc_dns_classify(&kind, name, sizeof name, arg) != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_dns_error_string());
+		return NULL;
+	}
+	if (kind == TC_DNSARG_ADDRESS)
+		return arg;
+
+	vlogf("looking up the tailcat= TXT record for %s", name);
+	int rc = tc_dns_lookup_tailcat(resolved, sizeof resolved, name);
+	if (rc == TC_ERR_NOTFOUND) {
+		fprintf(stderr, "tailcat-c: %s has no \"tailcat=\" TXT record\n", name);
+		return NULL;
+	}
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not look up %s: %s\n", name,
+		        tc_strerror(rc));
+		return NULL;
+	}
+	if (from_dns != NULL)
+		*from_dns = true;
+	vlogf("%s resolves to a tailcat address", name);
+	return resolved;
+}
+
 int main(int argc, char **argv)
 {
 	bool insecure = false;
@@ -5035,6 +5185,7 @@ int main(int argc, char **argv)
 	const char *bind_addr = "127.0.0.1";
 	bool open_browser = false;
 	bool until_direct = false;
+	bool skip_dns_check = false;
 	/* The server port ssh and cp reach through the tunnel. */
 	const char *ssh_port = "22";
 	/* An empty --key means "the saved default if there is one", which is how
@@ -5084,10 +5235,17 @@ int main(int argc, char **argv)
 		char namebuf[64];
 
 		if (passthrough) {
-			/* -p is the one flag still ours out here. Everything else,
+			/* Two flags are still ours out here, because they are about how
+			 * this program reaches the server rather than about what ssh
+			 * does once it is there. Upstream spells both after the
+			 * subcommand, so they have to work there. Everything else,
 			 * including `--`, is the far end's business. */
 			if (strcmp(a, "-p") == 0 && i + 1 < argc) {
 				ssh_port = argv[++i];
+				continue;
+			}
+			if (strcmp(a, "--skip-dns-safety-check") == 0) {
+				skip_dns_check = true;
 				continue;
 			}
 			if (nargs >= sizeof args / sizeof args[0] - 1) {
@@ -5214,6 +5372,8 @@ int main(int argc, char **argv)
 			open_browser = BOOL_VAL(true);
 		} else if (strcmp(a, "--until-direct") == 0) {
 			until_direct = BOOL_VAL(true);
+		} else if (strcmp(a, "--skip-dns-safety-check") == 0) {
+			skip_dns_check = BOOL_VAL(true);
 		} else if (strcmp(a, "--derpmap-url") == 0) {
 			NEED_VAL();
 			derpmap_url = val;
@@ -5285,7 +5445,10 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: resolve needs an address\n");
 			return 2;
 		}
-		return cmd_resolve(args[1], derpmap_url, insecure);
+		const char *dst = dest_arg(args[1], NULL);
+		if (dst == NULL)
+			return 1;
+		return cmd_resolve(dst, derpmap_url, insecure);
 	}
 	if (strcmp(args[0], "netcheck") == 0)
 		return cmd_netcheck(derpmap_url, insecure, timeout_s);
@@ -5294,7 +5457,10 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: ping needs an address\n");
 			return 2;
 		}
-		return cmd_ping(args[1], insecure, timeout_s, derpmap_url, key_spec,
+		const char *dst = dest_arg(args[1], NULL);
+		if (dst == NULL)
+			return 1;
+		return cmd_ping(dst, insecure, timeout_s, derpmap_url, key_spec,
 		                until_direct);
 	}
 	if (strcmp(args[0], "serve") == 0) {
@@ -5351,7 +5517,10 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: ls needs one address\n");
 			return 2;
 		}
-		return cmd_ls(args[1], long_listing, insecure,
+		const char *dst = dest_arg(args[1], NULL);
+		if (dst == NULL)
+			return 1;
+		return cmd_ls(dst, long_listing, insecure,
 		              timeout_given ? timeout_s : 30, derpmap_url, key_spec);
 	}
 	if (strcmp(args[0], "recv") == 0) {
@@ -5387,7 +5556,10 @@ int main(int argc, char **argv)
 			                "mapping; there is only one browser\n");
 			return 2;
 		}
-		return cmd_forward_or_socks(args[1], &args[2], nargs - 2, bind_addr,
+		const char *dst = dest_arg(args[1], NULL);
+		if (dst == NULL)
+			return 1;
+		return cmd_forward_or_socks(dst, &args[2], nargs - 2, bind_addr,
 		                            false, NULL, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, open_browser);
@@ -5404,8 +5576,11 @@ int main(int argc, char **argv)
 			return 2;
 		}
 		static const char *const browse_map[] = {"0:80"};
-		return cmd_forward_or_socks(args[1], (const char **)(uintptr_t)
-		                                         browse_map,
+		const char *dst = dest_arg(args[1], NULL);
+		if (dst == NULL)
+			return 1;
+		return cmd_forward_or_socks(dst, (const char **)(uintptr_t)
+		                                     browse_map,
 		                            1, bind_addr, false, NULL, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, true);
@@ -5448,7 +5623,10 @@ int main(int argc, char **argv)
 			args[nargs] = NULL;
 			child = (const char *const *)&args[at];
 		}
-		return cmd_forward_or_socks(args[1], specs, nspecs, bind_addr, true,
+		const char *dst = dest_arg(args[1], NULL);
+		if (dst == NULL)
+			return 1;
+		return cmd_forward_or_socks(dst, specs, nspecs, bind_addr, true,
 		                            child, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, false);
@@ -5466,9 +5644,35 @@ int main(int argc, char **argv)
 		}
 		/* Checked here rather than left to the ProxyCommand, where the same
 		 * complaint would arrive buried in ssh's own output. */
-		uint16_t probe;
-		if (!port_arg(ssh_port, &probe))
+		uint16_t pnum;
+		if (!port_arg(ssh_port, &pnum))
 			return 2;
+
+		bool from_dns = false;
+		const char *dst = dest_arg(args[1], &from_dns);
+		if (dst == NULL)
+			return 1;
+		if (from_dns && !skip_dns_check) {
+			vlogf("checking whether a stranger could log in here");
+			if (dns_admits_strangers(dst, insecure, derpmap_url)) {
+				fprintf(stderr,
+				        "tailcat-c: refusing to connect.\n"
+				        "  %s publishes its tailcat address in a DNS TXT "
+				        "record, which is public,\n"
+				        "  and its SSH server just accepted a login from a "
+				        "key generated seconds ago.\n"
+				        "  Anyone who reads that record can do the same, and "
+				        "get whatever you would.\n"
+				        "\n"
+				        "  Restrict the tunnel with `serve --allow "
+				        "nodekey:...`, or require SSH keys,\n"
+				        "  or pass --skip-dns-safety-check if it really is "
+				        "meant to be open to everyone.\n",
+				        args[1]);
+				return 1;
+			}
+		}
+		args[1] = dst;
 		return cmd_ssh_or_cp(false, argv[0], &args[1], nargs - 1, ssh_port,
 		                     insecure, derpmap_url);
 	}
@@ -5495,6 +5699,8 @@ int main(int argc, char **argv)
 	uint16_t port = 1;
 	if (nargs >= 2 && !port_arg(args[1], &port))
 		return 2;
-	return cmd_pipe(args[0], port, insecure, timeout_s, derpmap_url,
-	                key_spec);
+	const char *dst = dest_arg(args[0], NULL);
+	if (dst == NULL)
+		return 1;
+	return cmd_pipe(dst, port, insecure, timeout_s, derpmap_url, key_spec);
 }

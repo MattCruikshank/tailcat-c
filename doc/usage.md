@@ -116,6 +116,26 @@ Restrict who may connect, by client node key:
     tailcat-c serve --allow nodekey:abc123...,nodekey:def456...
 
 
+## Names instead of addresses
+
+If a DNS name has a TXT record holding `tailcat=<address>`, it works anywhere
+an address does:
+
+    my-server.example.com.  300  IN  TXT  "tailcat=tcGFwWCDMihnYWAeovm..."
+
+    tailcat-c ssh my-server.example.com
+    tailcat-c my-server.example.com 8080
+
+**A TXT record is public and an address is a password**, so a server named
+in DNS has to check its clients some other way -- `serve --allow` is the one
+here. `ssh` checks for you: before connecting to a DNS-named server it tries
+to log in the way a stranger would, and refuses if that works.
+`--skip-dns-safety-check` turns that off.
+
+An argument with an address inside it is refused rather than looked up, so a
+mistyped paste cannot send your address to a DNS server.
+
+
 ## Inspecting
 
     tailcat-c parse <tc-addr>       # describe an address

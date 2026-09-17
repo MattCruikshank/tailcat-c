@@ -19,6 +19,7 @@ const char *tc_strerror(int err)
 	case TC_ERR_AGAIN:       return "not ready yet";
 	case TC_ERR_CLOSED:      return "the connection was closed";
 	case TC_ERR_DONE:        return "there is nothing left to do";
+	case TC_ERR_NOTFOUND:    return "not found";
 	default:                 return "unknown error";
 	}
 }

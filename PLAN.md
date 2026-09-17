@@ -974,20 +974,64 @@ In rough order of what they cost:
    makes its address argument optional. Our SOCKS server already ignores the
    requested hostname except for `server.tailcat`; this means parsing it as
    an address instead and dialling it.
-6. **Addresses in DNS TXT records.** The largest of these, and the only one
-   that adds a dependency: a resolver, and with it upstream's safety check,
-   which probes a DNS-named server as a stranger would and refuses to connect
-   if that login succeeds. Publishing an address makes it public, so the
-   server has to authenticate clients by something other than knowing it --
-   which is exactly what `--allow` is for, and that is already here. Without
-   the check, this feature would quietly encourage the mistake it exists to
-   prevent, so the two land together or not at all.
+6. ~~**Addresses in DNS TXT records**~~: done, with the safety probe, which
+   this entry insisted had to land with it. See 6.3.
 
 Not on this list, and deliberately: the `ssh`, `no-auth-ssh`, `exec` and
 `files` services (5.4 and 5.5 say why), and bare `tailcat` starting a server,
 which is a one-line change this project declines because printing usage for
 a bare invocation is better behaviour and the explicit `serve` is right
 there.
+
+### 6.3 DNS names, and the probe that has to come with them ✅ · ~560 lines
+
+A DNS name works anywhere an address does. The lookup is `res_query` --
+Cosmopolitan ships musl's resolver, so the system's own DNS configuration is
+honoured on all six targets with no per-platform code, which was checked
+before anything was written by running a TXT query from a fat APE on Linux
+*and* natively on Windows.
+
+The answer is parsed here rather than with `ns_initparse`, for a reason worth
+recording: those helpers live in libresolv under glibc and inside libc under
+Cosmopolitan, so using them makes the two toolchains disagree about how to
+link -- and the entire point of building with two is that they see the same
+code. Sixty lines of parser beats a conditional in the Makefile, and it puts
+the bounds checks on a network buffer where they can be read.
+
+**The rule that is not obvious.** An argument with a valid tailcat address
+among its DNS labels is refused, not resolved. `tcABC....example.com`, or an
+address pasted with a trailing dot, would otherwise be sent to a resolver in
+cleartext -- a bearer credential, to a machine the user does not control,
+logged and forwarded onward. The typo is easy to make and the disclosure
+cannot be taken back. Upstream refuses the same case; this is not something
+two implementations invent independently, and most of `tests/test_dnsaddr.c`
+is that one case from several angles.
+
+**And the probe.** Publishing an address makes it public, so a server named
+in DNS has to authenticate clients by something other than knowing its
+address. Getting that wrong produces a server that looks fine to its owner,
+because their own client works, while being open to anyone who reads the
+record. So `ssh` to a DNS-named destination first tries what an attacker
+would: a fresh tunnel key and a throwaway SSH key. If that gets in,
+connecting is refused with an explanation.
+
+The first version of the probe offered no key at all -- the `none` method
+only -- on the reading that a stranger has no credentials. Pointed at our own
+drop box, which admits *any* key, it reported the server safe. A stranger is
+not someone with no key; it is someone with a key of their own. It now
+generates one, and catches the case it exists for. Verified both ways: an
+open drop box is refused, and the same server behind `--allow` is not, which
+is what proves the check is answering a question rather than always saying
+yes.
+
+The probe fails open on purpose. Anything other than a successful login --
+an unreachable relay, no SSH server, a refused tunnel -- lets the real
+connection proceed and report its own errors. A safety net that turned a
+flaky network into a refusal would be worse than no net.
+
+`parse` is deliberately not wired to DNS: it decodes an address and never
+dials one, so a lookup there would be a query nobody asked for. Upstream's
+does not resolve either.
 
 ---
 
@@ -1055,6 +1099,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.9 — `readme` and `doc/usage.md` | ~175 | ✅ done |
 | 5.10 — `browse` and `--open-browser` | ~700 | ✅ done |
 | 6.1 — walking upstream’s README | ~450 | ✅ done |
+| 6.3 — DNS names and the safety probe | ~560 | ✅ done |
 | 6.2 — the gaps it found | ? | ⏸ not started |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 

@@ -158,18 +158,27 @@ implemented here" — a reader cannot tell a typo from a missing feature.
 
 ## DNS names
 
-Upstream looks up a `tailcat=tc…` TXT record, so `tailcat ssh example.com`
-works. Not implemented here, and the error does not hint at it:
+A DNS name works anywhere an address does, if its TXT records hold
+`tailcat=tc…`:
 
-```
-$ tailcat-c ssh example.com
-tailcat-c: bad address: malformed input
-```
+| Instruction | Result |
+|---|---|
+| `tailcat-c ssh example.com` | ✅ |
+| `example.com 8080`, `ping`, `forward`, `socks`, `ls`, `browse`, `resolve` | ✅ |
+| `parse example.com` | ❌ **on purpose** — `parse` decodes an address and never dials one, so a lookup there is a DNS query nobody asked for. Upstream's `parse` does not resolve either. |
+| `--skip-dns-safety-check` | ✅ before or after the subcommand |
 
-`--skip-dns-safety-check` is likewise unknown. Upstream's safety check —
-probing a DNS-named server as a stranger would, and refusing to connect if
-the login succeeds — has nothing to guard here, because there is no DNS path
-to reach it by.
+`ssh` to a DNS-named destination probes it first, as upstream's does: a
+fresh tunnel key and a throwaway SSH key, which is what a stranger who read
+the public record would have. If that gets in, connecting is refused.
+
+One rule here is worth reading the source for, because it is not obvious and
+it is not ours: **an argument with a valid tailcat address among its DNS
+labels is refused rather than looked up.** `tcABC….example.com`, or an
+address pasted with a trailing dot, would otherwise put a bearer credential
+into a cleartext DNS query — to a resolver the user does not control, and
+onward from there. The typo is easy and the disclosure cannot be undone.
+Upstream refuses the same case; see `src/net/dnsaddr.c`.
 
 
 ## Cosmetic differences
@@ -194,8 +203,6 @@ walkthrough. PLAN.md 6.2 has what each would cost.
 
 | Missing | Upstream spelling | Nearest thing here |
 |---|---|---|
-| addresses in DNS TXT records | `tailcat ssh example.com` | paste the address |
-| the DNS safety probe | `--skip-dns-safety-check` | nothing to guard yet |
 | tc-addr as a URL hostname | `socks curl http://<tc-addr>:8081/` | `socks <addr> -- curl …` |
 | a relay baked into a saved key | `genkey --fixed-region`, `genkey --region=host` | `serve --relay host` |
 | a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
