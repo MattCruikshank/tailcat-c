@@ -555,7 +555,7 @@ does not match" and nothing more specific.
       caller parses a whole packet and asks once at the end. Returning a
       status per call is a design where exactly one call site eventually goes
       unchecked, and there are a dozen per packet.
-- [ ] **5.4.2 binary packet protocol** · ~400 lines.
+- [x] **5.4.2 binary packet protocol** · 373 lines, plus 458 of tests.
       Version exchange, packet framing with padding, sequence numbers, and
       `chacha20-poly1305@openssh.com` -- which is not the RFC 8439 AEAD but
       OpenSSH's own construction: two keys, the length field encrypted

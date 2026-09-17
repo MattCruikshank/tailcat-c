@@ -27,8 +27,67 @@ import (
 	"os"
 	"strings"
 
+	"encoding/binary"
+
+	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/poly1305"
 	"golang.org/x/crypto/ssh"
 )
+
+// opensshPacket builds one chacha20-poly1305@openssh.com packet, following
+// OpenSSH's PROTOCOL.chacha20poly1305 rather than RFC 8439 -- they are
+// different constructions with confusingly similar names.
+//
+// The padding is passed in rather than generated so the output is
+// reproducible; the real implementation must use random padding, because with
+// a stream cipher a predictable tail leaks the payload length modulo the
+// block size.
+func opensshPacket(keyMat []byte, seq uint32, payload, pad []byte) []byte {
+	// The first 32 bytes are K_2 and the second 32 are K_1. That order is
+	// reversed from what the names suggest and is the single easiest thing
+	// to get wrong here.
+	k2, k1 := keyMat[0:32], keyMat[32:64]
+
+	// The nonce is the sequence number as a big-endian uint64. OpenSSH uses
+	// ChaCha20's original 64-bit-nonce form; x/crypto exposes RFC 8439's
+	// 96-bit form, and the two agree when the leading four bytes are zero.
+	nonce := make([]byte, 12)
+	binary.BigEndian.PutUint64(nonce[4:], uint64(seq))
+
+	region := make([]byte, 1+len(payload)+len(pad))
+	region[0] = byte(len(pad))
+	copy(region[1:], payload)
+	copy(region[1+len(payload):], pad)
+
+	out := make([]byte, 4+len(region)+16)
+	binary.BigEndian.PutUint32(out[0:4], uint32(len(region)))
+
+	// The length field gets its own key, so that reading it before the
+	// packet is authenticated leaks nothing about the payload.
+	c1, err := chacha20.NewUnauthenticatedCipher(k1, nonce)
+	if err != nil {
+		panic(err)
+	}
+	c1.XORKeyStream(out[0:4], out[0:4])
+
+	c2, err := chacha20.NewUnauthenticatedCipher(k2, nonce)
+	if err != nil {
+		panic(err)
+	}
+	var polyKey [32]byte
+	c2.XORKeyStream(polyKey[:], polyKey[:])
+	// SetCounter, not "keep going": the Poly1305 key takes only 32 bytes of
+	// block zero and the rest of that block is discarded. Continuing from
+	// byte 32 would encrypt the payload with the wrong half of a block.
+	c2.SetCounter(1)
+	c2.XORKeyStream(out[4:4+len(region)], region)
+
+	// Encrypt-then-MAC, over the encrypted length field as well.
+	var tag [16]byte
+	poly1305.Sum(&tag, out[0:4+len(region)], &polyKey)
+	copy(out[4+len(region):], tag[:])
+	return out
+}
 
 func hexs(b []byte) string { return hex.EncodeToString(b) }
 
@@ -196,7 +255,42 @@ typedef struct {
 			hexs(seed), hexs(pub.Marshal()), hexs(msg),
 			hexs(ssh.Marshal(sig)))
 	}
-	sb.WriteString("};\n\n#endif /* TC_SSH_VECTORS_H_ */\n")
+	sb.WriteString("};\n\n")
+
+	// ---- chacha20-poly1305@openssh.com packets -----------------------
+	//
+	// Whole packets, so decoding one of these checks the key split, the
+	// nonce, both counters, the MAC coverage and the framing at once --
+	// any of which being wrong makes the tag fail.
+	sb.WriteString("static const struct {\n\tconst char *key;\n" +
+		"\tunsigned seq;\n\tconst char *payload;\n" +
+		"\tconst char *packet;\n} kSshPacketVectors[] = {\n")
+	prng := rand.New(rand.NewSource(11))
+	for i, plen := range []int{0, 1, 5, 6, 7, 8, 9, 63, 64, 65, 255, 1024} {
+		keyMat := make([]byte, 64)
+		for j := range keyMat {
+			keyMat[j] = byte(i*13 + j*7)
+		}
+		payload := make([]byte, plen)
+		prng.Read(payload)
+
+		// The same rule the C side uses: the length field is excluded from
+		// the alignment, because it is encrypted separately.
+		padLen := 8 - ((1 + plen) % 8)
+		if padLen < 4 {
+			padLen += 8
+		}
+		pad := make([]byte, padLen)
+		prng.Read(pad)
+
+		seq := uint32(i * 4099)
+		pkt := opensshPacket(keyMat, seq, payload, pad)
+		fmt.Fprintf(&sb, "\t{ \"%s\", %d, \"%s\", \"%s\" },\n",
+			hexs(keyMat), seq, hexs(payload), hexs(pkt))
+	}
+	sb.WriteString("};\n\n")
+
+	sb.WriteString("#endif /* TC_SSH_VECTORS_H_ */\n")
 
 	if err := os.WriteFile(*out, []byte(sb.String()), 0644); err != nil {
 		fmt.Fprintln(os.Stderr, err)

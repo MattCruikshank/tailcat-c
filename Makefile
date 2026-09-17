@@ -191,7 +191,8 @@ LIB_SRCS := \
 	src/net/http.c \
 	src/net/tls.c \
 	src/net/ca_bundle.c \
-	src/ssh/wire.c
+	src/ssh/wire.c \
+	src/ssh/packet.c
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 
