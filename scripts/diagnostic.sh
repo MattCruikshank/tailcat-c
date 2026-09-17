@@ -103,14 +103,33 @@ if [ "$LEVEL" -eq 1 ]; then
 	# A stale generated header is a test that has quietly stopped checking
 	# what it claims to. Regenerating into a scratch copy and diffing is the
 	# only way to notice.
+	#
+	# One block is excluded, and the exclusion is the interesting part.
+	# kCookieExchangeVectors is produced by wireguard-go's CookieChecker,
+	# which draws its mac2 secret and every reply nonce from crypto/rand --
+	# so those lines differ on every run and can never match. They are a
+	# captured artefact rather than a derivation: valid as a test (our code
+	# still has to open a reply wireguard-go really built) and meaningless
+	# as a freshness check.
+	#
+	# This check was added in Phase 2.1 and those vectors in 2.3, so it has
+	# been failing ever since -- unnoticed, because level 1 is the only level
+	# that runs it and level 1 had not been run in between. Comparing
+	# everything else keeps the check honest about what it can actually
+	# promise.
 	stage "generated vectors are current" '
+		strip_random() { grep -v "{ \"exchange-" "$1"; }
 		cp tests/crypto_vectors.h /tmp/vectors.before &&
 		(cd tools/genvectors && GOFLAGS=-mod=mod go run .) &&
-		if diff -q /tmp/vectors.before tests/crypto_vectors.h >/dev/null; then
+		strip_random /tmp/vectors.before > /tmp/vectors.a &&
+		strip_random tests/crypto_vectors.h > /tmp/vectors.b &&
+		cp /tmp/vectors.before tests/crypto_vectors.h &&
+		if diff -q /tmp/vectors.a /tmp/vectors.b >/dev/null; then
 			echo "    tests/crypto_vectors.h matches its generator"
+			echo "    (kCookieExchangeVectors excluded: not reproducible)"
 		else
 			echo "    tests/crypto_vectors.h is STALE -- commit the regenerated file" >&2
-			cp /tmp/vectors.before tests/crypto_vectors.h
+			diff /tmp/vectors.a /tmp/vectors.b | head -10 >&2
 			exit 1
 		fi'
 

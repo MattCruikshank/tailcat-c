@@ -234,7 +234,7 @@ take the panels off**, 5 is the quick sweep:
 ```console
 $ make diag5     # ~5s    did I just break the build
 $ make diag3     # ~30s   both toolchains, sanitizers, fuzzing, crosscheck
-$ make diag1     # long   the above from a clean tree, plus every live test
+$ make diag1     # ~15m   the above from a clean tree, plus every live test
 ```
 
 Level 3 runs before every push. Install the hook once:
@@ -726,6 +726,26 @@ symptom was a wall of missing ARIA and Camellia symbols that had nothing to
 do with the change. Fixed by naming the config as an explicit prerequisite.
 Same class as 14, found the same way, in the one part of the build where the
 usual mechanism was silently inapplicable.
+
+**19. The vector freshness check had never once passed.** *(Found by running
+the level 1 diagnostic for the first time in months.)* Level 1 regenerates
+`tests/crypto_vectors.h` and diffs it, on the principle that a stale
+generated header is a test that has quietly stopped checking what it claims
+to. The check was added in Phase 2.1. The cookie-exchange vectors were added
+in Phase 2.3, and wireguard-go's `CookieChecker` draws its mac2 secret and
+every reply nonce from `crypto/rand` -- so from that moment the file could
+never match itself, and the stage failed every time it ran. It simply had not
+run: level 1 is the only level that includes it, level 3 runs on every push,
+and level 1 had not been invoked since. A check nobody runs and a check that
+always fails are the same check.
+
+Two fixes, and the second is the one that matters. The comparison now
+excludes the block that cannot be reproduced, with the reason stated in both
+the script and the generated file. And level 1 gained the **eight live tests
+that were never in it** -- `live-allow`, `live-exitnode`, `live-socksudp`,
+`live-forward`, `live-genkey`, `live-multi`, `live-recv`, `live-ssh` -- three
+of which were written in the same session that found this. The README said
+level 1 ran "every live test". It ran nine of seventeen.
 
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs

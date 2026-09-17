@@ -515,7 +515,15 @@ func main() {
 	// CookieGenerator consumes it and macs a second message, and our code has
 	// to recover the same cookie from the reply and compute the same mac2.
 	// Nothing here is transcribed from the spec.
-	b.line("/* A complete cookie exchange performed by wireguard-go. */")
+	b.line("/* A complete cookie exchange performed by wireguard-go.")
+	b.line(" *")
+	b.line(" * NOT REPRODUCIBLE. wireguard-go's CookieChecker draws its mac2")
+	b.line(" * secret and every reply nonce from crypto/rand, so regenerating")
+	b.line(" * this block produces different bytes every time. It is a captured")
+	b.line(" * artefact rather than a derivation -- still a real test, because")
+	b.line(" * our code has to open a reply wireguard-go actually built, but")
+	b.line(" * meaningless to diff. diagnostic.sh excludes these lines from its")
+	b.line(" * freshness check for exactly that reason. */")
 	b.line("static const struct {")
 	b.line("\tconst char *name;")
 	b.line("\tconst char *responder_public;")
