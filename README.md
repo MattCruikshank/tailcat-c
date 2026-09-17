@@ -6,9 +6,11 @@ a single **fat Actually Portable Executable** — one binary that runs on
 Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
 aarch64.
 
-**Status: the agreed scope works, on two operating systems.** `tailcat-c`
-both serves and connects, interoperates with the real Go tailcat in both
-roles, and the *same fat binary* does it on Linux and on Windows:
+**Status: relay and direct paths both work, on two operating systems.**
+`tailcat-c` serves and connects, interoperates with the real Go tailcat in
+both roles, finds a direct peer-to-peer path when one exists and falls back
+to the relay when it stops working, and the *same fat binary* does it on
+Linux and on Windows:
 
 ```console
 $ echo 'the quick brown fox' | tailcat-c -v tcpGFwWCDMihnYWAeovm...
@@ -18,7 +20,16 @@ $ echo 'the quick brown fox' | tailcat-c -v tcpGFwWCDMihnYWAeovm...
 # connected
 ```
 
-and the Go server prints `the quick brown fox` on its own stdout.
+and the Go server prints `the quick brown fox` on its own stdout. On a run
+where a direct path is available, the same client reports finding one:
+
+```console
+# probing for a direct path (4 of our addresses offered)
+# path: direct to 172.25.125.50:60857, 24ms (2 of 2 candidates proven)
+```
+
+and that one is against a **real Go tailcat server**, not against ourselves:
+Tailscale's own disco protocol answering our probes.
 
 It works the other way round too: `tailcat-c serve` mints an address that the
 **real Go client** accepts, answers its WireGuard handshake as the responder,
@@ -28,7 +39,7 @@ and writes what it receives to stdout.
 systems, in both directions, through a real relay:
 
 ```
-one binary, 1759283 bytes, run by both operating systems
+one binary, 2047257 bytes, run by both operating systems
 
 == A: Windows transmits -> Linux receives ==
   the Linux server received: hello from Windows
@@ -59,37 +70,72 @@ has to reimplement, at minimum:
 
 ## Scope
 
-This implementation targets the **DERP-relay-only interop core**: fully wire
-compatible with real tailcat, but relaying through DERP rather than
-establishing direct peer-to-peer paths — exactly what tailcat's own
-WebAssembly web demo does today. That drops `magicsock`'s hardest parts
-(disco, netcheck, endpoint scoring, path upgrade) while still talking to the
-real thing, and it is a strict subset of the full data plane, so direct
-paths can be added later without redesign.
+The original scope was the **DERP-relay-only interop core** — wire compatible
+with real tailcat, but relaying rather than establishing direct paths, which
+is what tailcat's own WebAssembly demo does. That deliberately dropped
+`magicsock`'s hardest parts, on the grounds that they were a strict addition
+and could come later without redesign.
 
-Out of scope for now: direct P2P/NAT traversal, the SSH and SFTP *servers*
-(and therefore `recv` and `ls`), and the browser/WASM build. `forward`,
-`socks`, and `ssh`/`cp` as clients are all here.
+They came later. STUN, netcheck, the disco protocol, path discovery and the
+upgrade/fallback machinery are all here now, and the claim that they could be
+added without redesign turned out to be true: the only structural change was
+widening the connection key from a port pair to a four-tuple.
+
+**Still out of scope**, in descending order of how much it would take:
+
+- The **SSH and SFTP servers**, and therefore `recv`, `ls` and `serve ssh`.
+  This is by far the largest remaining item and it carries a licence
+  decision; see [Vendoring an SSH server](#vendoring-an-ssh-server).
+- The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
+  this means a second toolchain and a second build of everything — arguably
+  against the premise of a project whose whole point is one fat APE.
+- **Originating UDP through the tunnel from the CLI.** The tunnel carries it
+  and an exit node forwards it; what is missing is SOCKS5 UDP ASSOCIATE,
+  which is how upstream's CLI exposes it.
+- **TLS 1.3**, which is blocked on something more interesting than effort;
+  see [the note below](#tls-13-is-blocked-on-ed25519).
+
+`forward`, `socks`, `ssh`/`cp` as clients, exit nodes and saved identities
+are all here.
 
 ## How it compares
 
 ### Size
 
-Both columns are release builds: upstream with its own `-s -w` and 75
-`ts_omit_*` tags from `.goreleaser.yaml`, ours stripped by cosmocc.
+Both columns are release builds of the same commit: upstream with its own
+`-s -w` and the 75 `ts_omit_*` tags from `.goreleaser.yaml`, ours as cosmocc
+emits it. (Running `strip` on an APE destroys it — `scripts/check-fat.sh`
+will tell you so — and building without `-g` changes nothing, because cosmocc
+keeps debug information in sibling files rather than in the executable.)
 
 | | tailcat-c | tailcat (Go) |
 |---|---:|---:|
-| binary | **1.75 MB** | 17.67 MB |
-| gzipped | **0.86 MB** | 6.77 MB |
+| binary | **1.95 MB** | 17.70 MB |
+| gzipped | **0.97 MB** | 6.85 MB |
 | files needed for 6 OSes × 2 arches | **1** | 12 |
 
-The ratio is about 10×, and **most of it is the feature gap below, not
+The ratio is about 9×, and **most of it is the feature gap below, not
 craftsmanship**. A Go binary also carries a runtime, a garbage collector and
 reflection metadata that a C program does not, which accounts for a good part
-of the rest. The interesting number is not 1.75 MB, it is that one file covers
-every target: our own protocol code is only ~40 KB of it, and the single
-largest thing we add is the 181 KB CA bundle.
+of the rest.
+
+Where our 1.95 MB actually goes, measured with `size` on the objects:
+
+| | bytes |
+|---|---:|
+| Mbed TLS | 340 KB |
+| the compiled-in CA bundle | 181 KB |
+| **all of our own code** | **118 KB** |
+| Cosmopolitan libc, and two architectures of everything | the remainder |
+
+So the interesting number is not 1.95 MB. It is that one file covers every
+target, and that the entire protocol implementation — addresses, CBOR, JSON,
+crypto, DERP, WireGuard, TCP, UDP, STUN, disco, netcheck, path discovery —
+is smaller than the list of certificate authorities it ships with.
+
+Phases 3 through 5 added about 288 KB to the binary and roughly 6,000 lines
+of source, which is the cost of everything from `serve <ports>` through
+direct peer-to-peer paths.
 
 ### Features
 
@@ -107,10 +153,10 @@ largest thing we add is the 181 KB CA bundle.
 | Region choice by latency | ✅ (netcheck) | ✅ (netcheck) |
 | Multiple concurrent connections | ✅ | ✅ |
 | Multiple concurrent clients | ✅ (8) | ✅ |
-| UDP forwarding | the tunnel layer only | ✅ |
+| UDP forwarding | tunnel + exit node; no CLI surface | ✅ |
 | Exit node (forward to any address) | ✅ | ✅ |
-| IPv4 into the tunnel via NAT64 | ❌ | ✅ |
-| TLS to the relay | 1.2 | 1.2 + 1.3 |
+| IPv4 into the tunnel via NAT64 | ✅ | ✅ |
+| TLS to the relay | 1.2 ([why](#tls-13-is-blocked-on-ed25519)) | 1.2 + 1.3 |
 | **Commands** | | |
 | pipe stdin/stdout to a server | ✅ | ✅ |
 | `serve` | ports, ranges, `all`; many clients | full |
@@ -119,7 +165,7 @@ largest thing we add is the 181 KB CA bundle.
 | `ping` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
-| `socks` (SOCKS5 proxy) | ✅ (one server) | ✅ (many) |
+| `socks` (SOCKS5 proxy) | ✅ CONNECT, one server | ✅ CONNECT + UDP ASSOCIATE |
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
 | `ssh` / `cp` (via the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ❌ | ✅ |
@@ -135,11 +181,15 @@ largest thing we add is the 181 KB CA bundle.
 | Browser (WebAssembly) | ❌ | ✅ |
 | Persistent keys on disk | ✅ | ✅ |
 
-So: tailcat-c does the **core data path** — address, relay, tunnel, TCP — in
-both roles and interoperably, and now most of what is built on top of it:
-serving ports, forwarding, SOCKS, ssh and cp, and saved identities. What is
-left is the direct peer-to-peer path, and the SSH server that `recv`, `ls`
-and `serve ssh` all sit behind.
+So: tailcat-c does the **whole data path** — address, relay, tunnel, TCP,
+UDP, and the direct peer-to-peer path with its NAT traversal — in both roles
+and interoperably, plus everything built on top of it: serving ports,
+forwarding, SOCKS, exit nodes, ssh and cp, and saved identities.
+
+What is left is the **SSH server** that `recv`, `ls` and `serve ssh` all sit
+behind, the browser build, and a CLI surface for originating UDP. The first
+of those is most of the remaining distance, and it is a licence question
+before it is a code question.
 
 ## Build
 
@@ -163,6 +213,9 @@ make live       # connect to a real DERP relay and relay a packet (needs network
 make live-wg    # handshake against a real wireguard-go device
 make live-tailcat  # full tunnel with a real tailcat server (needs network)
 make live-cli      # drive the CLI end to end against a real server
+make live-netcheck # STUN probes and region choice against the real relay list
+make live-direct   # two of ours finding a direct path between them
+make live-exitnode # reach a third address through an exit node
 ```
 
 And, from Git Bash on Windows rather than from inside WSL, since it drives
@@ -250,7 +303,32 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-The address layer is checked three ways:
+25 test binaries, ~6,500 assertions, under two toolchains. The method matters
+more than the count, and it is the same one everywhere: **check against
+something that is not ours.**
+
+| Layer | The external anchor |
+|---|---|
+| addresses | upstream's own `tailcat_test.go` vectors, plus 2,000 random addresses generated by the real Go package and required to re-encode byte-identically |
+| crypto | `golang.org/x/crypto` and wireguard-go's exported KDFs, with RFC 7693 and RFC 7748 values as fixed points |
+| meow, disco, STUN | upstream's own encoders, via `tools/genvectors` |
+| UDP over IPv6 | packets built and checksummed by **gopacket** |
+| NAT64 | RFC 6052 §2.4's worked example, and `inet_pton`, which embeds a dotted quad itself |
+| IPv6 formatting | our output fed back through `inet_pton` |
+| everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
+
+Where a test passed on the first run, the response has generally been to
+**mutate the code and check the test notices**. That has been worth doing:
+of ten mutations to the path-discovery logic, six survived the first pass —
+including, embarrassingly, every one aimed at the rule the whole design rests
+on, because no scenario had one-way reachability. Of eleven to the UDP mux,
+two had to be *rewritten* before they were the right mutations: one was a
+false catch that merely failed to compile, and one modelled the wrong bug.
+
+A surviving mutation is a gap in the tests. A caught one only counts if it
+was the right mutation.
+
+The address layer specifically is checked three ways:
 
 1. **Golden vectors ported from upstream.** `tests/test_addr.c` uses the
    exact addresses and malformed-input cases from tailcat's own
@@ -375,6 +453,116 @@ binary, starts a real server, resolves the address it prints, and requires
 the C side to parse it, reach the relay, be meowed, and complete a
 handshake. Every milestone at once, against the thing we have to
 interoperate with.
+
+## TLS 1.3 is blocked on Ed25519
+
+Not on effort, and not on code size, which is what the plan originally
+assumed. This is worth writing down because the answer is the opposite of the
+obvious one.
+
+Enabling TLS 1.3 in Mbed TLS 3.6 is easy: `MBEDTLS_SSL_PROTO_TLS1_3`, the PSA
+crypto layer it requires (`MBEDTLS_PSA_CRYPTO_C` and HKDF — and *not*
+`MBEDTLS_PSA_CRYPTO_CONFIG`, whose defaults drag in ARIA, Camellia, CCM and
+DES), about twenty more source files, and a `psa_crypto_init()` before the
+first context. It builds, it links, and it costs 232 KB.
+
+It also cannot connect to a single relay.
+
+DERP servers append a self-signed **meta certificate** to the chain, encoding
+the server's public key in its CommonName so a client can skip a round trip.
+They send it only on TLS 1.3, because 1.3 encrypts the certificate chain and
+1.2 does not — see `initMetacert` in `tailscale.com/derp/derpserver`. That
+certificate is **Ed25519**, which Mbed TLS 3.6 cannot parse at all, so the
+chain is rejected whole, before any verification, with `X509 - Signature
+algorithm (oid) is unsupported`.
+
+The irony is exact: the gain 1.3 would have unlocked is upstream's "fast
+start", which reads the DERP key out of that same meta certificate — and the
+meta certificate is the thing that makes 1.3 unusable. Making it work means
+teaching a vendored TLS library to skip certificates it cannot parse in the
+middle of chain validation, which is not a change to make for an optimisation
+we do not implement.
+
+Nothing is given up by staying on 1.2 here: 1.2 with ECDHE and AEAD suites is
+not a weak configuration, and `tc_tls_last_version()` reports what was
+actually negotiated, so this is checkable rather than assumed.
+
+If Ed25519 gets written for the SSH server above, this becomes worth
+revisiting — the same 400 lines unblock both.
+
+## Vendoring an SSH server
+
+`recv`, `ls` and `serve ssh` all sit behind an SSH server, and it is the
+largest single thing left. PLAN.md's original note said "realistically:
+vendor an existing implementation rather than write one", which is sound
+advice that turns out to have a licence attached, so the decision belongs
+here rather than buried in a plan.
+
+This project is **BSD-3-Clause**, matching upstream tailcat, and it links
+everything statically into one executable. That makes the licence of anything
+vendored a licence question about the *whole binary*, not about a file.
+
+### The candidates
+
+| | Licence | Server? | Notes |
+|---|---|---|---|
+| **TinySSH** | public domain | yes | ~4k lines. Uses curve25519, ed25519, ChaCha20-Poly1305 — the primitives we already have. No PTY, no port forwarding, modern algorithms only. |
+| **Dropbear** | MIT (+ public-domain libtom*) | yes | ~30k lines, and a *program*, not a library. Brings libtomcrypt and libtommath, duplicating crypto we already vendor. |
+| **OpenSSH portable** | BSD-ish, mixed | yes | The reference implementation, and deeply Unix-specific. Porting `sshd` into a library inside an APE is a large job on its own. |
+| **libssh** | LGPL-2.1 | yes | Static linking obliges us to let recipients relink. Possible for an open project, awkward for a single-file APE whose whole selling point is that it is one file. |
+| **wolfSSH** | GPLv3 or commercial | yes | GPLv3 would relicense this project. |
+| **libssh2** | BSD-3 | **no** | Client only. Listed because it is the one people suggest first and it cannot do this. |
+
+### The recommendation
+
+**Write the subset, and take TinySSH as the reference rather than the
+dependency.**
+
+The reasoning is that we do not need an SSH server. We need `sftp` reachable
+over SSH with publickey authentication, which is a much smaller thing:
+
+- transport and key exchange (RFC 4253) — `curve25519-sha256`, which is
+  X25519 and SHA-256, **both already here**;
+- `chacha20-poly1305@openssh.com` for the cipher, **already here**;
+- publickey userauth (RFC 4252);
+- one channel, and only the `subsystem`/`exec` request (RFC 4254).
+
+No PTY allocation, no agent forwarding, no port forwarding, no interactive
+shell, no `scp` protocol. Those are most of what makes a general `sshd` big,
+and all of them are things a drop box should *not* have.
+
+The one genuine gap is **Ed25519**, which we do not have and which
+`ssh-ed25519` host and user keys need. Two ways out, and the first is
+probably right: implement Ed25519 (~400 lines on top of the field arithmetic
+X25519 already uses), or use `ecdsa-sha2-nistp256` host keys from Mbed TLS,
+which every OpenSSH client still accepts. Doing it ourselves also keeps the
+"no unvendored crypto beyond Mbed TLS" property the rest of the project has.
+
+Estimate with the crypto in hand: **~2,500 lines for the SSH subset, ~1,500
+for SFTP**, against ~30k for vendoring Dropbear and then carrying a second
+crypto stack forever.
+
+### If you would rather vendor
+
+Take **TinySSH** — public domain is the only licence here that costs nothing
+— but budget for the port rather than the drop-in: it is Unix-only, expects
+`fork`/`exec` and a supervising inetd-style parent, and depends on its own
+NaCl. Under Cosmopolitan on Windows that is the part that will hurt, and it
+is the same work as writing the subset, arranged differently.
+
+**Do not take wolfSSH** unless you intend to relicense, and **do not take
+libssh** unless you are willing to ship relinkable objects alongside the
+binary, which defeats the one-file premise.
+
+### The hazard this unlocks
+
+Worth stating before any of it is written. `recv` is a **write-only drop
+box**, and upstream's design is the one to copy rather than improve on: the
+server chooses every stored filename, so a sender can neither overwrite
+anything nor learn what is already in the directory. The recursive mode
+(`:wo+`, `--accept-dirs`) trades exactly that away, and upstream documents
+the trade rather than hiding it. Any implementation here should do the same,
+and the tests should assert the flat mode's guarantees directly.
 
 ## Bugs this verification has actually caught
 
@@ -521,6 +709,17 @@ whether the address belongs to this peer at all rather than whether we agree
 about it. The lesson is not about NATs -- it is that a component can be
 correct and still be wired up against a rule it states in its own header.
 
+**18. Editing the Mbed TLS config rebuilt nothing.** *(Phase 5.3, found by a
+link that should have worked.)* Mbed TLS reaches our config through its own
+`build_info.h`, which arrives via `-isystem` — and `-MMD` deliberately stops
+at system headers, so the dependency chain never reached
+`third_party/mbedtls_config.h`. Turning on TLS 1.3 therefore linked a
+`cipher_wrap.o` compiled against a config that no longer existed, and the
+symptom was a wall of missing ARIA and Camellia symbols that had nothing to
+do with the change. Fixed by naming the config as an explicit prerequisite.
+Same class as 14, found the same way, in the one part of the build where the
+usual mechanism was silently inapplicable.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -563,13 +762,14 @@ Current, and deliberate unless noted.
   Two peers that both sit behind symmetric NATs will stay on the relay, which
   is the correct answer rather than a limitation -- but upstream has a UDP
   relay for that case and we do not.
-- **One pipe at a time.** The data path is real — WireGuard, userspace TCP,
-  and interop with the Go binary in both directions — but a session carries a
-  single stream of bytes. The port-based commands all wait on the
-  demultiplexer (PLAN.md 2.1).
+- **No UDP from the command line.** The tunnel carries datagrams and an exit
+  node forwards them, but nothing in the CLI originates one. Upstream's
+  surface for that is SOCKS5 UDP ASSOCIATE, and ours does CONNECT only.
 - **No SSH or SFTP *server*, and no WASM build.** `ssh` and `cp` work as
   clients, because they exec the system ssh and scp with us as a
-  `ProxyCommand`; serving SSH would mean implementing it.
+  `ProxyCommand`; serving SSH would mean implementing it. See
+  [Vendoring an SSH server](#vendoring-an-ssh-server) for what that would
+  take and which licence it would cost.
 - **`ssh` turns off host key checking**, because the destination it gives ssh
   is a hash of the address rather than a host anyone holds a key for, and the
   address already authenticates the server: reaching it required the
@@ -577,8 +777,14 @@ Current, and deliberate unless noted.
   synthetic name would add a prompt and no security.
 - **`socks` reaches one server**, the one in its address, and ignores the
   destination host in each CONNECT request -- only the port is used. Upstream
-  routes by hostname across several servers at once. Ours would be inventing
-  a destination it cannot reach.
+  routes by hostname across several servers at once.
+
+  The original reason for this was that we had no way to reach a destination
+  beyond the server. That stopped being true when exit nodes landed, so the
+  honest statement now is that it simply has not been wired up: `forward`
+  gained a destination and `socks` did not. It should, and when it does the
+  destination in a CONNECT request is exactly what to pass to
+  `tc_tcp_mux_connect_to`.
 - **netcheck does not probe hairpinning or port mapping.** A relay is chosen
   by STUN round trip as upstream's netcheck does, and the NAT mapping is
   classified as stable or destination-dependent. What is missing is whether
@@ -691,6 +897,9 @@ Current, and deliberate unless noted.
 Roughly in the order they should be picked up.
 
 - [ ] **No TCP keepalive or idle timeout**; a silent peer is never noticed.
+      Less pressing than it was: a direct path now notices silence within
+      `TC_PATH_TRUST_MS` and falls back, but that is the *path*, not the
+      connection, and a relayed connection to a vanished peer still hangs.
 - [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
       closed connections hold their table slots; nothing does it on a timer.
 - [x] **Tiered local diagnostics** (`make diag5/3/1`) with a pre-push hook.
@@ -721,9 +930,21 @@ Roughly in the order they should be picked up.
       - [ ] **Real hardware** beats all of the above if any is to hand.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
       covered; the other four targets and the entire aarch64 half are not.
+- [ ] **An `--allow` list.** Anyone holding the address can connect, and with
+      `serve exit-node` that means reaching anything the serving machine can.
+      Upstream can restrict by client public key. This is now the largest
+      gap between our security posture and upstream's.
 - [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
       that callers must serialise it.
-- [ ] Revisit **TLS 1.3** once the PSA dependency is worth paying for.
+- [ ] **SOCKS5 UDP ASSOCIATE**, the only missing piece of UDP through the
+      tunnel. The tunnel carries datagrams and an exit node forwards them;
+      nothing in the CLI originates one, because upstream's surface for that
+      is UDP ASSOCIATE and ours does CONNECT only.
+- [ ] **Ed25519.** Needed by the SSH server, and it would also unblock TLS
+      1.3; see both sections above. ~400 lines on top of the field
+      arithmetic X25519 already uses.
+- [ ] Revisit **TLS 1.3** *after* Ed25519 exists, not before — the blocker is
+      the Ed25519 meta certificate, not the PSA dependency.
 - [ ] Refresh the **CA bundle** and decide on a cadence for it.
 - [ ] Consider making the address-parser limits runtime-configurable.
 - [ ] **Refresh the DERP map cache in the background** rather than only on a
@@ -827,9 +1048,35 @@ over SSH, so the *server* half needs PLAN.md's 5.4 and 5.5 rather than the
 live-recv` delivers a file into a real `tailcat recv` drop box — because `cp`
 execs the system scp, which speaks exactly that protocol.
 
-Beyond here, see [PLAN.md](PLAN.md): Phase 4 is direct peer-to-peer paths, and
-everything left of upstream's command set (`recv`, `ls`, `serve ssh`) needs an
-SSH server first.
+- [x] **Phase 4 — direct peer-to-peer paths.** A UDP transport, a STUN
+      client, netcheck, the disco protocol, and the path discovery and
+      upgrade machinery that uses them. A session starts on the relay, moves
+      to a direct path once one is *proven* — only an answered Ping counts —
+      and moves back if it goes quiet. Tested against a simulated network
+      where NAT behaviour, loss, delay and the clock are all arguments, then
+      against reality: `make live-direct` for two of ours, and `make
+      live-cli`, which now shows our client going direct to a **real Go
+      tailcat server** using Tailscale's own disco protocol.
+
+- [x] **Phase 5.1, 5.2 — datagrams and exit nodes.** UDP through the tunnel,
+      checked against packets built by `gopacket` because an IPv6 UDP
+      checksum covers a pseudo-header and a wrong one is invisible to a
+      loopback test. NAT64 for IPv4 destinations, anchored to RFC 6052's
+      published example. Exit-node mode on both muxes and both ends of the
+      CLI, off unless asked for by name, with `make live-exitnode` checking
+      that a server which was *not* asked to forward refuses.
+
+- [x] **Phase 5.3 — TLS 1.3, attempted and reverted.** See
+      [above](#tls-13-is-blocked-on-ed25519). Kept from it:
+      `tc_tls_last_version()`, and a Makefile fix — Mbed TLS objects now
+      depend on `mbedtls_config.h` explicitly, because `-MMD` stops at the
+      `-isystem` header that includes it, so editing the config rebuilt
+      nothing.
+
+**Phase 4 is done and Phase 5 is partly done.** What remains of upstream's
+command set — `recv`, `ls`, `serve ssh` — needs an SSH server first, which is
+a [licence decision](#vendoring-an-ssh-server) before it is code. See
+[PLAN.md](PLAN.md) for the detail.
 
 ## Licence
 

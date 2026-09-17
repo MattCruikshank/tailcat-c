@@ -4,10 +4,17 @@ What tailcat-c would need to reach feature parity with upstream
 [tailcat](https://github.com/tailscale/tailcat), roughly in the order worth
 doing it.
 
-Today tailcat-c has the **core data path** — address codec, DERP relay,
-WireGuard tunnel, userspace TCP — working in both roles and verified against
-the real Go implementation. Everything below is built on top of that, or
-makes it more robust.
+Today tailcat-c has the **whole data path** — address codec, DERP relay,
+WireGuard tunnel, userspace TCP and UDP, and direct peer-to-peer paths with
+NAT traversal — working in both roles and verified against the real Go
+implementation.
+
+**Phases 1–4 are done. Phase 5 is partly done**, and what is left of it
+divides into three quite different things: one small piece of ordinary work
+(SOCKS5 UDP ASSOCIATE), one blocked on a licence decision (the SSH and SFTP
+servers), and one blocked on a toolchain that does not exist for
+Cosmopolitan (WebAssembly). A fourth, TLS 1.3, was attempted and turned out
+to be blocked on Ed25519 rather than on effort.
 
 Sizes are rough C line counts for the new code, excluding tests, which have
 run about 1:1 with implementation on this project. "Risk" is about how likely
@@ -513,10 +520,36 @@ observable rather than assumed, and a Makefile fix — Mbed TLS objects now
 depend on `mbedtls_config.h` explicitly, because `-MMD` stops at the
 `-isystem` header that includes it and editing the config rebuilt nothing.
 
-### 5.4 SSH server · ~4,000+ lines · **high risk**
-The largest single item. Transport, key exchange, userauth, channels, PTY
-handling. Realistically: vendor an existing implementation rather than write
-one. Needed for `ls` (SFTP) and for being an SSH target.
+### 5.4 SSH server · ~2,500 lines · **high risk** · blocked on a licence choice
+
+The largest single item, and the one decision in this plan that is not
+technical. Full detail and a recommendation are in the README under
+[Vendoring an SSH server](README.md#vendoring-an-ssh-server); the summary:
+
+| | Licence | Verdict |
+|---|---|---|
+| TinySSH | public domain | usable; a port, not a drop-in (Unix-only, own NaCl) |
+| Dropbear | MIT | usable, but ~30k lines and a second crypto stack |
+| OpenSSH portable | BSD-ish | reference implementation, deeply Unix-specific |
+| libssh | LGPL-2.1 | obliges us to ship relinkable objects |
+| wolfSSH | GPLv3 / commercial | would relicense this project |
+| libssh2 | BSD-3 | **client only** — cannot do this |
+
+**Recommendation: write the subset.** We do not need an SSH server; we need
+`sftp` over SSH with publickey auth, which is transport and key exchange
+(`curve25519-sha256` — X25519 and SHA-256, both already here),
+`chacha20-poly1305@openssh.com` (already here), publickey userauth, and a
+single channel with only the `subsystem` request. No PTY, no port
+forwarding, no agent forwarding, no shell — which is most of what makes a
+general `sshd` large, and all of which a drop box should not have.
+
+The one real gap is **Ed25519** for `ssh-ed25519` keys: ~400 lines on top of
+the field arithmetic X25519 already uses, or fall back to
+`ecdsa-sha2-nistp256` host keys from Mbed TLS. Writing it also unblocks TLS
+1.3 (5.3), so the same 400 lines buy two things.
+
+The estimate drops from ~4,000 lines to ~2,500 precisely because the scope
+is the subset rather than a general server.
 
 ### 5.5 SFTP server · ~1,500 lines · medium risk
 Needed by `ls`, by the server side of `cp`, and by **`recv`**, which moved
@@ -532,15 +565,27 @@ trade-off rather than hiding it.
 No SFTP *client* is needed: `cp` and `ls` can keep execing the system scp and
 sftp, as `cp` already does.
 
-### 5.6 WebAssembly build · unknown · high risk
+### 5.6 WebAssembly build · blocked on the toolchain
+
 Upstream compiles to WASM for the browser demo. Cosmopolitan does **not**
-target WASM, so this would mean a second toolchain and a second build of the
-whole stack — arguably out of scope for a project whose premise is one fat
-APE.
+target WASM: cosmocc is GCC for x86_64 and aarch64, and there is no clang,
+emscripten or wasi-sdk in this environment to fall back on. This would mean a
+second toolchain and a second build of the whole stack.
+
+It is also the item most in tension with the premise. The selling point of
+this project is *one file that runs everywhere*; a WASM build is by
+definition a second artifact that runs somewhere else. Worth doing only if
+the browser demo is the point, rather than as parity for its own sake.
+
+Two things would need solving beyond the toolchain: there are no raw sockets
+in a browser, so DERP would have to run over WebSocket as upstream's demo
+does, and the direct-path work from Phase 4 has nothing to stand on — a
+browser cannot open a UDP socket at all, so a WASM build is relay-only by
+construction.
 
 ---
 
-## Cross-cutting, and worth doing before Phase 3
+## Cross-cutting
 
 These are already in the README's TODO list and do not depend on any feature.
 
@@ -554,6 +599,9 @@ These are already in the README's TODO list and do not depend on any feature.
   claim remaining.
 - **Extend fuzzing** to the DERP frame codec, the JSON parser and the TCP
   input path.
+- **Extend mutation testing** beyond path discovery and the UDP mux, which
+  are the only two modules it has been applied to. It found gaps in both, at
+  a rate that suggests the other modules have them too.
 - **Constant-time audit** with actual timing measurements, rather than the
   current "written in a data-independent style".
 - **Thread-safety**: either make `tc_derp_client` safe for concurrent use or
@@ -563,35 +611,56 @@ These are already in the README's TODO list and do not depend on any feature.
 
 ## Totals and honest expectations
 
-| Phase | New C | Risk |
+| Phase | New C | Status |
 |---|---:|---|
-| 1 — self-sufficient | ~1,330 ✅ | done |
-| 2 — robust | ~1,390 ✅ | done |
-| 3 — commands | ~1,970 ✅ | done |
-| 4 — direct paths | ~1,950 | **high** |
-| 5 — long tail (excl. SSH/WASM) | ~350 | low |
-| 5 — SSH + SFTP (incl. `recv`) | ~5,500 | high |
+| 1 — self-sufficient | ~1,330 | ✅ done |
+| 2 — robust | ~1,390 | ✅ done |
+| 3 — commands | ~1,970 | ✅ done |
+| 4 — direct paths | 2,801 | ✅ done |
+| 5.1, 5.2 — datagrams, NAT64, exit nodes | ~990 | ✅ done |
+| 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
+| 5.4, 5.5 — SSH + SFTP (and `recv`, `ls`) | ~4,000 | ⏸ licence decision |
+| 5.6 — WebAssembly | ? | ⏸ no toolchain |
+| — SOCKS5 UDP ASSOCIATE | ~350 | the next ordinary piece of work |
 
-Roughly **7,000 lines** for everything except SSH, SFTP and WASM, on top of
-the ~7,500 that exist — so a little under double the current size. Add SSH and
-SFTP and it roughly doubles again.
+The estimates held up better than expected in aggregate and badly in
+particulars. Phase 4 came in at 2,801 against ~1,950 estimated — the extra is
+almost entirely test scaffolding for the simulated networks, which was the
+right place to spend it. Phase 5.4 went the other way, from ~4,000 to ~2,500,
+because the scope turned out to be "sftp over ssh" rather than "an ssh
+server". The one that was simply wrong was 3.5 (`recv`), estimated at ~300
+lines and actually a subset of 5.5.
 
-Phases 1 and 3 are mostly mechanical. Phase 2 and Phase 4 are where the real
-difficulty is, and both have failure modes that only appear under load or
-over time rather than in a unit test. The pattern from M1–M7 holds: the
-dangerous work is where a plausible-looking implementation is subtly wrong,
-and the defence is differential testing against the Go implementation plus a
-second, stricter toolchain.
+Source today is about **22,000 lines** across `src/` and `include/`, with
+another **14,000** of tests. The 1:1 ratio predicted at the start has held
+almost exactly.
 
-**Phases 1, 2 and 3 are done.** Everything that made the tunnel unreliable is
-closed, and every command that moves bytes is implemented.
+Phase 2 and Phase 4 were where the real difficulty was, and both had the
+failure modes predicted for them: things that only appear under load or over
+time. Phase 2's rekey bug took a two-hour simulated run with 5% loss to
+surface; Phase 4's worst bug was invisible to every unit test and showed up
+on the first end-to-end run. The defence held — differential testing against
+the Go implementation, a second stricter toolchain, and simulated networks
+where the clock is an argument — with one addition worth carrying forward:
+**mutation testing**, which found that six of ten assertions about path
+discovery were not actually being made.
 
-The next thing is **Phase 3**, which is now unblocked and mostly mechanical:
-`serve` with ports, `forward`, `socks` and the `ssh`/`cp` wrappers all wanted
-the demultiplexer and a session that lasts, and now have both. 3.5 (`recv`)
-is the one to write carefully, since it writes attacker-named files.
+### What to do next
 
-The cross-cutting item worth doing alongside it is **running the aarch64
-half**, which is now the largest untested claim in the project: the
-diagnostics cover x86_64 on two operating systems, and the other half of every
-binary has never been executed at all.
+1. **Run the aarch64 half.** Still the largest untested claim in the project.
+   The diagnostics cover x86_64 on two operating systems; the other half of
+   every binary has never been executed at all. Cheapest first: build x86_64
+   with `-funsigned-char` and run the suite, then qemu-user, then
+   qemu-system, then real hardware.
+2. **SOCKS5 UDP ASSOCIATE**, which closes 5.1 and is the last piece of
+   ordinary work in the plan.
+3. **Ed25519**, which unblocks both the SSH server and TLS 1.3.
+4. **Decide the SSH licence question** (see 5.4) and then write the subset.
+5. An **`--allow` list**, which is now the largest gap between our security
+   posture and upstream's — especially with `serve exit-node`, where anyone
+   holding the address can reach anything the serving machine can.
+
+WebAssembly is last on purpose, and possibly never: it is a second artifact
+for a project whose premise is one file, and a browser cannot open a UDP
+socket, so a WASM build would be relay-only by construction — throwing away
+the whole of Phase 4.
