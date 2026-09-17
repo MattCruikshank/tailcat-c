@@ -562,8 +562,40 @@ learn what is already in the directory. The recursive mode (`:wo+`,
 `--accept-dirs`) trades exactly that away, and upstream documents the
 trade-off rather than hiding it.
 
-No SFTP *client* is needed: `cp` and `ls` can keep execing the system scp and
-sftp, as `cp` already does.
+**How upstream does these three is not uniform**, and it is worth being
+precise about because it decides how much we would have to write:
+
+| | upstream | ours |
+|---|---|---|
+| `ssh` | execs the system `ssh` (`exec.LookPath("ssh")`) | same |
+| `cp` | execs the system `scp` (`exec.LookPath("scp")`) | same |
+| `ls` | **in-process**: `golang.org/x/crypto/ssh` + `github.com/pkg/sftp`, dialling port 22 through its own tunnel | not implemented |
+
+So for `ssh` and `cp` we already match upstream exactly. `ls` is the odd one
+out: upstream does not shell out to the system `sftp` binary, it links an SSH
+client and an SFTP client and drives them itself, which is where a good part
+of that ~20,000 lines of Go dependency goes.
+
+That leaves a choice for our `ls`, and it is a real one:
+
+- **Exec the system `sftp`** (`sftp -b`). Consistent with how we already do
+  `cp`, and needs no SFTP client at all. The cost is that the output is
+  whatever the local `sftp` prints, so `tailcat-c ls` and `tailcat ls` would
+  not agree on formatting, and it needs an `sftp` binary present — which on
+  Windows is not a given.
+- **Write an SFTP client** (~400 lines for the handful of packets `ls`
+  needs: `SSH_FXP_STAT`, `SSH_FXP_OPENDIR`, `SSH_FXP_READDIR`). Matches
+  upstream's output, needs no external binary — but needs an SSH *client*
+  too, and we have neither.
+
+Worth noting the ordering: an SFTP client is only cheap **after** 5.4 exists,
+because it needs an SSH transport to run over. Before then, execing is the
+only option that works at all.
+
+Upstream's `ls` also disables host key checking, for the same reason our
+`ssh` wrapper does: "The WireGuard tunnel already authenticated the server by
+its node key in the tailcat address, so the SSH host key adds nothing." Good
+to know we reached the same conclusion independently.
 
 ### 5.6 WebAssembly build · blocked on the toolchain
 

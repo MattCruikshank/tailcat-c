@@ -167,8 +167,8 @@ direct peer-to-peer paths.
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
 | `socks` (SOCKS5 proxy) | ✅ CONNECT, one server | ✅ CONNECT + UDP ASSOCIATE |
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
-| `ssh` / `cp` (via the system ssh and scp) | ✅ | ✅ |
-| `ls` (SFTP remote listing) | ❌ | ✅ |
+| `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
+| `ls` (SFTP remote listing) | ❌ | ✅ (in-process SFTP client) |
 | SSH *server* (`serve ssh`) | ❌ | ✅ |
 | `recv` (file drop box, receiving) | ❌ (needs SSH+SFTP) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
@@ -767,9 +767,17 @@ Current, and deliberate unless noted.
   surface for that is SOCKS5 UDP ASSOCIATE, and ours does CONNECT only.
 - **No SSH or SFTP *server*, and no WASM build.** `ssh` and `cp` work as
   clients, because they exec the system ssh and scp with us as a
-  `ProxyCommand`; serving SSH would mean implementing it. See
+  `ProxyCommand` — which is exactly what upstream does for those two as
+  well. Serving SSH would mean implementing it; see
   [Vendoring an SSH server](#vendoring-an-ssh-server) for what that would
   take and which licence it would cost.
+- **No `ls`**, and it is not simply the same trick again. Upstream's `ls` is
+  the one file command it does *not* shell out for: it links
+  `golang.org/x/crypto/ssh` and `github.com/pkg/sftp` and drives them
+  in-process over its own tunnel. We could exec the system `sftp` instead
+  and match neither its output nor its lack of external dependencies, or
+  write an SFTP client — which needs an SSH client first. PLAN.md 5.5 has
+  the trade-off.
 - **`ssh` turns off host key checking**, because the destination it gives ssh
   is a hash of the address rather than a host anyone holds a key for, and the
   address already authenticates the server: reaching it required the
