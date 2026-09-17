@@ -90,7 +90,12 @@ machine or over ssh, the URL is printed instead of guessed at.
 A SOCKS5 proxy, optionally running a command with `all_proxy` set:
 
     tailcat-c socks <tc-addr> 1080
-    tailcat-c socks <tc-addr> -- curl https://example.com
+    tailcat-c socks <tc-addr> curl https://example.com
+    tailcat-c socks <tc-addr> 1080 -- curl https://example.com
+
+The argument after the address is the listening port if it reads as one and
+the start of a command if it does not. `--` is only needed for a command
+whose name is a number.
 
 In a SOCKS request, the hostname `server.tailcat` means the server itself.
 Any other name is a destination to reach *through* it, which needs

@@ -167,7 +167,26 @@ if ! printf '%s' "$CHILD_OUT" | grep -qF "service-said: via all_proxy"; then
 	exit 1
 fi
 
+# ---- socks with a child command and no separator -------------------------
+# Upstream takes `socks <tc-addr> <cmd>...` with no `--`, and its README is
+# written that way. Ours reads the argument after the address as a port if it
+# is one and as the start of a command if it is not, so this exercises the
+# second branch -- the one that used to report `"curl" is not a port number`.
+echo
+echo "\$ tailcat-c socks <addr> <client reading all_proxy>   # no --"
+CHILD2=$(printf 'no separator
+' |
+	timeout 90 "$CLI" socks "$ADDR" 	    python3 scripts/socks-client.py --from-env "$SVCPORT" 	    2>"$WORK/child2.err" || true)
+echo "    got: $CHILD2"
+if ! printf '%s' "$CHILD2" | grep -qF "service-said: no separator"; then
+	echo >&2
+	echo "live-forward: the child command without -- did not reach the service." >&2
+	sed 's/^/    /' "$WORK/child2.err" >&2
+	exit 1
+fi
+
 echo
 echo "ok   live-forward             forward and socks both carried a local"
 echo "                              client to a real Go tailcat server,"
-echo "                              including a child run with all_proxy"
+echo "                              including a child run with all_proxy,"
+echo "                              with and without the -- separator"

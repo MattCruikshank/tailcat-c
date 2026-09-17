@@ -911,13 +911,30 @@ that found them: each is a feature the table called done, or did not mention
 at all, and a user following upstream's documentation meets them immediately.
 In rough order of what they cost:
 
-1. **`socks <addr> <cmd>` without `--`.** Ours requires the separator and
-   says `"curl" is not a port number`, which is a confusing way to report a
-   missing `--`. The fix is to notice that the argument after the address is
-   not a port and treat the rest as a command -- or, at minimum, to say so.
-2. **`ping --until-direct`.** Keep pinging until a direct path answers, up to
-   `--timeout`, and exit non-zero if none does. Path discovery already
-   reports which path a reply arrived on, so this is a loop and an exit code.
+1. ~~**`socks <addr> <cmd>` without `--`**~~: done. The argument after the
+   address is a port if it reads as one and the start of a command if it
+   does not, and `--` still works for the one ambiguous case, a command
+   whose name is a number. It needed the same pass-through `ssh` and `cp`
+   got in bug 32 -- `socks <addr> python3 x.py --from-env 18082` had
+   `--from-env` read as ours -- which is the third subcommand to want it and
+   an argument for making that the rule rather than the exception.
+2. **`ping --until-direct`.** Bigger than this list first said, and the
+   correction is the useful part: it claimed "path discovery already reports
+   which path a reply arrived on, so this is a loop and an exit code". That
+   is false. `ping` here is relay-only -- it opens a DERP connection, sends a
+   meow ping, waits for the reply -- and never attempts a direct path, so
+   there is nothing to loop on and the flag could only ever fail.
+
+   Doing it properly means rebuilding `ping` on the client stack the pipe
+   uses: `client_up` for the tunnel, `path_bring_up` for discovery, a pump
+   loop to drive them, and `tc_path_best` to ask which way the last reply
+   came. Every piece exists; none of them is currently wired into `ping`,
+   and the pump is the fiddliest code in the project. Call it a day's work
+   touching the part with the worst failure modes, not an hour.
+
+   It would also close the cosmetic gap in the walkthrough: upstream's ping
+   names the direct path it used, and ours can only ever name a relay
+   because a relay is all it has.
 3. **Reaching a third address from the pipe form and `ssh -p ip:port`.**
    `forward` parses `local:ip:port` and `serve exit-node` serves it, so both
    ends exist; what is missing is accepting the syntax in two more places and

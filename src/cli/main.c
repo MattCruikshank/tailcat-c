@@ -4986,7 +4986,10 @@ int main(int argc, char **argv)
 	memset(&allow, 0, sizeof allow);
 	/* Room for a subcommand plus several port specs: upstream allows the
 	 * list to be spread over arguments, as in `serve 80,443 8000-8999`. */
-	const char *args[16];
+	/* One longer than the loop will fill: `socks <addr> <cmd>...`
+	 * hands the tail of this array to execvp, which needs a NULL
+	 * after the last argument. */
+	const char *args[17];
 	size_t nargs = 0;
 	memset(args, 0, sizeof args);
 
@@ -5022,7 +5025,7 @@ int main(int argc, char **argv)
 				ssh_port = argv[++i];
 				continue;
 			}
-			if (nargs >= sizeof args / sizeof args[0]) {
+			if (nargs >= sizeof args / sizeof args[0] - 1) {
 				fprintf(stderr, "tailcat-c: too many arguments\n");
 				return 2;
 			}
@@ -5170,10 +5173,16 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: unknown flag %s\n", a);
 			usage(stderr);
 			return 2;
-		} else if (nargs < sizeof args / sizeof args[0]) {
+		} else if (nargs < sizeof args / sizeof args[0] - 1) {
 			args[nargs++] = a;
 			if (nargs == 1 &&
 			    (strcmp(a, "ssh") == 0 || strcmp(a, "cp") == 0))
+				passthrough = true;
+			/* socks runs a child too, and the child has flags of its own:
+			 * `socks <addr> python3 x.py --from-env 18082` must not have
+			 * --from-env read as ours. One argument later than ssh and cp,
+			 * because the address is still this program's to read. */
+			else if (nargs == 2 && strcmp(args[0], "socks") == 0)
 				passthrough = true;
 		} else {
 			fprintf(stderr, "tailcat-c: too many arguments\n");
@@ -5333,9 +5342,41 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: socks needs an address\n");
 			return 2;
 		}
-		return cmd_forward_or_socks(args[1], nargs >= 3 ? &args[2] : NULL,
-		                            nargs >= 3 ? nargs - 2 : 0, bind_addr,
-		                            true, child_argv, insecure,
+		/* `socks <addr> [port] [cmd...]`, and the command needs no `--`,
+		 * because upstream's does not:
+		 *
+		 *     tailcat socks [--listen=<addr:port>] [<tc-addr>] [<cmd> ...]
+		 *
+		 * Ours takes the port where upstream takes a flag, so the argument
+		 * after the address is a port if it reads as one and the start of a
+		 * command otherwise. That is unambiguous for every command anyone
+		 * would run -- `curl` is not a port -- and `--` is still there for
+		 * the one case it is not, a command whose name is a number. */
+		size_t at = 2;
+		const char **specs = NULL;
+		size_t nspecs = 0;
+		if (at < nargs) {
+			tc_fwd_spec probe;
+			if (tc_fwd_parse(&probe, args[at]) == TC_OK) {
+				specs = &args[at];
+				nspecs = 1;
+				at++;
+			}
+		}
+		/* `--` survives into the positionals now that everything after the
+		 * address is taken verbatim, so the separator form arrives here as
+		 * an argument rather than as child_argv. Skipping it keeps both
+		 * spellings working and keeps execvp from being handed "--". */
+		if (at < nargs && strcmp(args[at], "--") == 0)
+			at++;
+		const char *const *child = child_argv;
+		if (child == NULL && at < nargs) {
+			/* Into the same array, which has a spare slot for this. */
+			args[nargs] = NULL;
+			child = (const char *const *)&args[at];
+		}
+		return cmd_forward_or_socks(args[1], specs, nspecs, bind_addr, true,
+		                            child, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, false);
 	}
