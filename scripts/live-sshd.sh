@@ -131,3 +131,53 @@ fi
 # ssh exiting zero is itself the exit-status check: without our exit-status
 # message ssh reports 255.
 echo "ok   live-sshd               real OpenSSH completed a session against our server"
+
+# ---- and a rekey is refused, not ignored ---------------------------------
+#
+# OpenSSH starts a key exchange on its own schedule. RFC 4253 section 9 has
+# the initiator wait for a KEXINIT in reply, so a server that ignores the
+# request leaves the client blocked until its own timeout with nothing in
+# stderr to say why -- which is what this server did until the handler was
+# added. RekeyLimit forces the case in a second rather than in a gigabyte.
+#
+# The check is deliberately "named failure, quickly" rather than "success":
+# we cannot rekey, and the point is that we say so.
+echo "== forcing a rekey =="
+port2=$((port + 1))
+"$SSHD" "$port2" "$host_seed" "$pub_hex" > "$tmp/srv2.out" 2> "$tmp/srv2.err" &
+srv_pid=$!
+for _ in $(seq 1 100); do
+	grep -q '^listening ' "$tmp/srv2.out" 2>/dev/null && break
+	sleep 0.1
+done
+
+start=$(date +%s)
+set +e
+head -c 200000 /dev/zero | tr '\0' 'x' | timeout 20 ssh \
+	-i "$tmp/id" \
+	-o StrictHostKeyChecking=no \
+	-o UserKnownHostsFile=/dev/null \
+	-o GlobalKnownHostsFile=/dev/null \
+	-o IdentitiesOnly=yes \
+	-o BatchMode=yes \
+	-o LogLevel=ERROR \
+	-o RekeyLimit=16K \
+	-p "$port2" tester@127.0.0.1 "uptime" > /dev/null 2> "$tmp/rekey.err"
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+kill "$srv_pid" 2>/dev/null || true
+srv_pid=""
+
+if [ "$rc" -eq 124 ]; then
+	echo "live-sshd: FAIL -- the client hung for ${elapsed}s on a rekey" >&2
+	echo "  A rekey request must be answered, even to refuse it." >&2
+	exit 1
+fi
+if ! grep -q 'rekeying is not implemented' "$tmp/rekey.err"; then
+	echo "live-sshd: FAIL -- a rekey did not draw our disconnect" >&2
+	cat "$tmp/rekey.err" >&2
+	cat "$tmp/srv2.err" >&2
+	exit 1
+fi
+echo "ok   live-sshd               a rekey is refused by name in ${elapsed}s, not ignored"

@@ -520,6 +520,28 @@ int tc_ssh_server_read(tc_ssh_server *s, void *buf, size_t cap, size_t *nread)
 			s->peer_eof = true;
 			s->ch.closed = true;
 			return TC_ERR_DONE;
+		case TC_SSH_MSG_KEXINIT:
+			/* The peer wants to rekey. We cannot, and the important part is
+			 * that we say so: RFC 4253 9 has the initiator wait for our
+			 * KEXINIT in reply, so ignoring this leaves the client blocked
+			 * until its own timeout with no indication why. OpenSSH starts a
+			 * rekey on its own schedule, so this is reachable in any session
+			 * that lives long enough -- far sooner than the sequence number
+			 * could wrap.
+			 *
+			 * A disconnect turns an indefinite hang into a named failure.
+			 * Implementing the rekey properly is the real answer and is on
+			 * the list; until then this fails honestly. */
+			{
+				uint8_t bye[128];
+				size_t bye_len = 0;
+				if (tc_ssh_disconnect_build(
+				        bye, sizeof bye, &bye_len,
+				        TC_SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
+				        "rekeying is not implemented") == TC_OK)
+					(void)send_packet(s, bye, bye_len);
+			}
+			return TC_ERR_UNSUPPORTED;
 		case TC_SSH_MSG_CHANNEL_REQUEST: {
 			/* A request mid-session, such as a window-change. Refused, but
 			 * answered if it wants an answer. */

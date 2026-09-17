@@ -586,6 +586,34 @@ does not match" and nothing more specific.
       *is* counted. Every vector we had was encrypted, so every handshake
       packet was four bytes out of alignment and OpenSSH rejected all of
       them. See bug 22.
+- [ ] **5.4.7 rekeying** · ~150 lines · the one piece of 5.4 that is not
+      done, and it is a real gap rather than a theoretical one.
+
+      Two things go wrong without it. The sequence number is the cipher
+      nonce, so it must never wrap; `tc_ssh_server_run` stops at 2^32
+      packets, which for a drop box is unreachable. That is the harmless
+      half.
+
+      The half that actually happens is a peer *asking* to rekey. OpenSSH
+      starts a key exchange on its own schedule, and RFC 4253 section 9 has
+      the initiator wait for a KEXINIT in reply -- so a server that ignores
+      the request leaves the client blocked until its own timeout with
+      nothing in stderr to say why. That is what this server did until the
+      handler was added; `ssh -o RekeyLimit=16K` reproduces it in about a
+      second, and before the fix the client sat there for the full timeout
+      and printed nothing at all.
+
+      It now answers with SSH_MSG_DISCONNECT, which is still a refusal but a
+      legible one, and `make live-sshd` checks both that the refusal arrives
+      and that it arrives *quickly* -- a hang and a refusal look identical to
+      a test that only asserts non-zero exit.
+
+      Doing it properly means re-running the exchange mid-session while
+      keeping the session id fixed, which is what ties the new keys to the
+      identity originally proven. The awkward part is not the kex: it is
+      that channel data may be in flight in both directions when the KEXINIT
+      arrives, and RFC 4253 allows only transport messages between KEXINIT
+      and NEWKEYS.
 
 The decision and its alternatives remain recorded below, because a decision
 whose reasoning is thrown away is one that gets relitigated. Full detail is in the README under
@@ -803,6 +831,10 @@ discovery were not actually being made.
 2. **Write the SFTP subset** (5.5). The SSH side is done and verified
    against a real OpenSSH, and `subsystem` already delivers the request, so
    what remains is the file protocol and `recv`'s write-only discipline.
+3. **SSH rekeying** (5.4.7). Currently refused by name rather than
+   implemented. Refusing is honest and a long transfer will hit it: OpenSSH
+   rekeys on its own schedule, so any session that moves enough data ends
+   with a disconnect the user did not ask for.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is
    alive, answers every probe, and simply never sends its FIN: nothing bounds

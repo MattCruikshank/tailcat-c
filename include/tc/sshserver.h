@@ -15,11 +15,18 @@
  * The refusals are answered rather than ignored, because a client waiting for
  * a reply it will never get cannot tell that from a hung server.
  *
- * There is no rekeying. A session that transfers more than a few gigabytes or
- * lives past 2^32 packets would need it -- the sequence number is the cipher
- * nonce, so it must never wrap -- and tc_ssh_server_run refuses to continue
- * rather than letting it. For a file drop box that limit is unreachable in
- * practice; for anything longer-lived it would have to be implemented.
+ * There is no rekeying, and that bites in two places rather than one.
+ *
+ * The obvious one is the sequence number, which is the cipher nonce and so
+ * must never wrap: tc_ssh_server_run stops at 2^32 packets rather than
+ * letting it. For a file drop box that is unreachable in practice.
+ *
+ * The one that actually happens is a peer asking to rekey. OpenSSH starts a
+ * key exchange on its own schedule, and RFC 4253 section 9 has the initiator
+ * wait for a KEXINIT in reply -- so a server that ignores the request leaves
+ * the client blocked until its own timeout, with nothing to say why. This
+ * server answers with SSH_MSG_DISCONNECT instead, which is still a refusal
+ * but a legible one. Implementing the exchange properly is the real fix.
  */
 #ifndef TC_SSHSERVER_H_
 #define TC_SSHSERVER_H_

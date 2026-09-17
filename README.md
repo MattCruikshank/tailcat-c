@@ -1118,10 +1118,15 @@ Roughly in the order they should be picked up.
 - [ ] Consider making the address-parser limits runtime-configurable.
 - [ ] **Refresh the DERP map cache in the background** rather than only on a
       miss, so a long-lived process does not pay a fetch mid-session.
-- [ ] **Rekeying for the SSH server.** The sequence number is the cipher
-      nonce, so it must never wrap; `tc_ssh_server_run` stops rather than
-      letting it, which is correct but is a limit rather than a solution. A
-      drop box will not reach 2^32 packets; anything longer-lived would.
+- [ ] **Rekeying for the SSH server**, which is a live limitation rather
+      than a theoretical one. The sequence number is the cipher nonce and
+      must never wrap, so `tc_ssh_server_run` stops at 2^32 packets -- that
+      part is unreachable for a drop box. What is reachable is a peer asking
+      to rekey: OpenSSH does so on its own schedule, and until a handler was
+      added this server ignored the request, leaving the client blocked
+      until its own timeout with nothing in stderr. It now answers with a
+      disconnect, so a long transfer ends by name instead of hanging, but
+      ending is not succeeding. PLAN.md 5.4.7 has the detail.
 - [ ] **Fuzz the DERP frame codec.** It parses attacker-influenced lengths
       straight off a socket, which is the same shape as the TCP reassembly
       queue, and that is where bugs 20 and 21 came from. It has vectors and
