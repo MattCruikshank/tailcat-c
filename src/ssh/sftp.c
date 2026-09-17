@@ -311,3 +311,169 @@ int tc_sftp_build_name(uint8_t *out, size_t cap, size_t *out_len, uint32_t id,
 	write_attrs(&w, attrs);
 	return finish(&w, out, out_len);
 }
+
+/* ---- the client half --------------------------------------------------- */
+
+int tc_sftp_build_init(uint8_t *out, size_t cap, size_t *out_len)
+{
+	if (out == NULL)
+		return TC_ERR_INVAL;
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, out, cap);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_INIT);
+	tc_ssh_put_u32(&w, TC_SFTP_VERSION);
+	return finish(&w, out, out_len);
+}
+
+int tc_sftp_build_path_request(uint8_t *out, size_t cap, size_t *out_len,
+                               uint8_t type, uint32_t id, const char *path)
+{
+	if (out == NULL || path == NULL)
+		return TC_ERR_INVAL;
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, out, cap);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, type);
+	tc_ssh_put_u32(&w, id);
+	tc_ssh_put_cstring(&w, path);
+	return finish(&w, out, out_len);
+}
+
+int tc_sftp_build_handle_request(uint8_t *out, size_t cap, size_t *out_len,
+                                 uint8_t type, uint32_t id,
+                                 const uint8_t *handle, size_t handle_len)
+{
+	if (out == NULL || handle == NULL || handle_len > TC_SFTP_MAX_HANDLE)
+		return TC_ERR_INVAL;
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, out, cap);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, type);
+	tc_ssh_put_u32(&w, id);
+	tc_ssh_put_string(&w, handle, handle_len);
+	return finish(&w, out, out_len);
+}
+
+int tc_sftp_parse_response(tc_sftp_response *out, const uint8_t *pkt,
+                           size_t len)
+{
+	if (out == NULL || pkt == NULL)
+		return TC_ERR_INVAL;
+	memset(out, 0, sizeof *out);
+
+	size_t want = 0;
+	int rc = tc_sftp_packet_len(pkt, len, &want);
+	if (rc != TC_OK)
+		return rc;
+	if (len != want)
+		return TC_ERR_INVAL;
+
+	tc_ssh_rbuf r;
+	tc_ssh_rbuf_init(&r, pkt + 4, len - 4);
+	out->type = tc_ssh_get_byte(&r);
+
+	if (out->type == TC_SFTP_VERSION_MSG) {
+		/* VERSION carries a version where every other reply carries an id,
+		 * and then any number of extension pairs, which we read past rather
+		 * than refuse -- a server advertising posix-rename is not talking
+		 * nonsense, it is talking about something we do not need. */
+		out->version = tc_ssh_get_u32(&r);
+		return tc_ssh_rbuf_ok(&r) ? TC_OK : TC_ERR_INVAL;
+	}
+
+	out->id = tc_ssh_get_u32(&r);
+	if (!tc_ssh_rbuf_ok(&r))
+		return TC_ERR_INVAL;
+
+	switch (out->type) {
+	case TC_SFTP_STATUS:
+		out->status = tc_ssh_get_u32(&r);
+		/* The message and language follow, and version 3 servers in the wild
+		 * sometimes omit them. Reading them is best effort for that reason;
+		 * the code is the part that means anything. */
+		break;
+
+	case TC_SFTP_HANDLE: {
+		size_t n = 0;
+		/* Whatever length the server chose, up to a bound: insisting on our
+		 * own server's eight bytes is what broke this against every other
+		 * implementation. */
+		const uint8_t *h = tc_ssh_get_string(&r, TC_SFTP_MAX_HANDLE, &n);
+		if (h == NULL)
+			return TC_ERR_INVAL;
+		memcpy(out->handle, h, n);
+		out->handle_len = n;
+		out->has_handle = true;
+		break;
+	}
+
+	case TC_SFTP_ATTRS:
+		if (!read_attrs(&r, &out->attrs))
+			return TC_ERR_INVAL;
+		break;
+
+	case TC_SFTP_NAME:
+		out->count = tc_ssh_get_u32(&r);
+		if (!tc_ssh_rbuf_ok(&r))
+			return TC_ERR_INVAL;
+		/* Each entry costs at least three length prefixes, so a count that
+		 * could not fit in what is left is refused here rather than by a
+		 * loop that trusts it. */
+		if ((size_t)out->count * 12 > tc_ssh_rbuf_remaining(&r))
+			return TC_ERR_INVAL;
+		out->names = pkt + 4 + 1 + 4 + 4;
+		out->names_len = tc_ssh_rbuf_remaining(&r);
+		break;
+
+	case TC_SFTP_DATA: {
+		size_t n = 0;
+		const uint8_t *d = tc_ssh_get_string(&r, TC_SFTP_MAX_PACKET, &n);
+		if (d == NULL)
+			return TC_ERR_INVAL;
+		out->names = d; /* reused: DATA's payload */
+		out->names_len = n;
+		break;
+	}
+
+	default:
+		break;
+	}
+	return TC_OK;
+}
+
+void tc_sftp_name_begin(tc_sftp_name_iter *it, const tc_sftp_response *resp)
+{
+	if (it == NULL)
+		return;
+	memset(it, 0, sizeof *it);
+	if (resp == NULL || resp->type != TC_SFTP_NAME)
+		return;
+	tc_ssh_rbuf_init(&it->r, resp->names, resp->names_len);
+	it->remaining = resp->count;
+}
+
+bool tc_sftp_name_next(tc_sftp_name_iter *it, char *name, size_t name_cap,
+                       char *longname, size_t long_cap, tc_sftp_attrs *attrs)
+{
+	if (it == NULL || it->remaining == 0)
+		return false;
+	it->remaining--;
+	if (name != NULL && !tc_ssh_get_cstring(&it->r, name, name_cap))
+		return false;
+	if (name == NULL && tc_ssh_get_string(&it->r, SIZE_MAX, NULL) == NULL)
+		return false;
+	if (longname != NULL && !tc_ssh_get_cstring(&it->r, longname, long_cap))
+		return false;
+	if (longname == NULL && tc_ssh_get_string(&it->r, SIZE_MAX, NULL) == NULL)
+		return false;
+	tc_sftp_attrs tmp;
+	if (!read_attrs(&it->r, attrs != NULL ? attrs : &tmp))
+		return false;
+	return tc_ssh_rbuf_ok(&it->r);
+}
+
+bool tc_sftp_name_ok(const tc_sftp_name_iter *it)
+{
+	return it != NULL && tc_ssh_rbuf_ok(&it->r) && it->remaining == 0;
+}

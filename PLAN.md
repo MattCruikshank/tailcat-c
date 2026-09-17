@@ -703,7 +703,12 @@ out: upstream does not shell out to the system `sftp` binary, it links an SSH
 client and an SFTP client and drives them itself, which is where a good part
 of that ~20,000 lines of Go dependency goes.
 
-That leaves a choice for our `ls`, and it is a real one:
+**Decided: write the SFTP client** (`tc/sshclient.h` plus the client half of
+`tc/sftp.h`, 1,100 lines). `ls` now does what upstream does -- no `sftp`
+binary involved, output that matches, and nothing to be missing on Windows.
+`make live-ls` lists a directory served by a real Go tailcat.
+
+The alternatives, and why they lost:
 
 - **Exec the system `sftp`** (`sftp -b`). Consistent with how we already do
   `cp`, and needs no SFTP client at all. The cost is that the output is
@@ -824,7 +829,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.4 — SSH subset (transport, kex, auth, channels, server, rekey) | 2,648 | ✅ done |
 | 5.5 — SFTP server and the drop box | 944 | ✅ done |
 | — `recv` wired into the CLI | ~250 | ✅ done |
-| — `ls` (needs an SFTP *client*) | ~400 | ⏸ a choice, see 5.5 |
+| 5.5 — `ls`, with SSH and SFTP clients | 1,100 | ✅ done |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
@@ -864,11 +869,10 @@ discovery were not actually being made.
    qemu-user and is written and waiting on `qemu-user-static` being
    installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
    APE assimilation is needed. After that: qemu-system, then hardware.
-2. **Decide whether `ls` is worth an SFTP client.** It is the last of
-   upstream's command set missing, and 5.5 records the trade: exec the system
-   `sftp` and match neither upstream's output nor its lack of dependencies,
-   or write ~400 lines of client. The SSH transport it would need now
-   exists.
+2. **Upstream's other file modes**, if they are wanted: `:rw` and the
+   recursive write-only `:wo+`. The second trades away the drop box
+   guarantee by design and should be a separate mode with the trade stated,
+   not a relaxation of the flat one.
 3. **Bound `FIN_WAIT_2`** — see below; unchanged by any of the SSH work.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is

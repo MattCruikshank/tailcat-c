@@ -27,6 +27,7 @@
 #include "tc/addr.h"
 #include "tc/allowlist.h"
 #include "tc/dropbox.h"
+#include "tc/sshclient.h"
 #include "tc/crypto.h"
 #include "tc/derp.h"
 #include "tc/derpmap.h"
@@ -103,6 +104,8 @@ static void usage(FILE *f)
 	        "22,80,8000-8999 or all;\n"
 	        "                                          add exit-node to "
 	        "forward anywhere this machine can reach\n"
+	        "  tailcat-c ls [-l] <tc-addr>[:path]      list the files a "
+	        "server offers\n"
 	        "  tailcat-c recv <dir>                    receive files into "
 	        "<dir>; the sender picks\n"
 	        "                                          no names, overwrites "
@@ -1822,17 +1825,26 @@ static int recv_write(void *ctx, const uint8_t *buf, size_t len)
 	return TC_OK;
 }
 
+/* Only sftp. An exec would be a shell on the serving machine, which is the
+ * one thing a drop box must never become. Decided here rather than in
+ * recv_on_start because the refusal has to reach the client before anything
+ * else happens. */
+static bool recv_on_accept(void *ctx, tc_ssh_request_type type,
+                           const char *arg)
+{
+	(void)ctx;
+	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0)
+		return true;
+	vlogf("recv: refused a request for %s", arg);
+	return false;
+}
+
 static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
                          const char *arg)
 {
 	serve_state *st = (serve_state *)ctx;
-
-	/* Only sftp. An exec would be a shell on the serving machine, which is
-	 * the one thing a drop box must never become. */
-	if (type != TC_SSH_REQ_SUBSYSTEM || strcmp(arg, "sftp") != 0) {
-		vlogf("recv: refused a request for %s", arg);
-		return TC_ERR_UNSUPPORTED;
-	}
+	(void)type;
+	(void)arg;
 
 	tc_dropbox db;
 	int rc = tc_dropbox_open(&db, st->recv_dir);
@@ -1868,6 +1880,7 @@ static void run_recv_session(serve_state *st, serve_client *sc,
 	opts.read = recv_read;
 	opts.write = recv_write;
 	opts.io_ctx = &io;
+	opts.on_accept = recv_on_accept;
 	opts.on_start = recv_on_start;
 	opts.app_ctx = st;
 
@@ -2673,6 +2686,487 @@ static int client_up(tc_client *cl, const char *addr_str, bool insecure,
 fail:
 	client_down(cl);
 	return 1;
+}
+
+/* ---- `ls`: an SFTP listing over the tunnel ----------------------------- */
+
+/* Upstream's `ls` is the one file command it does not shell out for: it links
+ * an SSH client and an SFTP client and drives them in-process over its own
+ * tunnel. This matches that.
+ *
+ * The shape is the mirror of `recv`. The SSH client blocks, the bytes it
+ * waits for arrive through a loop, so its callbacks drive the loop. */
+
+typedef struct {
+	tc_client *cl;
+	tc_tcp_conn *conn;
+	uint64_t deadline;
+} ls_io;
+
+/* ls_pump_once services the tunnel for one turn. */
+static int ls_pump_once(tc_client *cl, uint64_t deadline)
+{
+	uint64_t t = now_ms();
+
+	if (cl->ctx.relay_stalled) {
+		cl->ctx.relay_stalled = false;
+		vlogf("a relay write stalled; rebuilding the connection");
+		if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+		                  cl->ping_len, deadline) != TC_OK)
+			return 1;
+	}
+
+	tc_wg_peer_tick(&cl->peer, t);
+	tc_tcp_mux_tick(cl->mux, t);
+	pump_service_udp(&cl->ctx, cl->mux);
+
+	if (!tc_derp_has_pending(&cl->derp)) {
+		struct pollfd pfd;
+		int dfd = tc_derp_fd(&cl->derp);
+		if (dfd >= 0) {
+			pfd.fd = dfd;
+			pfd.events = POLLIN;
+			pfd.revents = 0;
+			int wait_ms = 20;
+			uint64_t dl = tc_tcp_mux_next_deadline(cl->mux);
+			uint64_t wdl = tc_wg_peer_next_deadline(&cl->peer);
+			if (wdl < dl)
+				dl = wdl;
+			if (dl != UINT64_MAX) {
+				uint64_t nowv = now_ms();
+				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
+				if (wait_ms > 200)
+					wait_ms = 200;
+			}
+			(void)poll(&pfd, 1, wait_ms);
+		}
+	}
+
+	uint8_t src[32];
+	static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
+	size_t len = 0;
+	int rc = tc_derp_recv(&cl->derp, src, buf, sizeof buf, &len);
+	if (rc == TC_ERR_TIMEOUT) {
+		if (tc_derp_idle_ms(&cl->derp) > TC_DERP_DEAD_AFTER_MS &&
+		    relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+		                  cl->ping_len, deadline) != TC_OK)
+			return 1;
+		return 0;
+	}
+	if (rc == TC_ERR_CLOSED) {
+		if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
+		                  cl->ping_len, deadline) != TC_OK)
+			return 1;
+		return 0;
+	}
+	if (rc != TC_OK)
+		return 1;
+	if (len == 0 || memcmp(src, cl->ci.server_public, 32) != 0)
+		return 0;
+	if (pump_relay_disco(&cl->ctx, buf, len))
+		return 0;
+
+	static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
+	size_t inner_len = 0;
+	if (tc_wg_peer_input(&cl->peer, buf, len, inner, sizeof inner, &inner_len,
+	                     now_ms()) != TC_OK)
+		return 0;
+	if (inner_len != 0)
+		deliver_inner(cl->mux, cl->ctx.umux, inner, inner_len);
+	return 0;
+}
+
+/* The connection can be reaped by the pump, so a pointer held across it has
+ * to be re-found. Same hazard as bug 11. */
+static bool ls_conn_alive(const ls_io *io)
+{
+	for (size_t i = 0, n = tc_tcp_mux_count(io->cl->mux); i < n; i++)
+		if (tc_tcp_mux_at(io->cl->mux, i) == io->conn)
+			return true;
+	return false;
+}
+
+static int ls_read(void *ctx, uint8_t *buf, size_t cap, size_t *nread)
+{
+	ls_io *io = (ls_io *)ctx;
+	for (;;) {
+		if (!ls_conn_alive(io))
+			return TC_ERR_CLOSED;
+		size_t got = 0;
+		if (tc_tcp_read(io->conn, buf, cap, &got) == TC_OK && got > 0) {
+			*nread = got;
+			return TC_OK;
+		}
+		if (tc_tcp_read_closed(io->conn))
+			return TC_ERR_CLOSED;
+		if (now_ms() > io->deadline)
+			return TC_ERR_TIMEOUT;
+		if (ls_pump_once(io->cl, io->deadline) != 0)
+			return TC_ERR_CLOSED;
+	}
+}
+
+static int ls_write(void *ctx, const uint8_t *buf, size_t len)
+{
+	ls_io *io = (ls_io *)ctx;
+	size_t off = 0;
+	while (off < len) {
+		if (!ls_conn_alive(io))
+			return TC_ERR_CLOSED;
+		size_t wrote = 0;
+		int rc = tc_tcp_write(io->conn, buf + off, len - off, &wrote,
+		                      now_ms());
+		if (rc != TC_OK && rc != TC_ERR_AGAIN)
+			return rc;
+		off += wrote;
+		if (off == len)
+			break;
+		if (now_ms() > io->deadline)
+			return TC_ERR_TIMEOUT;
+		if (ls_pump_once(io->cl, io->deadline) != 0)
+			return TC_ERR_CLOSED;
+	}
+	return TC_OK;
+}
+
+/* ---- the listing itself ------------------------------------------------ */
+
+#define LS_MAX_ENTRIES 4096
+
+typedef struct {
+	char name[256];
+	uint64_t size;
+	uint32_t mode;
+	uint32_t mtime;
+	bool is_dir;
+} ls_entry;
+
+typedef struct {
+	tc_ssh_client *ssh;
+	const char *path;
+	bool long_form;
+	uint8_t buf[TC_SFTP_MAX_PACKET * 2];
+	size_t have;
+	uint32_t next_id;
+	int status; /* 0 on success */
+} ls_session;
+
+/* ls_exchange sends one SFTP packet and reads the reply that matches it.
+ *
+ * Requests are issued one at a time and answered before the next goes out, so
+ * the id check is a consistency assertion rather than a queue: a reply for a
+ * request we did not send means the stream has desynchronised, and continuing
+ * would attribute one file's attributes to another. */
+static int ls_exchange(ls_session *ls, const uint8_t *req, size_t req_len,
+                       uint32_t id, tc_sftp_response *out)
+{
+	int rc = tc_ssh_client_write(ls->ssh, req, req_len);
+	if (rc != TC_OK)
+		return rc;
+
+	for (;;) {
+		size_t total = 0;
+		int lr = tc_sftp_packet_len(ls->buf, ls->have, &total);
+		if (lr == TC_OK && ls->have >= total) {
+			rc = tc_sftp_parse_response(out, ls->buf, total);
+			/* The reply is consumed before it is judged, so a malformed one
+			 * does not leave the stream half-read. */
+			memmove(ls->buf, ls->buf + total, ls->have - total);
+			ls->have -= total;
+			if (rc != TC_OK)
+				return rc;
+			if (out->type != TC_SFTP_VERSION_MSG && out->id != id)
+				return TC_ERR_INVAL;
+			return TC_OK;
+		}
+		if (lr != TC_OK && lr != TC_ERR_AGAIN)
+			return lr;
+		if (ls->have == sizeof ls->buf)
+			return TC_ERR_TOOMANY;
+
+		size_t got = 0;
+		rc = tc_ssh_client_read(ls->ssh, ls->buf + ls->have,
+		                        sizeof ls->buf - ls->have, &got);
+		if (rc == TC_ERR_DONE || rc == TC_ERR_CLOSED)
+			return TC_ERR_CLOSED;
+		if (rc != TC_OK)
+			return rc;
+		ls->have += got;
+	}
+}
+
+static int ls_cmp(const void *a, const void *b)
+{
+	return strcmp(((const ls_entry *)a)->name, ((const ls_entry *)b)->name);
+}
+
+/* ls_mode_string renders permissions the way Go's fs.FileMode does, because
+ * that is what upstream prints and a listing people compare should agree. */
+static void ls_mode_string(char out[11], uint32_t mode, bool is_dir)
+{
+	static const char kRwx[] = "rwxrwxrwx";
+	out[0] = is_dir ? 'd' : ((mode & 0170000u) == 0120000u ? 'L' : '-');
+	for (int i = 0; i < 9; i++)
+		out[1 + i] = (mode & (1u << (8 - i))) ? kRwx[i] : '-';
+	/* setuid, setgid and sticky replace the execute bit they qualify, which
+	 * is what ls has always done and what Go reproduces. */
+	if (mode & 04000u)
+		out[3] = (mode & 0100u) ? 's' : 'S';
+	if (mode & 02000u)
+		out[6] = (mode & 0010u) ? 's' : 'S';
+	if (mode & 01000u)
+		out[9] = (mode & 0001u) ? 't' : 'T';
+	out[10] = '\0';
+}
+
+static void ls_print(const ls_entry *e, bool long_form)
+{
+	char name[300];
+	snprintf(name, sizeof name, "%s%s", e->name, e->is_dir ? "/" : "");
+	if (!long_form) {
+		printf("%s\n", name);
+		return;
+	}
+	char mode[11];
+	ls_mode_string(mode, e->mode, e->is_dir);
+
+	/* Upstream switches to a year once an entry is over 180 days old, which
+	 * is what every ls does and what keeps the column width stable. */
+	char when[32];
+	time_t mt = (time_t)e->mtime;
+	struct tm tmv;
+	size_t wrote = 0;
+	if (gmtime_r(&mt, &tmv) != NULL) {
+		/* Two literal calls rather than one with a chosen format: a variable
+		 * format string is a warning the compiler is right to make, and the
+		 * choice here is between exactly two constants. */
+		if (time(NULL) - mt > 180 * 24 * 3600)
+			wrote = strftime(when, sizeof when, "%b %e  %Y", &tmv);
+		else
+			wrote = strftime(when, sizeof when, "%b %e %H:%M", &tmv);
+	}
+	if (wrote == 0)
+		snprintf(when, sizeof when, "?");
+	printf("%s %12llu %s %s\n", mode, (unsigned long long)e->size, when,
+	       name);
+}
+
+static int ls_on_ready(void *ctx, tc_ssh_client *c)
+{
+	ls_session *ls = (ls_session *)ctx;
+	ls->ssh = c;
+	ls->status = 1;
+
+	uint8_t req[TC_SFTP_MAX_PACKET];
+	size_t req_len = 0;
+	tc_sftp_response resp;
+
+	int rc = tc_sftp_build_init(req, sizeof req, &req_len);
+	if (rc != TC_OK)
+		return rc;
+	rc = ls_exchange(ls, req, req_len, 0, &resp);
+	if (rc != TC_OK || resp.type != TC_SFTP_VERSION_MSG) {
+		fprintf(stderr, "tailcat-c: the server did not start SFTP\n");
+		return TC_ERR_INVAL;
+	}
+
+	/* Stat first, as upstream does: a path that is not a directory is
+	 * printed as itself rather than listed. */
+	uint32_t id = ++ls->next_id;
+	rc = tc_sftp_build_path_request(req, sizeof req, &req_len, TC_SFTP_STAT,
+	                                id, ls->path);
+	if (rc != TC_OK)
+		return rc;
+	rc = ls_exchange(ls, req, req_len, id, &resp);
+	if (rc != TC_OK)
+		return rc;
+	if (resp.type == TC_SFTP_STATUS) {
+		fprintf(stderr, "tailcat-c: %s: %s\n", ls->path,
+		        resp.status == TC_SFTP_FX_NO_SUCH_FILE ? "no such file"
+		        : resp.status == TC_SFTP_FX_PERMISSION_DENIED
+		            ? "permission denied"
+		            : "cannot stat");
+		return TC_ERR_INVAL;
+	}
+	if (resp.type != TC_SFTP_ATTRS)
+		return TC_ERR_INVAL;
+
+	bool is_dir = (resp.attrs.flags & TC_SFTP_ATTR_PERMISSIONS) &&
+	              (resp.attrs.permissions & 0170000u) == 0040000u;
+	if (!is_dir) {
+		ls_entry one;
+		memset(&one, 0, sizeof one);
+		const char *base = ls->path;
+		for (const char *q = ls->path; *q != '\0'; q++)
+			if (*q == '/')
+				base = q + 1;
+		snprintf(one.name, sizeof one.name, "%s", base);
+		one.size = resp.attrs.size;
+		one.mode = resp.attrs.permissions;
+		one.mtime = resp.attrs.mtime;
+		ls_print(&one, ls->long_form);
+		ls->status = 0;
+		return TC_OK;
+	}
+
+	id = ++ls->next_id;
+	rc = tc_sftp_build_path_request(req, sizeof req, &req_len,
+	                                TC_SFTP_OPENDIR, id, ls->path);
+	if (rc != TC_OK)
+		return rc;
+	rc = ls_exchange(ls, req, req_len, id, &resp);
+	if (rc != TC_OK)
+		return rc;
+	if (resp.type != TC_SFTP_HANDLE) {
+		fprintf(stderr, "tailcat-c: %s: cannot list\n", ls->path);
+		return TC_ERR_INVAL;
+	}
+	uint8_t handle[TC_SFTP_MAX_HANDLE];
+	size_t handle_len = resp.handle_len;
+	memcpy(handle, resp.handle, handle_len);
+
+	static ls_entry entries[LS_MAX_ENTRIES];
+	size_t count = 0;
+	bool truncated = false;
+
+	/* READDIR is answered in batches until the server says EOF; one call is
+	 * not a directory. */
+	for (;;) {
+		id = ++ls->next_id;
+		rc = tc_sftp_build_handle_request(req, sizeof req, &req_len,
+		                                  TC_SFTP_READDIR, id, handle,
+		                                  handle_len);
+		if (rc != TC_OK)
+			break;
+		rc = ls_exchange(ls, req, req_len, id, &resp);
+		if (rc != TC_OK)
+			break;
+		if (resp.type == TC_SFTP_STATUS) {
+			if (resp.status != TC_SFTP_FX_EOF)
+				rc = TC_ERR_INVAL;
+			break;
+		}
+	
+		if (resp.type != TC_SFTP_NAME) {
+			rc = TC_ERR_INVAL;
+			break;
+		}
+
+		tc_sftp_name_iter it;
+		tc_sftp_name_begin(&it, &resp);
+		char name[256], longname[512];
+		tc_sftp_attrs a;
+		while (tc_sftp_name_next(&it, name, sizeof name, longname,
+		                         sizeof longname, &a)) {
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+				continue;
+			if (count == LS_MAX_ENTRIES) {
+				truncated = true;
+				break;
+			}
+			ls_entry *e = &entries[count++];
+			memset(e, 0, sizeof *e);
+			snprintf(e->name, sizeof e->name, "%s", name);
+			e->size = a.size;
+			e->mode = a.permissions;
+			e->mtime = a.mtime;
+			e->is_dir = (a.flags & TC_SFTP_ATTR_PERMISSIONS) &&
+			            (a.permissions & 0170000u) == 0040000u;
+		}
+		/* A batch that ran out mid-entry is a short read, not an empty
+		 * directory, and listing it as complete would be a lie. */
+	
+		if (!tc_sftp_name_ok(&it) && !truncated) {
+			rc = TC_ERR_INVAL;
+			break;
+		}
+		if (truncated)
+			break;
+	}
+
+	uint32_t cid = ++ls->next_id;
+	if (tc_sftp_build_handle_request(req, sizeof req, &req_len, TC_SFTP_CLOSE,
+	                                 cid, handle, handle_len) == TC_OK)
+		(void)ls_exchange(ls, req, req_len, cid, &resp);
+
+	if (rc != TC_OK)
+		return rc;
+
+	qsort(entries, count, sizeof *entries, ls_cmp);
+	for (size_t i = 0; i < count; i++)
+		ls_print(&entries[i], ls->long_form);
+	if (truncated)
+		fprintf(stderr, "tailcat-c: listing truncated at %d entries\n",
+		        LS_MAX_ENTRIES);
+
+	ls->status = 0;
+	return TC_OK;
+}
+
+static int cmd_ls(const char *arg, bool long_form, bool insecure,
+                  unsigned timeout_s, const char *derpmap_url,
+                  const char *key_spec)
+{
+	/* `<addr>:path`, with the path defaulting to the served root. The colon
+	 * is found from the right because an address never contains one and a
+	 * path might. */
+	char addr[2048];
+	const char *path = ".";
+	const char *colon = strrchr(arg, ':');
+	if (colon != NULL && (size_t)(colon - arg) < sizeof addr) {
+		size_t n = (size_t)(colon - arg);
+		memcpy(addr, arg, n);
+		addr[n] = '\0';
+		if (colon[1] != '\0')
+			path = colon + 1;
+	} else {
+		snprintf(addr, sizeof addr, "%s", arg);
+	}
+
+	static tc_client cl;
+	uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000u;
+	if (client_up(&cl, addr, insecure, derpmap_url, key_spec, deadline) !=
+	    TC_OK)
+		return 1;
+
+	tc_tcp_conn *tcp = NULL;
+	if (tc_tcp_mux_connect(cl.mux, 22, now_ms(), &tcp) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not start the connection\n");
+		client_down(&cl);
+		return 1;
+	}
+
+	ls_io io;
+	io.cl = &cl;
+	io.conn = tcp;
+	io.deadline = deadline;
+
+	static ls_session ls;
+	memset(&ls, 0, sizeof ls);
+	ls.path = path;
+	ls.long_form = long_form;
+	ls.status = 1;
+
+	/* The user name is what a server that wants one will see; ours accepts
+	 * any key and upstream's accepts the `none` method, so neither looks. */
+	tc_ssh_client_opts opts;
+	memset(&opts, 0, sizeof opts);
+	opts.user = "tailcat";
+	opts.user_seed = NULL; /* `none` only, as upstream's ls offers */
+	opts.subsystem = "sftp";
+	opts.read = ls_read;
+	opts.write = ls_write;
+	opts.io_ctx = &io;
+	opts.on_ready = ls_on_ready;
+	opts.app_ctx = &ls;
+
+	int rc = tc_ssh_client_run(&opts);
+	if (rc != TC_OK && rc != TC_ERR_CLOSED && rc != TC_ERR_DONE &&
+	    ls.status != 0)
+		fprintf(stderr, "tailcat-c: ls: %s\n", tc_strerror(rc));
+
+	client_down(&cl);
+	return ls.status;
 }
 
 static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
@@ -4277,6 +4771,7 @@ int main(int argc, char **argv)
 	 * and honours only a --timeout the user actually asked for. Coercing 0
 	 * back to 60 would make "run until I stop it" impossible to express. */
 	bool timeout_given = false;
+	bool long_listing = false;
 	const char *relay = NULL;
 	/* NULL means the built-in default; --derpmap-url overrides, matching
 	 * upstream's flag of the same name. */
@@ -4360,6 +4855,12 @@ int main(int argc, char **argv)
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
 			timeout_s = (unsigned)strtoul(argv[++i], NULL, 10);
 			timeout_given = true;
+		} else if (strcmp(a, "-l") == 0) {
+			/* `ls -l`. Flags are parsed before the subcommand is known, so a
+			 * subcommand's own short flag has to be accepted here or it is
+			 * rejected as unknown before anything can claim it. Every other
+			 * subcommand ignores it. */
+			long_listing = true;
 		} else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
 			usage(stdout);
 			return 0;
@@ -4451,6 +4952,14 @@ int main(int argc, char **argv)
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
 		                 key_spec, full_address, exit_node, &allow, NULL);
+	}
+	if (strcmp(args[0], "ls") == 0) {
+		if (nargs != 2) {
+			fprintf(stderr, "tailcat-c: ls needs one address\n");
+			return 2;
+		}
+		return cmd_ls(args[1], long_listing, insecure,
+		              timeout_given ? timeout_s : 30, derpmap_url, key_spec);
 	}
 	if (strcmp(args[0], "recv") == 0) {
 		if (nargs < 2) {

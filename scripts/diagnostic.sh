@@ -186,6 +186,8 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: real OpenSSH against our SSH server" "make live-sshd"
 	stage "live: scp and sftp against the write-only drop box" "make live-dropbox"
 	stage "live: recv receiving a real scp over a real relay" "make live-recv-serve"
+	stage "live: our client and a real client against each other" "make live-sshloop"
+	stage "live: ls against a real Go file server" "make live-ls"
 	stage "live: ssh and scp with us as ProxyCommand" "make live-ssh"
 	stage "live: a file into a real tailcat recv drop box" "make live-recv"
 	stage "live: session across a rekey (slow, ~6m)" "make live-rekey"

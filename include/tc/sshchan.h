@@ -175,6 +175,24 @@ int tc_ssh_channel_exit_status_build(uint8_t *out, size_t cap, size_t *out_len,
                                      const tc_ssh_channel *ch,
                                      uint32_t status);
 
+/* ---- the client half --------------------------------------------------- */
+
+/* tc_ssh_channel_open_build asks for a session channel. */
+int tc_ssh_channel_open_build(uint8_t *out, size_t cap, size_t *out_len,
+                              const tc_ssh_channel *ch);
+
+/* tc_ssh_channel_confirm_parse reads the server's acceptance, taking its
+ * channel id, window and maximum packet size. */
+int tc_ssh_channel_confirm_parse(tc_ssh_channel *ch, const uint8_t *payload,
+                                 size_t len);
+
+/* tc_ssh_channel_subsystem_build asks for a subsystem, always with
+ * want_reply set: a client that did not ask for an answer could not tell a
+ * server that started sftp from one that ignored the request. */
+int tc_ssh_channel_subsystem_build(uint8_t *out, size_t cap, size_t *out_len,
+                                   const tc_ssh_channel *ch,
+                                   const char *name);
+
 /* tc_ssh_channel_id_matches reports whether a message names our channel.
  * Every channel message carries a recipient id and a server with one channel
  * must still check it: acting on a message for a channel that does not exist

@@ -341,3 +341,73 @@ int tc_ssh_channel_exit_status_build(uint8_t *out, size_t cap, size_t *out_len,
 		*out_len = tc_ssh_wbuf_len(&w);
 	return TC_OK;
 }
+
+/* ---- the client half --------------------------------------------------- */
+
+int tc_ssh_channel_open_build(uint8_t *out, size_t cap, size_t *out_len,
+                              const tc_ssh_channel *ch)
+{
+	if (out == NULL || ch == NULL)
+		return TC_ERR_INVAL;
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, out, cap);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_OPEN);
+	tc_ssh_put_cstring(&w, "session");
+	tc_ssh_put_u32(&w, ch->local_id);
+	tc_ssh_put_u32(&w, ch->local_window);
+	tc_ssh_put_u32(&w, TC_SSH_CHAN_MAX_PACKET);
+	if (!tc_ssh_wbuf_ok(&w))
+		return TC_ERR_NOSPACE;
+	if (out_len != NULL)
+		*out_len = tc_ssh_wbuf_len(&w);
+	return TC_OK;
+}
+
+int tc_ssh_channel_confirm_parse(tc_ssh_channel *ch, const uint8_t *payload,
+                                 size_t len)
+{
+	if (ch == NULL || payload == NULL)
+		return TC_ERR_INVAL;
+	tc_ssh_rbuf r;
+	tc_ssh_rbuf_init(&r, payload, len);
+	if (tc_ssh_get_byte(&r) != TC_SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+		return TC_ERR_INVAL;
+	/* The recipient id is ours; a confirmation for a channel we did not open
+	 * is a confused server and not something to adopt. */
+	if (tc_ssh_get_u32(&r) != ch->local_id)
+		return TC_ERR_INVAL;
+	uint32_t remote_id = tc_ssh_get_u32(&r);
+	uint32_t window = tc_ssh_get_u32(&r);
+	uint32_t max_packet = tc_ssh_get_u32(&r);
+	if (!tc_ssh_rbuf_ok(&r))
+		return TC_ERR_INVAL;
+	if (max_packet == 0)
+		return TC_ERR_INVAL;
+	if (max_packet > TC_SSH_MAX_PAYLOAD)
+		max_packet = TC_SSH_MAX_PAYLOAD;
+
+	ch->remote_id = remote_id;
+	ch->remote_window = window;
+	ch->remote_max_packet = max_packet;
+	ch->open = true;
+	return TC_OK;
+}
+
+int tc_ssh_channel_subsystem_build(uint8_t *out, size_t cap, size_t *out_len,
+                                   const tc_ssh_channel *ch, const char *name)
+{
+	if (out == NULL || ch == NULL || name == NULL)
+		return TC_ERR_INVAL;
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, out, cap);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_REQUEST);
+	tc_ssh_put_u32(&w, ch->remote_id);
+	tc_ssh_put_cstring(&w, "subsystem");
+	tc_ssh_put_bool(&w, true);
+	tc_ssh_put_cstring(&w, name);
+	if (!tc_ssh_wbuf_ok(&w))
+		return TC_ERR_NOSPACE;
+	if (out_len != NULL)
+		*out_len = tc_ssh_wbuf_len(&w);
+	return TC_OK;
+}

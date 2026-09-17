@@ -198,7 +198,8 @@ LIB_SRCS := \
 	src/ssh/channel.c \
 	src/ssh/server.c \
 	src/ssh/sftp.c \
-	src/ssh/dropbox.c
+	src/ssh/dropbox.c \
+	src/ssh/client.c
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o) $(MBEDTLS_OBJS)
 
@@ -207,7 +208,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-dropbox live-recv-serve diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -437,6 +438,15 @@ $(BUILD)/livesshd: tests/livesshd.c $(LIB_OBJS)
 
 # One real OpenSSH client against our server. The only check that can tell
 # whether the SSH subset speaks SSH rather than speaking to itself.
+$(BUILD)/livesshcli: tests/livesshcli.c $(LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests $< $(LIB_OBJS) $(LDFLAGS) -o $@
+
+# Our client against our server, over loopback. Needs no network; proves the
+# client half exists, not that it interoperates -- see live-ls for that.
+live-sshloop: $(BUILD)/livesshd $(BUILD)/livesshcli
+	BUILD=$(BUILD) sh scripts/live-sshloop.sh
+
 live-sshd: $(BUILD)/livesshd
 	BUILD=$(BUILD) sh scripts/live-sshd.sh
 
@@ -450,6 +460,11 @@ live-dropbox: $(BUILD)/livesshd
 # the SSH server's blocking reads drive the serve event loop.
 live-recv-serve: $(CLI)
 	BUILD=$(BUILD) sh scripts/live-recv-serve.sh
+
+# Our SSH and SFTP clients against a real Go tailcat file server. The
+# interoperability claim for the client half.
+live-ls: $(CLI)
+	BUILD=$(BUILD) sh scripts/live-ls.sh
 
 live-tailcat: $(BUILD)/livetailcat
 	LIVETC=$(BUILD)/livetailcat sh scripts/live-tailcat.sh

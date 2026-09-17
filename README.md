@@ -83,11 +83,11 @@ widening the connection key from a port pair to a four-tuple.
 
 **Still out of scope**, in descending order of how much it would take:
 
-- **`ls`**, which is the last of upstream's command set missing. It needs an
-  SFTP *client* rather than a server, and that is a choice rather than a
-  gap -- see PLAN.md 5.5. `serve ssh` as a general shell server is
-  deliberately not planned: `recv` serves sftp and nothing else, and a drop
-  box that can run commands is not a drop box.
+- **`serve ssh` as a general shell server**, deliberately. `recv` serves
+  sftp and nothing else, and a drop box that can run commands is not a drop
+  box. Upstream's read-write and recursive file modes (`:rw`, `:wo+`) are
+  not implemented either; PLAN.md 5.5 records what the recursive one trades
+  away.
 - The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
   this means a second toolchain and a second build of everything — arguably
   against the premise of a project whose whole point is one fat APE.
@@ -171,7 +171,7 @@ direct peer-to-peer paths.
 | `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, one server | ✅ (many servers) |
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
-| `ls` (SFTP remote listing) | ❌ | ✅ (in-process SFTP client) |
+| `ls` (SFTP remote listing) | ✅ (in-process SFTP client) | ✅ |
 | SSH *server* (`serve ssh`) | serves sftp for `recv`; no shell, no PTY | ✅ |
 | `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
@@ -283,6 +283,7 @@ $ tailcat-c parse <tc-address>             # describe an address
 $ tailcat-c netcheck                       # UDP, NAT type, relay latency
 $ tailcat-c serve exit-node,22             # forward anywhere this machine can reach
 $ tailcat-c forward <addr> 13306:192.168.1.10:3306
+$ tailcat-c ls <tc-addr>:photos           # list what a server offers
 $ tailcat-c recv ~/inbox                   # receive files; senders name nothing
 $ tailcat-c serve --allow nodekey:...      # only that client may connect
 $ tailcat-c socks <addr> 1080             # CONNECT and UDP ASSOCIATE
@@ -314,7 +315,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-35 test binaries, 9,717 assertions, under two toolchains. The method matters
+35 test binaries, 9,817 assertions, under two toolchains. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
 
@@ -329,6 +330,7 @@ something that is not ours.**
 | IPv6 formatting | our output fed back through `inet_pton` |
 | SSH | `golang.org/x/crypto/ssh` for the wire encodings and the cipher, and a **real OpenSSH 9.6 client** for the protocol itself |
 | the SFTP drop box | a real `scp` and `sftp` carrying out the attacks, with the check on the filesystem afterwards rather than on what the client printed |
+| the SSH and SFTP *clients* | a real Go tailcat file server, via `golang.org/x/crypto/ssh` and `github.com/pkg/sftp` |
 | everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
 
 Where a test passed on the first run, the response has generally been to
@@ -859,6 +861,35 @@ packet layer's vectors were produced by Go written from the same OpenSSH
 document as the C, so both sides could be -- and in this respect both were --
 wrong in the same way. Only a peer written from neither could tell.
 
+**26. Our SSH server replied to a channel request only after doing the
+work.** *(Phase 5.5, found by our own SSH client.)* `on_start` ran the entire
+application -- the whole SFTP session -- and the `CHANNEL_SUCCESS` for the
+request that started it went out afterwards. RFC 4254 section 4 has the
+requester wait for that reply before using the channel, so a client that
+waits deadlocks: ours sent the subsystem request and blocked, the server sat
+inside the application waiting for data that would never come.
+
+It had worked against every real client tried, because OpenSSH does not wait
+-- it sends optimistically. The bug was invisible until something that
+follows the specification more strictly connected, and the first thing that
+did was our own client on the day it was written. Fixed by splitting the
+decision from the work: `tc_ssh_accept_fn` answers, and only then does
+`tc_ssh_start_fn` run.
+
+**27. The SFTP client insisted on our own server's handle length.** *(Phase
+5.5, found by `make live-ls` against a real Go server.)* A file handle is
+opaque and entirely the server's to choose -- ours are eight bytes, Go's
+`pkg/sftp` uses its own, OpenSSH uses four. The client-side parser required
+exactly eight, so it interoperated with itself and nothing else. It got as
+far as a successful `stat` before failing on the first `opendir`, which is
+the most misleading place for it to stop: everything up to the point where a
+server-chosen value comes back works perfectly.
+
+Both of these are the same lesson in two directions. A protocol has two ends,
+and writing both from one reading gives two implementations that agree with
+each other. Bug 26 needed a stricter *client* than the one we had been
+testing with; bug 27 needed a server that was not ours.
+
 **25. `recv` refused every connection it existed to accept.** *(Found by
 the first run over a real tunnel.)* Connections are admitted by an accept
 filter that consults the served port set, and `recv` serves no local ports at
@@ -977,13 +1008,16 @@ Current, and deliberate unless noted.
   well. Serving SSH would mean implementing it; see
   [Vendoring an SSH server](#vendoring-an-ssh-server) for what that would
   take and which licence it would cost.
-- **No `ls`**, and it is not simply the same trick again. Upstream's `ls` is
-  the one file command it does *not* shell out for: it links
-  `golang.org/x/crypto/ssh` and `github.com/pkg/sftp` and drives them
-  in-process over its own tunnel. We could exec the system `sftp` instead
-  and match neither its output nor its lack of external dependencies, or
-  write an SFTP client — which needs an SSH client first. PLAN.md 5.5 has
-  the trade-off.
+- **`ls` is in-process, as upstream's is.** Upstream's `ls` is the one file
+  command it does *not* shell out for: it links `golang.org/x/crypto/ssh`
+  and `github.com/pkg/sftp` and drives them over its own tunnel. Ours does
+  the same with `tc/sshclient.h` and the client half of `tc/sftp.h`, so it
+  needs no `sftp` binary — which on Windows is not a given — and prints what
+  upstream prints. `make live-ls` checks it against a real Go file server.
+
+  What it does not do is read files: `ls` lists, and there is no `get`. A
+  read client is a different feature from a listing one, and `cp` already
+  covers fetching by execing scp.
 - **`ssh` turns off host key checking**, because the destination it gives ssh
   is a hash of the address rather than a host anyone holds a key for, and the
   address already authenticates the server: reaching it required the

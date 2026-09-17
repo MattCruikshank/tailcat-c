@@ -83,7 +83,11 @@ static int sock_write(void *ctx, const uint8_t *buf, size_t len)
 	int fd = *(int *)ctx;
 	size_t off = 0;
 	while (off < len) {
-		ssize_t n = write(fd, buf + off, len - off);
+		/* send with MSG_NOSIGNAL rather than write: a peer that has closed
+		 * would otherwise kill this process with SIGPIPE before the error
+		 * could be returned. Bug 15 is the same lesson, and the fix is the
+		 * same -- per call, not by changing the signal disposition. */
+		ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
 		if (n <= 0)
 			return TC_ERR_CLOSED;
 		off += (size_t)n;
@@ -120,11 +124,11 @@ static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 {
 	(void)ctx;
 
-	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0) {
-		if (g_dropbox_dir == NULL) {
-			fprintf(stderr, "livesshd: no drop box configured\n");
-			return TC_ERR_UNSUPPORTED;
-		}
+	/* Without a drop box the sftp subsystem falls through to the echo below,
+	 * which is what lets live-sshloop exercise the client's channel and data
+	 * paths without needing a file server at the other end. */
+	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0 &&
+	    g_dropbox_dir != NULL) {
 		int srv = serve_sftp(s);
 		if (srv != TC_OK)
 			fprintf(stderr, "livesshd: sftp failed: %s\n", tc_strerror(srv));

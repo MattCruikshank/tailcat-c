@@ -775,15 +775,18 @@ static int do_session(tc_ssh_server *s)
 		if (rc != TC_OK)
 			return rc;
 
+		/* Decide, answer, *then* work. RFC 4254 4 has the requester wait for
+		 * CHANNEL_SUCCESS before using the channel, so running the
+		 * application first and replying afterwards deadlocks against a
+		 * client that waits. */
 		bool accept = false;
 		if (req.type == TC_SSH_REQ_SUBSYSTEM || req.type == TC_SSH_REQ_EXEC) {
 			/* Refused rather than truncated. A name that does not fit is not
 			 * a name we serve, and shortening it would make "sftp" and
 			 * "sftp-and-more" the same request. */
 			accept = strlen(req.arg) < sizeof s->ch.subsystem &&
-			         s->opts->on_start != NULL &&
-			         s->opts->on_start(s->opts->app_ctx, s, req.type,
-			                           req.arg) == TC_OK;
+			         (s->opts->on_accept == NULL ||
+			          s->opts->on_accept(s->opts->app_ctx, req.type, req.arg));
 		}
 
 		if (req.want_reply) {
@@ -800,6 +803,12 @@ static int do_session(tc_ssh_server *s)
 
 		s->ch.started = true;
 		memcpy(s->ch.subsystem, req.arg, strlen(req.arg) + 1);
+		if (s->opts->on_start != NULL) {
+			int arc = s->opts->on_start(s->opts->app_ctx, s, req.type,
+			                            req.arg);
+			if (arc != TC_OK)
+				return arc;
+		}
 		return TC_OK;
 	}
 }

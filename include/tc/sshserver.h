@@ -45,12 +45,28 @@ typedef int (*tc_ssh_read_fn)(void *ctx, uint8_t *buf, size_t cap,
 /* Write all len bytes, blocking. */
 typedef int (*tc_ssh_write_fn)(void *ctx, const uint8_t *buf, size_t len);
 
-/* Called once the client has asked for a subsystem or an exec and been
- * authenticated. Returning TC_OK accepts the request; anything else refuses
- * it with CHANNEL_FAILURE.
+/* Decides whether a channel request will be served. Must answer immediately
+ * and must not read or write the channel.
  *
- * Inside the callback, tc_ssh_server_read and tc_ssh_server_write carry
- * channel data. Returning from it ends the session. */
+ * It is separate from tc_ssh_start_fn because the answer has to go out
+ * *before* the work begins. RFC 4254 4 has the requester wait for
+ * CHANNEL_SUCCESS before using the channel, so a server that runs the
+ * application first and replies afterwards deadlocks against any client that
+ * waits -- which OpenSSH does not, because it sends optimistically, and Go's
+ * client and ours both do. Getting this wrong is invisible until something
+ * other than OpenSSH connects. See bug 26.
+ *
+ * NULL accepts every subsystem and exec. */
+typedef bool (*tc_ssh_accept_fn)(void *ctx, tc_ssh_request_type type,
+                                 const char *arg);
+
+/* Called once the request has been accepted *and answered*. Inside it,
+ * tc_ssh_server_read and tc_ssh_server_write carry channel data; returning
+ * ends the session.
+ *
+ * Its return value cannot refuse the request -- that decision was made and
+ * sent by tc_ssh_accept_fn -- so an error here ends a session that was
+ * already agreed to, which is the only thing left to do. */
 typedef int (*tc_ssh_start_fn)(void *ctx, tc_ssh_server *s,
                                tc_ssh_request_type type, const char *arg);
 
@@ -86,6 +102,7 @@ typedef struct {
 	tc_ssh_write_fn write;
 	void *io_ctx;
 
+	tc_ssh_accept_fn on_accept;
 	tc_ssh_start_fn on_start;
 	void *app_ctx;
 } tc_ssh_server_opts;

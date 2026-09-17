@@ -24,6 +24,7 @@
 #ifndef TC_SFTP_H_
 #define TC_SFTP_H_
 
+#include "tc/sshwire.h"
 #include "tc/tc.h"
 
 /* The version we speak. */
@@ -89,6 +90,15 @@
 #define TC_SFTP_MAX_PATH 1024
 #define TC_SFTP_HANDLE_LEN 8
 
+/* The longest handle a *server* may hand us.
+ *
+ * A handle is opaque and entirely the server's to choose: ours are eight
+ * bytes, Go's pkg/sftp uses its own, OpenSSH uses four. A client that insisted
+ * on its own server's length would work against itself and nothing else --
+ * which is exactly what happened, and it got as far as a successful stat
+ * before failing on the first opendir. */
+#define TC_SFTP_MAX_HANDLE 256
+
 /* File attributes, as much of them as version 3 has. */
 typedef struct {
 	uint32_t flags;
@@ -152,5 +162,64 @@ int tc_sftp_build_attrs(uint8_t *out, size_t cap, size_t *out_len,
 int tc_sftp_build_name(uint8_t *out, size_t cap, size_t *out_len, uint32_t id,
                        const char *filename, const char *longname,
                        const tc_sftp_attrs *attrs);
+
+/* ---- the client half --------------------------------------------------- */
+
+/* tc_sftp_build_init writes the client's opening packet. */
+int tc_sftp_build_init(uint8_t *out, size_t cap, size_t *out_len);
+
+/* tc_sftp_build_path_request writes a request whose only argument is a path:
+ * REALPATH, STAT, LSTAT, OPENDIR, REMOVE, RMDIR. */
+int tc_sftp_build_path_request(uint8_t *out, size_t cap, size_t *out_len,
+                               uint8_t type, uint32_t id, const char *path);
+
+/* tc_sftp_build_handle_request writes one whose only argument is a handle:
+ * READDIR, CLOSE, FSTAT. The handle is echoed back exactly as the server gave
+ * it, whatever length that was. */
+int tc_sftp_build_handle_request(uint8_t *out, size_t cap, size_t *out_len,
+                                 uint8_t type, uint32_t id,
+                                 const uint8_t *handle, size_t handle_len);
+
+/* What a server sent back. */
+typedef struct {
+	uint8_t type;
+	uint32_t id;
+	uint32_t version; /* VERSION */
+	uint32_t status;  /* STATUS */
+	uint8_t handle[TC_SFTP_MAX_HANDLE];
+	size_t handle_len;
+	bool has_handle;
+	tc_sftp_attrs attrs; /* ATTRS */
+	/* NAME: read with the iterator below rather than copied here, because a
+	 * READDIR reply holds as many entries as the server felt like sending
+	 * and a fixed array would have to either truncate or refuse them. */
+	uint32_t count;
+	const uint8_t *names; /* into the caller's buffer */
+	size_t names_len;
+} tc_sftp_response;
+
+int tc_sftp_parse_response(tc_sftp_response *out, const uint8_t *pkt,
+                           size_t len);
+
+/* Walks the entries of a NAME response. */
+typedef struct {
+	tc_ssh_rbuf r;
+	uint32_t remaining;
+} tc_sftp_name_iter;
+
+void tc_sftp_name_begin(tc_sftp_name_iter *it, const tc_sftp_response *resp);
+
+/* tc_sftp_name_next reads one entry. `longname` is version 3's
+ * human-readable line -- the one an `ls -l` would print -- and is the only
+ * place a version 3 server reports a file's type and mode, because the ATTRS
+ * that follow carry permissions only if the server chose to set that flag.
+ *
+ * Returns false at the end, and also on a malformed entry: a caller that
+ * cannot tell those apart would list a truncated directory as a complete
+ * one, so check tc_sftp_name_ok when it stops. */
+bool tc_sftp_name_next(tc_sftp_name_iter *it, char *name, size_t name_cap,
+                       char *longname, size_t long_cap, tc_sftp_attrs *attrs);
+
+bool tc_sftp_name_ok(const tc_sftp_name_iter *it);
 
 #endif /* TC_SFTP_H_ */

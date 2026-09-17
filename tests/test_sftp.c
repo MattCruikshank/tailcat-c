@@ -275,6 +275,223 @@ static void test_builders(void)
 	TCT_TRUE((flags & TC_SFTP_ATTR_SIZE) != 0);
 }
 
+/* ---- the client half --------------------------------------------------- */
+
+/* patch_len backfills the length prefix of a hand-built packet. */
+static void patch_len(uint8_t *pkt, size_t len)
+{
+	uint32_t body = (uint32_t)(len - 4);
+	pkt[0] = (uint8_t)(body >> 24);
+	pkt[1] = (uint8_t)(body >> 16);
+	pkt[2] = (uint8_t)(body >> 8);
+	pkt[3] = (uint8_t)body;
+}
+
+static void test_handles_are_the_servers_to_choose(void)
+{
+	/* A handle is opaque and entirely the server's: ours are eight bytes,
+	 * Go's pkg/sftp uses its own, OpenSSH uses four. A client that insisted
+	 * on its own server's length would work against itself and nothing
+	 * else -- which is what it did, and it got as far as a successful stat
+	 * before failing on the first opendir against a real Go server.
+	 */
+	TCT_CASE("a handle of any length is accepted");
+	static const size_t lens[] = { 1, 3, 4, 8, 17, 64, 255, TC_SFTP_MAX_HANDLE };
+	for (size_t i = 0; i < sizeof lens / sizeof *lens; i++) {
+		uint8_t pkt[BUFSZ];
+		tc_ssh_wbuf w;
+		tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+		tc_ssh_put_u32(&w, 0);
+		tc_ssh_put_byte(&w, TC_SFTP_HANDLE);
+		tc_ssh_put_u32(&w, 77);
+		uint8_t h[TC_SFTP_MAX_HANDLE];
+		for (size_t j = 0; j < lens[i]; j++)
+			h[j] = (uint8_t)(j + 1);
+		tc_ssh_put_string(&w, h, lens[i]);
+		TCT_TRUE(tc_ssh_wbuf_ok(&w));
+		size_t len = tc_ssh_wbuf_len(&w);
+		patch_len(pkt, len);
+
+		tc_sftp_response resp;
+		if (tc_sftp_parse_response(&resp, pkt, len) != TC_OK) {
+			TCT_FAILF("a %zu-byte handle was refused", lens[i]);
+			continue;
+		}
+		tct_checks++;
+		TCT_EQ_INT((int)resp.handle_len, (int)lens[i]);
+		TCT_EQ_MEM(resp.handle, h, lens[i]);
+
+		TCT_CASE("and is echoed back exactly");
+		uint8_t req[BUFSZ];
+		size_t req_len = 0;
+		TCT_EQ_INT(tc_sftp_build_handle_request(req, sizeof req, &req_len,
+		                                        TC_SFTP_READDIR, 78,
+		                                        resp.handle, resp.handle_len),
+		           TC_OK);
+		tc_ssh_rbuf r;
+		tc_ssh_rbuf_init(&r, req + 4, req_len - 4);
+		TCT_EQ_INT(tc_ssh_get_byte(&r), TC_SFTP_READDIR);
+		TCT_EQ_INT((int)tc_ssh_get_u32(&r), 78);
+		size_t got = 0;
+		const uint8_t *back = tc_ssh_get_string(&r, TC_SFTP_MAX_HANDLE, &got);
+		TCT_TRUE(back != NULL && got == lens[i]);
+		TCT_EQ_MEM(back, h, lens[i]);
+	}
+
+	TCT_CASE("but an absurd one is still refused");
+	uint8_t pkt[BUFSZ];
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_HANDLE);
+	tc_ssh_put_u32(&w, 1);
+	uint8_t big[TC_SFTP_MAX_HANDLE + 1];
+	memset(big, 7, sizeof big);
+	tc_ssh_put_string(&w, big, sizeof big);
+	size_t len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+	tc_sftp_response resp;
+	TCT_TRUE(tc_sftp_parse_response(&resp, pkt, len) != TC_OK);
+}
+
+static void test_name_listings(void)
+{
+	TCT_CASE("a multi-entry NAME response is walked to the end");
+	/* READDIR is answered in batches, so a client that read one entry and
+	 * stopped would list a directory as having one file in it. */
+	uint8_t pkt[BUFSZ];
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_NAME);
+	tc_ssh_put_u32(&w, 5);
+	tc_ssh_put_u32(&w, 3);
+	static const char *const names[] = { "alpha.txt", "bravo.bin", "sub" };
+	for (int i = 0; i < 3; i++) {
+		tc_ssh_put_cstring(&w, names[i]);
+		tc_ssh_put_cstring(&w, "-rw-r--r-- 1 0 0 6 Jan 1 00:00 x");
+		tc_ssh_put_u32(&w, TC_SFTP_ATTR_SIZE | TC_SFTP_ATTR_PERMISSIONS);
+		tc_ssh_put_u64(&w, (uint64_t)(100 + i));
+		tc_ssh_put_u32(&w, i == 2 ? 040755u : 0100644u);
+	}
+	TCT_TRUE(tc_ssh_wbuf_ok(&w));
+	size_t len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+
+	tc_sftp_response resp;
+	TCT_EQ_INT(tc_sftp_parse_response(&resp, pkt, len), TC_OK);
+	TCT_EQ_INT(resp.type, TC_SFTP_NAME);
+	TCT_EQ_INT((int)resp.count, 3);
+
+	tc_sftp_name_iter it;
+	tc_sftp_name_begin(&it, &resp);
+	char name[256], longname[512];
+	tc_sftp_attrs a;
+	int seen = 0;
+	while (tc_sftp_name_next(&it, name, sizeof name, longname,
+	                         sizeof longname, &a)) {
+		TCT_EQ_STR(name, names[seen]);
+		TCT_TRUE(a.size == (uint64_t)(100 + seen));
+		seen++;
+	}
+	TCT_EQ_INT(seen, 3);
+	TCT_CASE("and the iterator reports that it finished cleanly");
+	/* A batch that ran out mid-entry is a short read, not an empty
+	 * directory, and a caller that could not tell them apart would print a
+	 * truncated listing as a complete one. */
+	TCT_TRUE(tc_sftp_name_ok(&it));
+
+	TCT_CASE("a count larger than the entries present is refused");
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_NAME);
+	tc_ssh_put_u32(&w, 5);
+	tc_ssh_put_u32(&w, 0x1000000u); /* entries that are not there */
+	tc_ssh_put_cstring(&w, "only.txt");
+	len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+	TCT_TRUE(tc_sftp_parse_response(&resp, pkt, len) != TC_OK);
+
+	TCT_CASE("and one truncated mid-entry is reported, not silently short");
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_NAME);
+	tc_ssh_put_u32(&w, 5);
+	tc_ssh_put_u32(&w, 2);
+	tc_ssh_put_cstring(&w, "first.txt");
+	tc_ssh_put_cstring(&w, "longname");
+	tc_ssh_put_u32(&w, 0); /* no attribute flags */
+	tc_ssh_put_cstring(&w, "second.txt"); /* and then it stops */
+	len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+	TCT_EQ_INT(tc_sftp_parse_response(&resp, pkt, len), TC_OK);
+	tc_sftp_name_begin(&it, &resp);
+	seen = 0;
+	while (tc_sftp_name_next(&it, name, sizeof name, longname,
+	                         sizeof longname, &a))
+		seen++;
+	TCT_EQ_INT(seen, 1);
+	TCT_TRUE(!tc_sftp_name_ok(&it));
+}
+
+static void test_client_responses(void)
+{
+	uint8_t pkt[BUFSZ];
+	tc_ssh_wbuf w;
+	tc_sftp_response resp;
+
+	TCT_CASE("a VERSION with extensions still parses");
+	/* Servers advertise posix-rename and the statvfs pair. We use none of
+	 * them, and refusing a server for offering them would be absurd. */
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_VERSION_MSG);
+	tc_ssh_put_u32(&w, 3);
+	tc_ssh_put_cstring(&w, "posix-rename@openssh.com");
+	tc_ssh_put_cstring(&w, "1");
+	size_t len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+	TCT_EQ_INT(tc_sftp_parse_response(&resp, pkt, len), TC_OK);
+	TCT_EQ_INT(resp.type, TC_SFTP_VERSION_MSG);
+	TCT_EQ_INT((int)resp.version, 3);
+
+	TCT_CASE("a STATUS carries its code");
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_STATUS);
+	tc_ssh_put_u32(&w, 9);
+	tc_ssh_put_u32(&w, TC_SFTP_FX_EOF);
+	len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+	TCT_EQ_INT(tc_sftp_parse_response(&resp, pkt, len), TC_OK);
+	TCT_EQ_INT((int)resp.status, TC_SFTP_FX_EOF);
+	TCT_EQ_INT((int)resp.id, 9);
+
+	TCT_CASE("a STATUS with no message is accepted");
+	/* Version 3 servers in the wild omit the message and language, and a
+	 * client that required them would reject a legitimate EOF. */
+	TCT_EQ_INT(resp.type, TC_SFTP_STATUS);
+
+	TCT_CASE("every response is refused at every truncation");
+	tc_ssh_wbuf_init(&w, pkt, sizeof pkt);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_byte(&w, TC_SFTP_ATTRS);
+	tc_ssh_put_u32(&w, 3);
+	tc_ssh_put_u32(&w, TC_SFTP_ATTR_SIZE | TC_SFTP_ATTR_ACMODTIME);
+	tc_ssh_put_u64(&w, 4096);
+	tc_ssh_put_u32(&w, 111);
+	tc_ssh_put_u32(&w, 222);
+	len = tc_ssh_wbuf_len(&w);
+	patch_len(pkt, len);
+	TCT_EQ_INT(tc_sftp_parse_response(&resp, pkt, len), TC_OK);
+	TCT_TRUE(resp.attrs.size == 4096);
+	TCT_EQ_INT((int)resp.attrs.mtime, 222);
+	for (size_t cut = 0; cut < len; cut++)
+		if (tc_sftp_parse_response(&resp, pkt, cut) == TC_OK)
+			TCT_FAILF("an ATTRS truncated to %zu bytes parsed", cut);
+	tct_checks++;
+}
+
 int main(void)
 {
 	test_framing();
@@ -283,5 +500,8 @@ int main(void)
 	test_attrs_extended();
 	test_unknown_requests_keep_their_id();
 	test_builders();
+	test_handles_are_the_servers_to_choose();
+	test_name_listings();
+	test_client_responses();
 	return tct_report("sftp");
 }
