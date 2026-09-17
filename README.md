@@ -105,6 +105,33 @@ widening the connection key from a port pair to a four-tuple.
 `forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes, saved
 identities, `browse` and `readme` are all here.
 
+**Smaller things that are simply absent**, none of them hard, all of them
+found by typing upstream's README at this binary rather than by reading our
+own feature list:
+
+- **Addresses published as DNS TXT records.** `tailcat ssh example.com`
+  looks up a `tailcat=tc…` record. Ours says `bad address: malformed
+  input`, which is true and unhelpful. It needs a resolver, and with it
+  upstream's safety check -- probing a DNS-named server as a stranger would
+  and refusing if that login succeeds -- because publishing an address makes
+  it public and the server must then authenticate clients itself.
+- **`socks` recognising a tailcat address as a URL hostname**, which is what
+  makes the address argument optional there.
+- **`socks <addr> <cmd>`** without the `--`. Ours requires the separator and
+  reports `"curl" is not a port number`, which is a confusing way to say
+  "there is a `--` missing".
+- **`ping --until-direct`**, which keeps pinging until a direct path works
+  and exits non-zero if none does. Everything it needs is here; it is a loop
+  and an exit code.
+- **`genkey --fixed-region`** and **`genkey --region=<relay-hostname>`**.
+  `--relay` pins a relay for `serve`, so what is missing is baking the choice
+  into a *saved key* -- which is what makes a published address keep working
+  across restarts.
+- **Reaching a third address from the pipe form or `ssh -p ip:port`.**
+  `forward` does this and `serve exit-node` is implemented, so this is
+  plumbing an existing path into two more commands. Until then both refuse
+  it by name; see bug 34 for what they did before.
+
 Every instruction in upstream's README has been typed at our binary and the
 result written down: [doc/upstream-readme.md](doc/upstream-readme.md). It is
 a sharper question than the feature table asks, and it found three bugs that
@@ -178,9 +205,9 @@ direct peer-to-peer paths.
 | **Commands** | | |
 | pipe stdin/stdout to a server | ✅ | ✅ |
 | `serve` | ports, ranges, `all`; many clients | full |
-| `parse` | ✅ | ✅ (JSON) |
+| `parse` | ✅ (byte-identical JSON) | ✅ |
 | `version` | ✅ | ✅ |
-| `ping` | ✅ | ✅ |
+| `ping` | ✅ | ✅ (`--until-direct`) |
 | `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
 | `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, one server | ✅ (many servers) |
@@ -193,6 +220,18 @@ direct peer-to-peer paths.
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
 | `readme` | ✅ (embeds doc/usage.md, not this file) | ✅ (embeds README.md) |
 | `browse`, `forward --open-browser` | ✅ | ✅ |
+| `--flag=value` as well as `--flag value` | ✅ | ✅ |
+| `--timeout` as a duration (`2m`, `1h30m`) | ✅ | ✅ |
+| **Not here** | | |
+| addresses in DNS TXT records | ❌ | ✅ (`tailcat ssh example.com`) |
+| `socks` with the address omitted | ❌ | ✅ (tc-addr as a URL hostname) |
+| `socks <addr> <cmd>` without `--` | ❌ (needs `--`) | ✅ |
+| `ping --until-direct` | ❌ | ✅ |
+| `genkey --fixed-region` | ❌ (`--relay` pins one for `serve`) | ✅ |
+| `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
+| reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
+| `serve` services: `ssh`, `no-auth-ssh`, `exec`, `files` | ❌ | ✅ |
+| bare `tailcat` starts a server | ❌ (prints usage) | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
@@ -1107,6 +1146,30 @@ because the lesson is about the test, not the arithmetic: the case was in the
 file because "a sum that overflows only when added" is a thing to check, not
 because anyone suspected that line.
 
+
+**34. A port argument was read as far as it parsed and no further.**
+*(Phase 6, found while writing down the gaps rather than while testing.)*
+`tailcat-c <addr> 10.0.0.1:22` connected to **port 10** of the server and
+said nothing. `strtoul` with no endptr check stops at the first dot and
+keeps the prefix, which is bug 33's defect in a second place nobody had
+thought to look.
+
+It matters because that string is not a typo: upstream documents
+`tailcat ssh -p 10.0.0.1:22 <tc-addr>` for reaching a third address through
+an exit node, and `-p` is handed straight to the pipe form. So following
+upstream's own documentation produced a connection to the wrong port of the
+right machine.
+
+Ports now have to be the whole argument. The host:port form gets its own
+message naming the command that does work, because "bad port" would have
+been true and useless -- the user typed something valid, at the wrong
+program.
+
+Three bugs of one kind now: 33, 34, and the `-l` half of 32 are all a parser
+accepting a prefix and discarding the rest. The lesson is not about
+`strtoul`. It is that **every one of them still ran**, and the only visible
+difference between right and wrong was a number nobody had a reason to
+check.
 
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs

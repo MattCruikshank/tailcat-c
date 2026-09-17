@@ -904,6 +904,49 @@ pings us in 5.61ms over a direct path. The rule that saved it is the same one
 bugs 7 and 8 taught: when an interop test fails, suspect the scaffolding
 first.
 
+### 6.2 What the walk showed is missing ⏸ · not started
+
+None of these is hard. They are listed because the walk is the only thing
+that found them: each is a feature the table called done, or did not mention
+at all, and a user following upstream's documentation meets them immediately.
+In rough order of what they cost:
+
+1. **`socks <addr> <cmd>` without `--`.** Ours requires the separator and
+   says `"curl" is not a port number`, which is a confusing way to report a
+   missing `--`. The fix is to notice that the argument after the address is
+   not a port and treat the rest as a command -- or, at minimum, to say so.
+2. **`ping --until-direct`.** Keep pinging until a direct path answers, up to
+   `--timeout`, and exit non-zero if none does. Path discovery already
+   reports which path a reply arrived on, so this is a loop and an exit code.
+3. **Reaching a third address from the pipe form and `ssh -p ip:port`.**
+   `forward` parses `local:ip:port` and `serve exit-node` serves it, so both
+   ends exist; what is missing is accepting the syntax in two more places and
+   routing through `tc_nat64_wrap` as `forward` does. Both refuse it by name
+   today rather than connecting somewhere else -- see bug 34 for why that
+   sentence had to be written.
+4. **`genkey --fixed-region` and `genkey --region=<relay-hostname>`.**
+   `--relay` already pins a relay for one `serve`. What is missing is baking
+   the choice into a *saved key*, which is what lets a published address
+   survive a restart. The key file format would gain a field.
+5. **`socks` recognising a tailcat address as a URL hostname**, which is what
+   makes its address argument optional. Our SOCKS server already ignores the
+   requested hostname except for `server.tailcat`; this means parsing it as
+   an address instead and dialling it.
+6. **Addresses in DNS TXT records.** The largest of these, and the only one
+   that adds a dependency: a resolver, and with it upstream's safety check,
+   which probes a DNS-named server as a stranger would and refuses to connect
+   if that login succeeds. Publishing an address makes it public, so the
+   server has to authenticate clients by something other than knowing it --
+   which is exactly what `--allow` is for, and that is already here. Without
+   the check, this feature would quietly encourage the mistake it exists to
+   prevent, so the two land together or not at all.
+
+Not on this list, and deliberately: the `ssh`, `no-auth-ssh`, `exec` and
+`files` services (5.4 and 5.5 say why), and bare `tailcat` starting a server,
+which is a one-line change this project declines because printing usage for
+a bare invocation is better behaviour and the explicit `serve` is right
+there.
+
 ---
 
 ## Cross-cutting
@@ -970,6 +1013,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.9 — `readme` and `doc/usage.md` | ~175 | ✅ done |
 | 5.10 — `browse` and `--open-browser` | ~700 | ✅ done |
 | 6.1 — walking upstream’s README | ~450 | ✅ done |
+| 6.2 — the gaps it found | ? | ⏸ not started |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 
 The estimates held up better than expected in aggregate and badly in

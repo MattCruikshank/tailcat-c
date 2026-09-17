@@ -4912,6 +4912,46 @@ out:
 
 /* ---- entry ------------------------------------------------------------ */
 
+/* port_arg reads a port argument, and reports rather than guesses.
+ *
+ * It replaced a bare strtoul with no endptr check, which stopped at the
+ * first character it did not understand and kept the prefix: upstream
+ * documents `tailcat ssh -p 10.0.0.1:22 <tc-addr>` for reaching a third
+ * address through an exit node, and that reached *port 10 of the server*
+ * here, connected, and said nothing. A refusal is a worse user experience
+ * than the feature and a much better one than the wrong connection.
+ *
+ * The host:port form gets its own message, because "bad port" would be true
+ * and useless: the user typed something upstream accepts, and what they need
+ * to know is which command does it here. */
+static bool port_arg(const char *s, uint16_t *out)
+{
+	char *end = NULL;
+
+	if (s == NULL || *s == '\0') {
+		fprintf(stderr, "tailcat-c: missing port\n");
+		return false;
+	}
+	unsigned long p = strtoul(s, &end, 10);
+	if (end != s && *end == '\0' && p >= 1 && p <= 65535) {
+		*out = (uint16_t)p;
+		return true;
+	}
+	if (strchr(s, ':') != NULL) {
+		fprintf(stderr,
+		        "tailcat-c: \"%s\" is a host and port, which this form "
+		        "cannot reach.\n"
+		        "  Going through a server to a third address needs it "
+		        "running as an exit node,\n"
+		        "  and the forward command: tailcat-c forward <tc-addr> "
+		        "<local-port>:%s\n",
+		        s, s);
+		return false;
+	}
+	fprintf(stderr, "tailcat-c: bad port %s\n", s);
+	return false;
+}
+
 int main(int argc, char **argv)
 {
 	bool insecure = false;
@@ -5310,6 +5350,11 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: ssh needs an address\n");
 			return 2;
 		}
+		/* Checked here rather than left to the ProxyCommand, where the same
+		 * complaint would arrive buried in ssh's own output. */
+		uint16_t probe;
+		if (!port_arg(ssh_port, &probe))
+			return 2;
 		return cmd_ssh_or_cp(false, argv[0], &args[1], nargs - 1, ssh_port,
 		                     insecure, derpmap_url);
 	}
@@ -5319,6 +5364,9 @@ int main(int argc, char **argv)
 			                "destination\n");
 			return 2;
 		}
+		uint16_t probe;
+		if (!port_arg(ssh_port, &probe))
+			return 2;
 		return cmd_ssh_or_cp(true, argv[0], &args[1], nargs - 1, ssh_port,
 		                     insecure, derpmap_url);
 	}
@@ -5331,14 +5379,8 @@ int main(int argc, char **argv)
 	}
 
 	uint16_t port = 1;
-	if (nargs >= 2) {
-		unsigned long p = strtoul(args[1], NULL, 10);
-		if (p == 0 || p > 65535) {
-			fprintf(stderr, "tailcat-c: bad port %s\n", args[1]);
-			return 2;
-		}
-		port = (uint16_t)p;
-	}
+	if (nargs >= 2 && !port_arg(args[1], &port))
+		return 2;
 	return cmd_pipe(args[0], port, insecure, timeout_s, derpmap_url,
 	                key_spec);
 }

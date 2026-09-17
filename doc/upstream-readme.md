@@ -186,6 +186,35 @@ operating systems and they do not agree about what a terminal does with the
 rest of Unicode.
 
 
+## What is missing, in one place
+
+Scattered through the tables above; collected here because "what does this
+not do" is a question worth being able to answer without reading a
+walkthrough. PLAN.md 6.2 has what each would cost.
+
+| Missing | Upstream spelling | Nearest thing here |
+|---|---|---|
+| addresses in DNS TXT records | `tailcat ssh example.com` | paste the address |
+| the DNS safety probe | `--skip-dns-safety-check` | nothing to guard yet |
+| tc-addr as a URL hostname | `socks curl http://<tc-addr>:8081/` | `socks <addr> -- curl …` |
+| a command without `--` | `socks <addr> curl …` | `socks <addr> -- curl …` |
+| ping until a direct path | `ping --until-direct <addr>` | `ping`, read the path it reports |
+| a relay baked into a saved key | `genkey --fixed-region`, `genkey --region=host` | `serve --relay host` |
+| a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
+| shell, forced command, file server | `serve ssh`, `no-auth-ssh`, `exec`, `files` | `recv`, `ls` |
+| server on a bare invocation | `tailcat` | `tailcat-c serve` |
+
+The four `serve` services are refusals rather than omissions — PLAN 5.4 and
+5.5 record the reasoning, and it is mostly that a drop box which can run
+commands is not a drop box. Everything else on this list is simply not
+written yet, and none of it is large.
+
+One thing the walk changed rather than recorded: `-p 10.0.0.1:22` and the
+pipe form's port argument used to accept that string and connect to port
+10. They now refuse it and name `forward`, which is the command that does
+work. A documented gap is fine; a silent wrong connection is not.
+
+
 ## Reproducing this
 
 There is no script. The walk was done by hand because the judgement — "works",
