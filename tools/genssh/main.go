@@ -19,6 +19,7 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -287,6 +288,90 @@ typedef struct {
 		pkt := opensshPacket(keyMat, seq, payload, pad)
 		fmt.Fprintf(&sb, "\t{ \"%s\", %d, \"%s\", \"%s\" },\n",
 			hexs(keyMat), seq, hexs(payload), hexs(pkt))
+	}
+	sb.WriteString("};\n\n")
+
+	// ---- exchange hash and key derivation ----------------------------
+	//
+	// H is built from the field encodings ssh.Marshal produces, composed per
+	// RFC 8731 section 3. The encodings are x/crypto's; the composition is
+	// read from the RFC, the same as the C. So this pins the part most
+	// likely to be wrong -- K is an mpint where the two public keys are
+	// strings, which is worth about half of all secrets going wrong if
+	// missed -- while the live test against OpenSSH settles the rest.
+	sb.WriteString("static const struct {\n\tconst char *vc;\n" +
+		"\tconst char *vs;\n\tconst char *ic;\n\tconst char *is;\n" +
+		"\tconst char *ks;\n\tconst char *qc;\n\tconst char *qs;\n" +
+		"\tconst char *secret;\n\tconst char *h;\n" +
+		"\tconst char *c2s;\n\tconst char *s2c;\n" +
+		"} kSshKexVectors[] = {\n")
+	krng := rand.New(rand.NewSource(23))
+	for i := 0; i < 6; i++ {
+		vc := []byte(fmt.Sprintf("SSH-2.0-client_%d", i))
+		vs := []byte(fmt.Sprintf("SSH-2.0-tailcatc_%d", i))
+		ic := make([]byte, 40+krng.Intn(80))
+		is := make([]byte, 40+krng.Intn(80))
+		ks := make([]byte, 51)
+		qc := make([]byte, 32)
+		qs := make([]byte, 32)
+		secret := make([]byte, 32)
+		krng.Read(ic)
+		krng.Read(is)
+		krng.Read(ks)
+		krng.Read(qc)
+		krng.Read(qs)
+		krng.Read(secret)
+		// Half the cases with the top bit of K set, which is the case the
+		// mpint rule exists for: it needs a leading zero byte and a string
+		// encoding would not add one.
+		if i%2 == 0 {
+			secret[0] |= 0x80
+		} else {
+			secret[0] &^= 0x80
+		}
+
+		var buf []byte
+		str := func(b []byte) {
+			var v struct{ S []byte }
+			v.S = b
+			buf = append(buf, ssh.Marshal(&v)...)
+		}
+		str(vc)
+		str(vs)
+		str(ic)
+		str(is)
+		str(ks)
+		str(qc)
+		str(qs)
+		var mp struct{ I *big.Int }
+		mp.I = new(big.Int).SetBytes(secret)
+		buf = append(buf, ssh.Marshal(&mp)...)
+
+		h := sha256.Sum256(buf)
+
+		// RFC 4253 7.2, extended to 64 bytes because SHA-256 gives 32 and
+		// chacha20-poly1305 wants 64.
+		derive := func(letter byte) []byte {
+			kEnc := ssh.Marshal(&mp)
+			d1 := sha256.New()
+			d1.Write(kEnc)
+			d1.Write(h[:])
+			d1.Write([]byte{letter})
+			d1.Write(h[:]) // session id == H on the first exchange
+			k1 := d1.Sum(nil)
+			d2 := sha256.New()
+			d2.Write(kEnc)
+			d2.Write(h[:])
+			d2.Write(k1)
+			k2 := d2.Sum(nil)
+			return append(append([]byte{}, k1...), k2...)
+		}
+
+		fmt.Fprintf(&sb,
+			"\t{ \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\" },\n",
+			hexs(vc), hexs(vs), hexs(ic), hexs(is), hexs(ks), hexs(qc),
+			hexs(qs), hexs(secret), hexs(h[:]), hexs(derive('C')),
+			hexs(derive('D')))
 	}
 	sb.WriteString("};\n\n")
 

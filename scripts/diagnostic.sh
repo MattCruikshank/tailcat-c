@@ -183,6 +183,7 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: reaching a third address via an exit node" "make live-exitnode"
 	stage "live: --allow admits and refuses" "make live-allow"
 	stage "live: a saved key through both implementations" "make live-genkey"
+	stage "live: real OpenSSH against our SSH server" "make live-sshd"
 	stage "live: ssh and scp with us as ProxyCommand" "make live-ssh"
 	stage "live: a file into a real tailcat recv drop box" "make live-recv"
 	stage "live: session across a rekey (slow, ~6m)" "make live-rekey"

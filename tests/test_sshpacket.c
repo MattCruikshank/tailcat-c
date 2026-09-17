@@ -253,10 +253,21 @@ static void test_round_trips(void)
 
 static void test_framing_rules(void)
 {
+	/* The two modes align differently, and getting that wrong is invisible
+	 * to a round trip -- our encoder and our decoder would simply agree.
+	 * OpenSSH does not, and this is the rule it enforces:
+	 *
+	 *   - encrypted: the length field is under its own key and outside the
+	 *     aligned region, so the region alone is a multiple of 8;
+	 *   - in the clear, where the cipher is "none": RFC 4253's plain rule,
+	 *     and the length field counts like everything else.
+	 *
+	 * Getting the second wrong makes every packet of the handshake four
+	 * bytes out and OpenSSH rejects all of them. */
 	uint8_t key[TC_SSH_CIPHER_KEY_LEN];
 	memset(key, 0x5a, sizeof key);
 
-	TCT_CASE("the encrypted region is always a whole number of blocks");
+	TCT_CASE("in the clear, the length field counts toward the alignment");
 	for (size_t len = 0; len < 200; len++) {
 		tc_ssh_cipher c;
 		tc_ssh_cipher_init_plain(&c);
@@ -268,35 +279,63 @@ static void test_framing_rules(void)
 			TCT_FAILF("encode(%zu) failed", len);
 			return;
 		}
-		/* In the clear there is no tag, so the region is everything after
-		 * the four-byte length field. */
-		size_t region = pkt_len - TC_SSH_LENGTH_LEN;
-		if (region % TC_SSH_BLOCK != 0)
-			TCT_FAILF("payload %zu gave a %zu-byte region", len, region);
+		/* No tag in the clear, so the whole packet is length plus region. */
+		if (pkt_len % TC_SSH_BLOCK != 0)
+			TCT_FAILF("payload %zu gave a %zu-byte packet", len, pkt_len);
 		if (pkt[TC_SSH_LENGTH_LEN] < TC_SSH_MIN_PADDING)
 			TCT_FAILF("payload %zu got %u bytes of padding", len,
 			          pkt[TC_SSH_LENGTH_LEN]);
 	}
 	tct_checks++;
 
-	TCT_CASE("the length field is excluded from the alignment");
-	/* OpenSSH computes padding over (padding_length || payload) only,
-	 * because the length field is encrypted separately under its own key.
-	 * Including it shifts every packet by four bytes and an OpenSSH peer
-	 * rejects the result as badly padded -- so this pins the rule directly
-	 * rather than through a round trip that would agree with itself.
-	 *
-	 * A 7-byte payload makes 1 + 7 = 8, already aligned, so the padding is a
-	 * whole extra block: 8. Were the length field counted, 4 + 1 + 7 = 12
-	 * would want 4. */
+	TCT_CASE("encrypted, it does not");
+	for (size_t len = 0; len < 200; len++) {
+		tc_ssh_cipher c;
+		tc_ssh_cipher_init_plain(&c);
+		tc_ssh_cipher_set_key(&c, key);
+		uint8_t payload[256], pkt[BUFSZ];
+		memset(payload, 0x11, sizeof payload);
+		size_t pkt_len = 0;
+		if (tc_ssh_packet_encode(pkt, sizeof pkt, &pkt_len, payload, len,
+		                         &c) != TC_OK) {
+			TCT_FAILF("encode(%zu) failed", len);
+			return;
+		}
+		size_t region = pkt_len - TC_SSH_LENGTH_LEN - TC_SSH_MAC_LEN;
+		if (region % TC_SSH_BLOCK != 0)
+			TCT_FAILF("payload %zu gave a %zu-byte region", len, region);
+	}
+	tct_checks++;
+
+	TCT_CASE("and the two rules give different padding for the same payload");
+	/* A 7-byte payload: encrypted, 1 + 7 = 8 is already aligned so the
+	 * padding is a whole extra block, 8. In the clear, 4 + 1 + 7 = 12 wants
+	 * 4. Same payload, different answer -- which is the whole point. */
 	tc_ssh_cipher c;
-	tc_ssh_cipher_init_plain(&c);
 	uint8_t payload[8], pkt[BUFSZ];
 	memset(payload, 0x22, sizeof payload);
 	size_t pkt_len = 0;
+
+	tc_ssh_cipher_init_plain(&c);
+	tc_ssh_cipher_set_key(&c, key);
 	TCT_EQ_INT(tc_ssh_packet_encode(pkt, sizeof pkt, &pkt_len, payload, 7, &c),
 	           TC_OK);
-	TCT_EQ_INT(pkt[TC_SSH_LENGTH_LEN], 8);
+	/* The padding byte is inside the encrypted region, so decode to see it. */
+	tc_ssh_cipher d;
+	tc_ssh_cipher_init_plain(&d);
+	tc_ssh_cipher_set_key(&d, key);
+	uint8_t plain[BUFSZ];
+	size_t plain_len = 0;
+	TCT_EQ_INT(tc_ssh_packet_decode(plain, sizeof plain, &plain_len, pkt,
+	                                pkt_len, &d),
+	           TC_OK);
+	TCT_EQ_INT((int)plain_len, 7);
+	TCT_EQ_INT((int)(pkt_len - TC_SSH_LENGTH_LEN - TC_SSH_MAC_LEN), 16);
+
+	tc_ssh_cipher_init_plain(&c);
+	TCT_EQ_INT(tc_ssh_packet_encode(pkt, sizeof pkt, &pkt_len, payload, 7, &c),
+	           TC_OK);
+	TCT_EQ_INT(pkt[TC_SSH_LENGTH_LEN], 4);
 
 	TCT_CASE("padding is random, not a constant");
 	/* With a stream cipher a predictable tail would leak the payload length
@@ -332,7 +371,10 @@ static void test_length_bounds(void)
 	TCT_TRUE(tc_ssh_packet_decode_length(&c, tiny, &total) != TC_OK);
 
 	TCT_CASE("and an enormous one is refused rather than believed");
-	static const uint8_t huge[] = { 0xff, 0xff, 0xff, 0xf8 };
+	/* Chosen to be legally aligned in the clear -- 0xfffffff4 + 4 is a
+	 * multiple of 8 -- so this is refused for its size and not incidentally
+	 * for its shape. */
+	static const uint8_t huge[] = { 0xff, 0xff, 0xff, 0xf4 };
 	TCT_EQ_INT(tc_ssh_packet_decode_length(&c, huge, &total), TC_ERR_TOOMANY);
 
 	TCT_CASE("a packet handed over short is refused, not padded");
@@ -371,19 +413,21 @@ static void test_bad_padding_is_refused(void)
 	tc_ssh_cipher_init_plain(&c);
 	uint8_t pkt[64];
 	memset(pkt, 0, sizeof pkt);
-	pkt[3] = 8;    /* region of 8 bytes */
-	pkt[4] = 200;  /* claiming 200 bytes of padding inside it */
+	/* 12, not 8: in the clear the length field counts, so the region plus
+	 * four must be a multiple of the block size. */
+	pkt[3] = 12;
+	pkt[4] = 200; /* claiming 200 bytes of padding inside twelve */
 	uint8_t out[64];
 	size_t out_len = 0;
-	TCT_TRUE(tc_ssh_packet_decode(out, sizeof out, &out_len, pkt, 4 + 8, &c) !=
-	         TC_OK);
+	TCT_TRUE(tc_ssh_packet_decode(out, sizeof out, &out_len, pkt, 4 + 12,
+	                              &c) != TC_OK);
 
 	TCT_CASE("and so is one below the four-byte minimum");
 	memset(pkt, 0, sizeof pkt);
-	pkt[3] = 8;
+	pkt[3] = 12;
 	pkt[4] = 2;
-	TCT_TRUE(tc_ssh_packet_decode(out, sizeof out, &out_len, pkt, 4 + 8, &c) !=
-	         TC_OK);
+	TCT_TRUE(tc_ssh_packet_decode(out, sizeof out, &out_len, pkt, 4 + 12,
+	                              &c) != TC_OK);
 }
 
 /* ---- version exchange -------------------------------------------------- */

@@ -83,9 +83,10 @@ widening the connection key from a port pair to a four-tuple.
 
 **Still out of scope**, in descending order of how much it would take:
 
-- The **SSH and SFTP servers**, and therefore `recv`, `ls` and `serve ssh`.
-  This is by far the largest remaining item and it carries a licence
-  decision; see [Vendoring an SSH server](#vendoring-an-ssh-server).
+- The **SFTP server**, and therefore `recv`, `ls` and `serve ssh`. The SSH
+  half is now written and verified against a real OpenSSH client; what is
+  left is the file protocol on top of it. The licence question that gated
+  this is [decided](#vendoring-an-ssh-server): write the subset.
 - The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
   this means a second toolchain and a second build of everything — arguably
   against the premise of a project whose whole point is one fat APE.
@@ -170,7 +171,7 @@ direct peer-to-peer paths.
 | `socks -- <cmd>` with `all_proxy` | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ❌ | ✅ (in-process SFTP client) |
-| SSH *server* (`serve ssh`) | ❌ | ✅ |
+| SSH *server* (`serve ssh`) | transport done, awaiting SFTP | ✅ |
 | `recv` (file drop box, receiving) | ❌ (needs SSH+SFTP) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
@@ -311,7 +312,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-28 test binaries, 8,556 assertions, under two toolchains. The method matters
+33 test binaries, 9,544 assertions, under two toolchains. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
 
@@ -324,6 +325,7 @@ something that is not ours.**
 | NAT64 | RFC 6052 §2.4's worked example, and `inet_pton`, which embeds a dotted quad itself |
 | Ed25519 | RFC 8032's published vectors, reached by feeding its own seeds to Go's `crypto/ed25519` |
 | IPv6 formatting | our output fed back through `inet_pton` |
+| SSH | `golang.org/x/crypto/ssh` for the wire encodings and the cipher, and a **real OpenSSH 9.6 client** for the protocol itself |
 | everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
 
 Where a test passed on the first run, the response has generally been to
@@ -833,6 +835,27 @@ All four were locked down with direct tests before the fix was believed, and
 each of those tests was checked against a mutation that reintroduces the bug
 it covers.
 
+**22. Every SSH handshake packet was four bytes out of alignment.** *(Phase
+5.4, found by the first real `ssh` client to connect.)* Whether the packet
+length field counts toward the block alignment depends on the cipher.
+`chacha20-poly1305@openssh.com` encrypts it separately under its own key and
+leaves it outside the aligned region; the `none` cipher in force before
+NEWKEYS does not, so RFC 4253's plain rule applies and the length field
+counts like everything else. We used the AEAD rule for both.
+
+Every packet of the handshake was therefore misaligned and OpenSSH rejected
+all of them with `padding error: need 212 block 8 mod 4`. Nothing offline
+could have caught it: every vector in `tests/ssh_vectors.h` is encrypted,
+because vectors are generated from the cipher, and the one test that pinned
+the padding rule directly asserted the AEAD rule against a *plaintext*
+cipher -- so it was confirming the bug. Our encoder and our decoder agreed
+perfectly with each other throughout.
+
+This is the clearest case yet for the project's own rule about anchors. The
+packet layer's vectors were produced by Go written from the same OpenSSH
+document as the C, so both sides could be -- and in this respect both were --
+wrong in the same way. Only a peer written from neither could tell.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -1095,6 +1118,10 @@ Roughly in the order they should be picked up.
 - [ ] Consider making the address-parser limits runtime-configurable.
 - [ ] **Refresh the DERP map cache in the background** rather than only on a
       miss, so a long-lived process does not pay a fetch mid-session.
+- [ ] **Rekeying for the SSH server.** The sequence number is the cipher
+      nonce, so it must never wrap; `tc_ssh_server_run` stops rather than
+      letting it, which is correct but is a limit rather than a solution. A
+      drop box will not reach 2^32 packets; anything longer-lived would.
 - [ ] **Fuzz the DERP frame codec.** It parses attacker-influenced lengths
       straight off a socket, which is the same shape as the TCP reassembly
       queue, and that is where bugs 20 and 21 came from. It has vectors and

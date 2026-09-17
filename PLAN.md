@@ -563,16 +563,29 @@ does not match" and nothing more specific.
       the Poly1305 key taken from block zero of the payload keystream.
       Getting the length-field key wrong yields a connection that works
       until a packet crosses a 4KB boundary.
-- [ ] **5.4.3 key exchange** · ~500 lines.
-      KEXINIT and algorithm negotiation, `curve25519-sha256`, the exchange
-      hash, `ssh-ed25519` host key signing, and key derivation. The one
-      place where our order of preference must decide and not the peer's.
-- [ ] **5.4.4 userauth** · ~300 lines · publickey only (RFC 4252), verified
-      against an authorized-keys list. No passwords, no keyboard-interactive,
-      no `none` that succeeds.
-- [ ] **5.4.5 connection layer** · ~400 lines · one channel, window
-      management, and only the `subsystem` request -- which is what carries
-      sftp.
+- [x] **5.4.3 key exchange** · 300 lines.
+      KEXINIT and negotiation, `curve25519-sha256`, the exchange hash,
+      `ssh-ed25519` host key signing, key derivation. Our preference order
+      decides, not the peer's, and a wrong first-packet guess is discarded --
+      both checked, and the second only catches with a peer whose favourite
+      is an algorithm we support but rank lower.
+- [x] **5.4.4 userauth** · 250 lines · publickey only. One function rather
+      than two, deliberately: there is no way to verify a signature without
+      also checking the key is authorized, because the version of this that
+      has a bug has exactly that shape.
+- [x] **5.4.5 connection layer** · 330 lines · one channel, flow control,
+      `subsystem` and `exec`, everything else refused *and answered*.
+- [x] **5.4.6 the server** · 640 lines · the transport state machine over a
+      pair of callbacks rather than a socket, so the same code serves over
+      the tunnel later. `make live-sshd` puts a real OpenSSH 9.6 client
+      against it.
+
+      That test found the bug offline testing structurally could not: the
+      padding rule differs between the two ciphers, and the "none" cipher in
+      force before NEWKEYS uses RFC 4253's plain rule where the length field
+      *is* counted. Every vector we had was encrypted, so every handshake
+      packet was four bytes out of alignment and OpenSSH rejected all of
+      them. See bug 22.
 
 The decision and its alternatives remain recorded below, because a decision
 whose reasoning is thrown away is one that gets relitigated. Full detail is in the README under
@@ -746,7 +759,8 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.1, 5.2 — datagrams, NAT64, exit nodes | ~990 | ✅ done |
 | 5.1 — SOCKS5 UDP ASSOCIATE | ~400 | ✅ done |
 | 5.3 — TLS 1.3 | — | ❌ blocked on Ed25519 |
-| 5.4, 5.5 — SSH + SFTP (and `recv`, `ls`) | ~4,000 | ⏸ licence decision |
+| 5.4 — SSH subset (transport, kex, auth, channels, server) | 2,513 | ✅ done |
+| 5.5 — SFTP (and `recv`, `ls`) | ~1,500 | ⏸ next |
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
@@ -786,8 +800,9 @@ discovery were not actually being made.
    qemu-user and is written and waiting on `qemu-user-static` being
    installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
    APE assimilation is needed. After that: qemu-system, then hardware.
-2. **Decide the SSH licence question** (see 5.4) and then write the subset.
-   Ed25519 is done, so the crypto it needs is all in hand.
+2. **Write the SFTP subset** (5.5). The SSH side is done and verified
+   against a real OpenSSH, and `subsystem` already delivers the request, so
+   what remains is the file protocol and `recv`'s write-only discipline.
 3. **Bound `FIN_WAIT_2`.** Keepalive and idle timeout are done (bug 21), and
    they cover the peer that vanishes. They do not cover the peer that is
    alive, answers every probe, and simply never sends its FIN: nothing bounds

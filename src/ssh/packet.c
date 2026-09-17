@@ -195,16 +195,25 @@ int tc_ssh_version_check(const char *line, size_t len)
 
 /* padding_for returns how many padding bytes a payload needs.
  *
- * The length field is excluded from the alignment, which is the part that
- * differs from RFC 4253's plain rule: for this cipher it is encrypted
- * separately under its own key and is not part of the block-aligned region.
- * OpenSSH computes it the same way, as `block - ((len - aadlen) % block)`
- * with aadlen 4. Including the length field here yields packets an OpenSSH
- * peer rejects as badly padded. */
-static size_t padding_for(size_t payload_len)
+ * Whether the length field counts toward the block alignment depends on the
+ * cipher, and this is the detail that makes the two modes genuinely
+ * different rather than merely differing in confidentiality:
+ *
+ *   - With chacha20-poly1305, the length field is encrypted separately under
+ *     its own key and is *not* part of the aligned region. OpenSSH computes
+ *     `block - ((len - aadlen) % block)` with aadlen 4.
+ *   - Before NEWKEYS the cipher is "none", aadlen is 0, and RFC 4253's plain
+ *     rule applies: the length field is counted like everything else.
+ *
+ * Using the AEAD rule for both is a server whose every handshake packet is
+ * four bytes out of alignment, which OpenSSH rejects with "padding error:
+ * need N block 8 mod 4" before the key exchange gets anywhere. Nothing
+ * offline caught it here: the vectors are all encrypted. */
+static size_t padding_for(size_t payload_len, bool encrypted)
 {
-	size_t unaligned = (1 + payload_len) % TC_SSH_BLOCK;
-	size_t pad = TC_SSH_BLOCK - unaligned;
+	size_t base = encrypted ? (1 + payload_len)
+	                        : (TC_SSH_LENGTH_LEN + 1 + payload_len);
+	size_t pad = TC_SSH_BLOCK - (base % TC_SSH_BLOCK);
 	if (pad < TC_SSH_MIN_PADDING)
 		pad += TC_SSH_BLOCK;
 	return pad;
@@ -221,7 +230,7 @@ int tc_ssh_packet_encode(uint8_t *out, size_t cap, size_t *out_len,
 	if (payload_len > TC_SSH_MAX_PAYLOAD)
 		return TC_ERR_TOOMANY;
 
-	size_t pad = padding_for(payload_len);
+	size_t pad = padding_for(payload_len, c->encrypted);
 	size_t region = 1 + payload_len + pad; /* what gets encrypted */
 	size_t total = TC_SSH_LENGTH_LEN + region +
 	               (c->encrypted ? TC_SSH_MAC_LEN : 0);
@@ -295,7 +304,14 @@ int tc_ssh_packet_decode_length(const tc_ssh_cipher *c,
 	 * of the packet body, because at this point the number has been
 	 * decrypted but not authenticated -- it is still entirely under the
 	 * peer's control. */
-	if (region % TC_SSH_BLOCK != 0)
+	/* The same asymmetry as padding_for: the length field is inside the
+	 * aligned region only when it is not separately encrypted. */
+	/* Widened before the addition, not after: region is a uint32_t and a
+	 * value near its maximum plus four wraps to a small number that passes
+	 * the alignment check it should fail. */
+	size_t aligned = (size_t)region +
+	                 (c->encrypted ? 0u : (size_t)TC_SSH_LENGTH_LEN);
+	if (aligned % TC_SSH_BLOCK != 0)
 		return TC_ERR_INVAL;
 	if (region < 1 + TC_SSH_MIN_PADDING)
 		return TC_ERR_INVAL;
