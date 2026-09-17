@@ -178,7 +178,7 @@ direct peer-to-peer paths.
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
-| aarch64 | built, never executed | ✅ |
+| aarch64 | built; arithmetic verified, instructions pending qemu | ✅ |
 | Browser (WebAssembly) | ❌ | ✅ |
 | Persistent keys on disk | ✅ | ✅ |
 
@@ -954,26 +954,38 @@ Roughly in the order they should be picked up.
       relays, and pointing a robot at someone else's infrastructure on every
       push is not a reasonable default.
 - [ ] **Run the aarch64 half.** `check-fat` proves it compiles, links and is
-      present in every binary. Nothing has ever *executed* it, which makes it
-      the largest untested claim in this README. The plan, cheapest first:
-      - [ ] **Build x86_64 with `-funsigned-char`** and run the whole suite.
-            No emulator, no new infrastructure. Plain `char` is signed on
-            x86-64 and unsigned on aarch64, so `if (c < 0)` on a `char`
-            silently changes meaning between them — and `json.c`, `cbor.c`,
+      present in every binary; for a long time nothing had ever *executed*
+      it, which made it the largest untested claim here. Two of the four
+      rungs are now done and the remaining two need hardware or a package.
+      - [x] **Build x86_64 with `-funsigned-char`** and run the whole suite —
+            `make test-unsigned-char`, and a level 1 stage.
+
+            The concern was real and now measured: `__CHAR_UNSIGNED__` is
+            **undefined for cosmo's x86_64 and defined for its aarch64**, so
+            plain `char` is signed in one half of every fat binary we ship
+            and unsigned in the other. `if (c < 0)` on a `char` means
+            different things in the two halves, and `json.c`, `cbor.c`,
             `base64url.c` and `http.c` are full of character handling that
-            *mostly* uses `uint8_t`. "Mostly" is the word that hides this.
-            Check first whether cosmocc already forces a signedness for both
-            targets; if it does, the concern evaporates and that is worth
-            knowing too.
-      - [ ] **qemu-user** (`qemu-aarch64` plus binfmt). Whether it runs an APE
-            unmodified needs finding out rather than assuming: Cosmopolitan
-            issues raw syscalls and brings its own loader, and qemu-user
-            translates syscalls to the host kernel instead of emulating one.
-            It may need `assimilate` to flatten the APE into a plain aarch64
-            ELF first. This catches miscompilation and arch-dependent logic.
+            *mostly* uses `uint8_t`. "Mostly" was the word hiding it.
+
+            All 28 test binaries pass under the other signedness, so the
+            arithmetic is clean. That removes the largest *class* of aarch64
+            risk without an emulator.
+      - [x] **qemu-user** — `make test-aarch64`, which needs
+            `qemu-user-static` installed and skips with instructions when it
+            is not.
+
+            The plan assumed this would need `assimilate` to flatten an APE
+            into a plain ELF. **It does not.** cosmocc already leaves a plain
+            statically-linked aarch64 ELF beside each binary as
+            `<name>.aarch64.elf`, and qemu-user runs those directly — no APE
+            loader, no binfmt registration. The target is written and waiting;
+            it has not been *run* here, because installing the package needs a
+            password this session does not have.
       - [ ] **qemu-system** with a real aarch64 Linux: slow, but the only
             option that exercises Cosmopolitan's own aarch64 runtime rather
-            than just our instructions.
+            than just our instructions. qemu-user translates syscalls to the
+            host kernel, so it tests our code and not Cosmopolitan's.
       - [ ] **Real hardware** beats all of the above if any is to hand.
 - [ ] **Test on macOS and the BSDs, and on aarch64.** Linux and Windows are
       covered; the other four targets and the entire aarch64 half are not.

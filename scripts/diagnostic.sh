@@ -42,8 +42,17 @@ stage() {
 	shift
 	printf '\n=== %s\n' "$name"
 	t0=$(date +%s)
-	if sh -c "$*"; then
+	sh -c "$*"
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
 		printf '    ok   %s [%s]\n' "$name" "$(hms $(($(date +%s) - t0)))"
+	elif [ "$rc" -eq 2 ]; then
+		# Exit 2 means "the tooling for this is not installed", which is not
+		# a failure -- but it must not be silent either, or a stage that
+		# never runs anywhere looks exactly like one that always passes.
+		printf '    SKIP %s -- see the message above\n' "$name"
+		SKIPPED="${SKIPPED:-}
+      $name"
 	else
 		printf '    FAIL %s [%s]\n' "$name" "$(hms $(($(date +%s) - t0)))"
 		FAILED="$FAILED
@@ -137,6 +146,13 @@ if [ "$LEVEL" -eq 1 ]; then
 	# tailcat, which is exactly why they are not in any faster level: a robot
 	# pointed at someone else'"'"'s infrastructure on every push is rude, and
 	# network flakiness would train everyone to ignore the result.
+	# The other half of every binary we ship. Character signedness differs
+	# between the two architectures, so the first of these runs the whole
+	# suite under aarch64's semantics on x86_64 hardware; the second runs
+	# real aarch64 instructions under qemu, when qemu is installed.
+	stage "the suite under aarch64 char semantics" "make test-unsigned-char"
+	stage "the suite on aarch64 instructions (qemu)" "make test-aarch64"
+
 	stage "live: DERP relay round trip and reconnection" "make live"
 	stage "live: STUN binding exchange" "make live-stun"
 	stage "live: netcheck against the real relay list" "make live-netcheck"
@@ -159,6 +175,10 @@ fi
 
 TOTAL=$(hms $(($(date +%s) - START)))
 echo
+if [ -n "${SKIPPED:-}" ]; then
+	echo "skipped (tooling not installed):${SKIPPED}"
+	echo
+fi
 if [ -n "$FAILED" ]; then
 	echo "FAIL level $LEVEL diagnostic [$TOTAL]. Failed stages:$FAILED"
 	exit 1

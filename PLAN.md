@@ -693,11 +693,13 @@ discovery were not actually being made.
 
 ### What to do next
 
-1. **Run the aarch64 half.** Still the largest untested claim in the project.
-   The diagnostics cover x86_64 on two operating systems; the other half of
-   every binary has never been executed at all. Cheapest first: build x86_64
-   with `-funsigned-char` and run the suite, then qemu-user, then
-   qemu-system, then real hardware.
+1. **Run the aarch64 half**, which is now half done. `make
+   test-unsigned-char` passes: `char` really is signed on cosmo x86_64 and
+   unsigned on cosmo aarch64, and all 28 test binaries pass under the other
+   signedness. `make test-aarch64` runs the real aarch64 instructions under
+   qemu-user and is written and waiting on `qemu-user-static` being
+   installed. cosmocc emits a plain `.aarch64.elf` beside each binary, so no
+   APE assimilation is needed. After that: qemu-system, then hardware.
 2. **Decide the SSH licence question** (see 5.4) and then write the subset.
    Ed25519 is done, so the crypto it needs is all in hand.
 4. **TCP keepalive / idle timeout**, now the oldest thing on the list. A

@@ -139,6 +139,16 @@ SAN := -fsanitize=address,undefined -fno-omit-frame-pointer \
 	-fno-sanitize-recover=all
 CFLAGS += $(SAN)
 MBEDTLS_CFLAGS += $(SAN)
+
+# A hook for one-off builds, because overriding CFLAGS wholesale on the
+# command line silently discards the include paths and the warning set.
+#
+# Its first use is the cheapest possible test of the aarch64 half: plain
+# `char` is signed on cosmo's x86_64 and *unsigned* on its aarch64, so
+# `EXTRA_CFLAGS=-funsigned-char` runs the whole suite under the other half's
+# character semantics without an emulator. See `make test-unsigned-char`.
+CFLAGS += $(EXTRA_CFLAGS)
+MBEDTLS_CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS += $(SAN)
 endif
 
@@ -189,7 +199,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp diag1 diag3 diag5
+.PHONY: all test clean check-fat fuzz interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 $(CLI): src/cli/main.c $(LIB_OBJS)
@@ -312,6 +322,24 @@ $(BUILD)/livestun: tests/livestun.c $(LIB_OBJS)
 
 live-stun: $(BUILD)/livestun
 	./$(BUILD)/livestun
+
+# The aarch64 half's character semantics, on x86_64 hardware.
+#
+# `char` is signed on cosmo's x86_64 and unsigned on its aarch64, so any
+# `c < 0` on a plain char means something different in the two halves of
+# every fat binary we ship -- and only the x86_64 half has ever been
+# executed. This is the cheapest way to exercise the difference: no
+# emulator, no new toolchain, just the other signedness.
+#
+# It does not test aarch64 code generation, only our arithmetic. qemu is
+# still the next step.
+test-unsigned-char:
+	$(MAKE) BUILD=build/uchar EXTRA_CFLAGS=-funsigned-char test
+
+# And the aarch64 half itself, on real aarch64 instructions under qemu-user.
+# Skips with a message saying what to install if qemu is not there.
+test-aarch64: $(TEST_BINS)
+	BUILD=$(BUILD) sh scripts/test-aarch64.sh
 
 # A whole netcheck against the real relay list: that the servers answer, that
 # the region called preferred really is the quickest, and that it is dialable
