@@ -1270,6 +1270,69 @@ static int dial_endpoint(const tc_endpoint *ep)
 	return -1;
 }
 
+/* spawn_exec runs the `exec` service's command with a socket as its stdio.
+ *
+ * Like inetd: the connection *is* the command's stdin and stdout, so a
+ * socketpair goes to the child and the parent's end is handed to the same
+ * proxy that would otherwise hold a socket to a local port. Nothing else
+ * about the accept path changes, which is the whole reason it is a
+ * socketpair and not a pair of pipes -- the proxy already knows how to pump
+ * one file descriptor against one tunnel connection.
+ *
+ * stderr is deliberately the server's, as upstream documents: a command that
+ * complains should complain where the operator can see it, not into a
+ * tunnel where it would be mistaken for output.
+ *
+ * Returns the parent's descriptor, or -1.
+ */
+static int spawn_exec(const char *const *argv, const uint8_t peer_key[32],
+                      const uint8_t peer_ip[TC_IPV6_ADDR_LEN], uint16_t port)
+{
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+		return -1;
+
+	char keybuf[128];
+	char addrbuf[96];
+	tc_endpoint ep;
+	memset(&ep, 0, sizeof ep);
+	memcpy(ep.ip, peer_ip, TC_IPV6_ADDR_LEN);
+	ep.ip_len = 16;
+	ep.port = port;
+	if (tc_key_format_hex(keybuf, sizeof keybuf, "nodekey", peer_key) != TC_OK)
+		keybuf[0] = '\0';
+	if (tc_endpoint_format(addrbuf, sizeof addrbuf, &ep) != TC_OK)
+		addrbuf[0] = '\0';
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		(void)close(sv[0]);
+		(void)close(sv[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		(void)close(sv[0]);
+		(void)dup2(sv[1], STDIN_FILENO);
+		(void)dup2(sv[1], STDOUT_FILENO);
+		if (sv[1] > STDERR_FILENO)
+			(void)close(sv[1]);
+		/* What upstream passes, under the same names, so a command written
+		 * for one works with the other. */
+		(void)setenv("TAILCAT_PEER_KEY", keybuf, 1);
+		(void)setenv("TAILCAT_REMOTE_ADDR", addrbuf, 1);
+		execvp(argv[0], (char *const *)(uintptr_t)argv);
+		fprintf(stderr, "tailcat-c: could not run %s: %s\n", argv[0],
+		        strerror(errno));
+		_exit(127);
+	}
+
+	(void)close(sv[1]);
+	int fl = fcntl(sv[0], F_GETFL, 0);
+	if (fl >= 0)
+		(void)fcntl(sv[0], F_SETFL, (int)((unsigned)fl | (unsigned)O_NONBLOCK));
+	return sv[0];
+}
+
 static int dial_localhost(uint16_t port)
 {
 	struct sockaddr_in v4;
@@ -1372,6 +1435,9 @@ typedef struct {
 	/* Set by `recv <dir>`: where uploads land, and the host identity the SSH
 	 * server presents. NULL means this is an ordinary `serve`. */
 	const char *recv_dir;
+	/* `serve exec -- cmd`: the command to run for each connection, NULL when
+	 * the service is not in use. */
+	const char *const *exec_argv;
 	uint8_t ssh_host_seed[32];
 
 	/* One SSH session at a time. The session's own read callback drives the
@@ -1395,6 +1461,14 @@ static bool port_is_served(void *ctx, uint16_t port)
 {
 	const serve_state *st = (const serve_state *)ctx;
 	if (st->recv_dir != NULL && port == 22)
+		return true;
+	/* The exec service answers everywhere, because it is not a service on a
+	 * port: it is what this server does. Upstream's own example connects to
+	 * port 80 of a server that has nothing on port 80. Any port set given
+	 * alongside it still applies to the local services it names, so
+	 * `serve 8080 exec -- cmd` is not a thing that makes sense and the
+	 * exec wins. */
+	if (st->exec_argv != NULL)
 		return true;
 	return st->ports != NULL && tc_portset_has(st->ports, port);
 }
@@ -2052,7 +2126,20 @@ static int serve_pump_once(serve_state *st, uint64_t deadline)
 				}
 
 				int fd;
-				if (memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
+				if (st->exec_argv != NULL &&
+				    memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
+					/* The exec service answers on every port of our own
+					 * address: it is the service, not a service beside the
+					 * others, which is why upstream's example dials port 80
+					 * of a server that has nothing on port 80. */
+					uint8_t peer_ip[TC_IPV6_ADDR_LEN];
+					tc_tunnel_addr_for_key(peer_ip, sc->key);
+					fd = spawn_exec(st->exec_argv, sc->key, peer_ip,
+					                tc_tcp_remote_port(c));
+					if (fd >= 0)
+						vlogf("exec: running %s for a connection to port %u",
+						      st->exec_argv[0], (unsigned)port);
+				} else if (memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
 					fd = dial_localhost(port);
 				} else {
 					tc_endpoint dst;
@@ -2088,6 +2175,13 @@ static int serve_pump_once(serve_state *st, uint64_t deadline)
 				}
 				vlogf("accepted a connection to port %u", (unsigned)port);
 			}
+		}
+
+		/* Children of the exec service, so a long-lived server does not
+		 * collect a zombie per connection. */
+		if (st->exec_argv != NULL) {
+			while (waitpid(-1, NULL, WNOHANG) > 0)
+				;
 		}
 
 		bool progress = tc_proxy_pump(st->proxy, t) > 0;
@@ -4959,7 +5053,8 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      bool insecure, unsigned timeout_s,
                      const char *derpmap_url, const char *key_spec,
                      bool full_address, bool exit_node,
-                     const tc_allowlist *allow, const char *recv_dir)
+                     const tc_allowlist *allow, const char *recv_dir,
+                     const char *const *exec_argv)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -5132,6 +5227,7 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		st.ports = ports;
 		st.exit_node = exit_node;
 		st.recv_dir = recv_dir;
+		st.exec_argv = exec_argv;
 		if (recv_dir != NULL) {
 			/* The SSH host key is derived from the tunnel identity rather
 			 * than generated, so it is the same on every run for as long as
@@ -5514,12 +5610,13 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		/* `--` ends our flags. For socks it also starts the child command,
-		 * which is the only subcommand that runs one. Handled here rather
+		/* `--` ends our flags. For socks and for `serve exec` it also starts
+		 * a command, which are the two subcommands that run one. Handled here rather
 		 * than in a pass over argv beforehand, because which subcommand this
 		 * is has to be known first, and before this loop it is not. */
 		if (strcmp(a, "--") == 0) {
-			if (nargs >= 1 && strcmp(args[0], "socks") == 0) {
+			if (nargs >= 1 && (strcmp(args[0], "socks") == 0 ||
+			                   strcmp(args[0], "serve") == 0)) {
 				if (i + 1 < argc)
 					child_argv = (const char *const *)&argv[i + 1];
 				break;
@@ -5680,8 +5777,23 @@ int main(int argc, char **argv)
 	}
 
 	if (nargs == 0) {
-		usage(stderr);
-		return 2;
+		/* A bare invocation is a server, as upstream's is: it prints an
+		 * address, waits for one connection, and pipes it to stdout.
+		 *
+		 * This used to print usage instead, on the reasoning that usage is
+		 * more helpful to someone who typed the name to see what it does.
+		 * That reasoning ignored who actually types it: the first line of
+		 * upstream's README is `$ tailcat`, so the people most likely to
+		 * run it bare are the ones following that, and they are expecting a
+		 * server. `--help` is there for the other case and says so.
+		 *
+		 * The one-shot form, not `serve all`: a bare server that quietly
+		 * offered every port would be a much larger thing than the command
+		 * looks. */
+		if (timeout_s == 0)
+			timeout_s = 60;
+		return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
+		                 key_spec, full_address, false, &allow, NULL, NULL);
 	}
 	/* Outside the port server, a deadline of zero would mean "give up at
 	 * once", which nobody asks for by typing --timeout 0. */
@@ -5728,12 +5840,14 @@ int main(int argc, char **argv)
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
-			                 key_spec, full_address, false, &allow, NULL);
+			                 key_spec, full_address, false, &allow, NULL,
+			                 NULL);
 		}
 
 		static tc_portset ports;
 		tc_portset_clear(&ports);
 		bool exit_node = false;
+		const char *const *exec_argv = NULL;
 		for (size_t i = 1; i < nargs; i++) {
 			tc_portset_service svc = TC_PORTSET_SVC_NONE;
 			int rc = tc_portset_parse(&ports, args[i], &svc);
@@ -5743,6 +5857,20 @@ int main(int argc, char **argv)
 				 * because it makes this machine a proxy for everything it
 				 * can reach. */
 				exit_node = true;
+				continue;
+			}
+			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_EXEC) {
+				/* Like inetd: every connection runs the command, with the
+				 * connection as its stdin and stdout. The command is
+				 * whatever follows `--`, and without one there is nothing
+				 * to run. */
+				if (child_argv == NULL) {
+					fprintf(stderr,
+					        "tailcat-c: serve exec needs a command: "
+					        "tailcat-c serve exec -- /usr/bin/fortune\n");
+					return 2;
+				}
+				exec_argv = child_argv;
 				continue;
 			}
 			if (rc == TC_ERR_UNSUPPORTED) {
@@ -5762,7 +5890,8 @@ int main(int argc, char **argv)
 		}
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
-		                 key_spec, full_address, exit_node, &allow, NULL);
+		                 key_spec, full_address, exit_node, &allow, NULL,
+		                 exec_argv);
 	}
 	if (strcmp(args[0], "readme") == 0) {
 		/* Upstream embeds its own README.md here. Ours is an engineering log
@@ -5800,7 +5929,7 @@ int main(int argc, char **argv)
 		tc_portset_clear(&no_ports);
 		return cmd_serve(relay, &no_ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url, key_spec,
-		                 full_address, false, &allow, args[1]);
+		                 full_address, false, &allow, args[1], NULL);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

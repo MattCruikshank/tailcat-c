@@ -206,6 +206,8 @@ direct peer-to-peer paths.
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
 | `readme` | ✅ (embeds doc/usage.md, not this file) | ✅ (embeds README.md) |
 | `browse`, `forward --open-browser` | ✅ | ✅ |
+| `serve exec` (a command per connection) | ✅ | ✅ |
+| bare `tailcat` starts a server | ✅ | ✅ |
 | `--flag=value` as well as `--flag value` | ✅ | ✅ |
 | `--timeout` as a duration (`2m`, `1h30m`) | ✅ | ✅ |
 | **Not here** | | |
@@ -218,7 +220,6 @@ direct peer-to-peer paths.
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
 | reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
 | `serve` services: `ssh`, `no-auth-ssh`, `exec`, `files` | ❌ | ✅ |
-| bare `tailcat` starts a server | ❌ (prints usage) | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |

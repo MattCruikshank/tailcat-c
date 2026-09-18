@@ -31,7 +31,16 @@ Pipe stdin to a server and its output back:
 
 Serve one connection and write it to stdout, then exit:
 
+    tailcat-c
     tailcat-c serve
+
+Run a command for each connection instead, with the connection as its stdin
+and stdout, like inetd:
+
+    tailcat-c serve exec -- /usr/bin/fortune
+
+The command gets the caller's node key in $TAILCAT_PEER_KEY and its address
+in $TAILCAT_REMOTE_ADDR.
 
 Serve local ports, to many clients at once:
 

@@ -63,7 +63,7 @@ and `hello` appears on the server. Works.
 
 | Instruction | Result |
 |---|---|
-| `tailcat` (bare) | **Differs.** Upstream starts a server; ours prints usage and exits 2. |
+| `tailcat` (bare) | ✅ starts a one-shot server, as upstream does |
 | `tailcat <addr>` | ✅ |
 | `serve 8080,8443` | ✅ |
 | `serve all` | ✅ |
@@ -150,11 +150,14 @@ $ tailcat-c serve ssh
 tailcat-c: the "ssh" service is not implemented here; see the feature table in README.md
 ```
 
-Same for `no-auth-ssh`, `exec` and `files`. By contrast the *flags* belonging
-to those features report only `unknown flag` — `--ssh-authorized-keys` and
-`--files`. "Unknown" is true but less useful than "not implemented here": a
-reader cannot tell a typo from a missing feature, and these are the last two
-places that distinction is lost.
+Same for `no-auth-ssh` and `files`. `exec` is implemented now — a command per
+connection, with the connection as its stdin and stdout, and the caller's key
+and address in its environment.
+
+By contrast the *flags* belonging to the remaining features report only
+`unknown flag` — `--ssh-authorized-keys` and `--files`. "Unknown" is true but
+less useful than "not implemented here": a reader cannot tell a typo from a
+missing feature, and these are the last two places that distinction is lost.
 
 (This paragraph named five flags when the walk was first written.
 `--fixed-region`, `--until-direct` and `--skip-dns-safety-check` have since
@@ -212,7 +215,6 @@ walkthrough. PLAN.md 6.2 has what each would cost.
 | a *self-hosted* relay in a saved key | `genkey --region=derp.example.com` | `serve --relay host` |
 | a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
 | shell, forced command, file server | `serve ssh`, `no-auth-ssh`, `exec`, `files` | `recv`, `ls` |
-| server on a bare invocation | `tailcat` | `tailcat-c serve` |
 
 The four `serve` services are refusals rather than omissions — PLAN 5.4 and
 5.5 record the reasoning, and it is mostly that a drop box which can run
