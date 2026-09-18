@@ -3780,6 +3780,15 @@ static int resolve_for_socks(tc_socks_target *out, const char *host,
 typedef struct {
 	bool udp;               /* UDP ASSOCIATE rather than CONNECT */
 	tc_socks_target target; /* where it points */
+	/* Set when the destination hostname was itself a tailcat address, which
+	 * upstream allows and documents:
+	 *
+	 *     tailcat socks curl http://<tc-addr>:8081/
+	 *
+	 * The connection then belongs to *that* server rather than to the one
+	 * named on the command line -- which is why the proxy keeps more than
+	 * one. Empty otherwise. */
+	char server[TC_ADDR_STR_MAX];
 } socks_request;
 
 /* socks_reply answers a request. rep is 0 for success; bnd is the address to
@@ -3833,6 +3842,8 @@ static int socks_handshake(int fd, socks_request *out_req)
 	uint8_t reply[2] = { SOCKS_VERSION, none_ok ? 0x00 : 0xff };
 	if (!socks_write(fd, reply, 2, until) || !none_ok)
 		return TC_ERR_UNSUPPORTED;
+
+	memset(out_req, 0, sizeof *out_req);
 
 	/* Request: version, command, reserved, address type. */
 	if (!socks_read(fd, b, 4, until) || b[0] != SOCKS_VERSION)
@@ -3891,6 +3902,27 @@ static int socks_handshake(int fd, socks_request *out_req)
 		char host[256];
 		memcpy(host, b, addr_len);
 		host[addr_len] = '\0';
+
+		/* A tailcat address in the hostname names a server, not a host
+		 * beyond one. Checked before the resolver, which is not merely an
+		 * ordering preference: sending an address to DNS would publish a
+		 * bearer credential in cleartext, which is the same hazard
+		 * src/net/dnsaddr.c refuses for command-line arguments. */
+		{
+			static tc_conn_info probe;
+			if (tc_addr_parse(&probe, host, strlen(host)) == TC_OK) {
+				if (strlen(host) >= sizeof out_req->server)
+					return TC_ERR_INVAL;
+				(void)snprintf(out_req->server, sizeof out_req->server, "%s",
+				               host);
+				out_req->target.kind = TC_SOCKS_TO_SERVER;
+				out_req->target.port = port;
+				if (!socks_reply(fd, 0x00, NULL, until))
+					return TC_ERR_INVAL;
+				return TC_OK;
+			}
+		}
+
 		if (resolve_for_socks(&out_req->target, host, port) != TC_OK) {
 			(void)socks_reply(fd, 0x04, NULL, until); /* host unreachable */
 			return TC_ERR_INVAL;
@@ -4124,11 +4156,97 @@ static void assoc_to_client(tc_client *cl, udp_assoc *as, size_t nas)
 	}
 }
 
-static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
+/* ---- more than one server ----------------------------------------------
+ *
+ * `forward` has exactly one destination and always will. `socks` does not:
+ * upstream lets a tailcat address stand in for a hostname, so one proxy can
+ * be asked for several servers, and the address on the command line becomes
+ * optional.
+ *
+ * Hence a small set of tunnels rather than one. Small because each holds a
+ * relay connection, a WireGuard session, two muxes and a path prober, and
+ * because a SOCKS proxy fronting more than a handful of tailcat servers is
+ * not a thing anyone has asked for.
+ *
+ * Slot 0 is the address given on the command line, when there is one. It is
+ * where everything that does not name a server goes: an IP destination, the
+ * `server.tailcat` name, and every UDP association, since UDP ASSOCIATE
+ * names no destination at all and so cannot select a server.
+ */
+#ifndef TC_MAX_SERVERS
+#define TC_MAX_SERVERS 4
+#endif
+
+typedef struct {
+	tc_client cl;
+	char addr[TC_ADDR_STR_MAX];
+	bool up;
+} server_slot;
+
+typedef struct {
+	server_slot s[TC_MAX_SERVERS];
+	size_t n;
+	/* Repeated for every tunnel brought up after the first. */
+	bool insecure;
+	const char *derpmap_url;
+	const char *key_spec;
+} server_set;
+
+/* server_find returns the slot serving `addr`, bringing one up if there is
+ * none and there is room.
+ *
+ * The bring-up is synchronous, and that is a real cost worth stating: a
+ * first connection to a new server stalls this loop for as long as a tunnel
+ * takes, which is a second or two, and every other proxied connection waits.
+ * Upstream does it on a goroutine and does not. Making it asynchronous here
+ * means a connection state machine for something that happens once per
+ * server, and the alternative -- refusing the connection while it builds --
+ * is worse than a pause. */
+static server_slot *server_find(server_set *set, const char *addr,
+                                uint64_t deadline)
+{
+	for (size_t i = 0; i < set->n; i++) {
+		if (set->s[i].up && strcmp(set->s[i].addr, addr) == 0)
+			return &set->s[i];
+	}
+	if (set->n >= TC_MAX_SERVERS) {
+		vlogf("no room for another server; %d is the limit", TC_MAX_SERVERS);
+		return NULL;
+	}
+	server_slot *slot = &set->s[set->n];
+	if ((size_t)snprintf(slot->addr, sizeof slot->addr, "%s", addr) >=
+	    sizeof slot->addr)
+		return NULL;
+	vlogf("bringing up a second tunnel for a server named in a request");
+	if (client_up(&slot->cl, addr, set->insecure, set->derpmap_url,
+	              set->key_spec, deadline) != TC_OK)
+		return NULL;
+	slot->up = true;
+	set->n++;
+	return slot;
+}
+
+static void server_set_down(server_set *set)
+{
+	for (size_t i = 0; i < set->n; i++) {
+		if (set->s[i].up) {
+			client_down(&set->s[i].cl);
+			set->s[i].up = false;
+		}
+	}
+	set->n = 0;
+}
+
+static int run_listeners(server_set *set, local_listener *ls, size_t nls,
                          tc_proxy *proxy, bool socks, pid_t child,
                          const char *bind_addr, uint64_t deadline)
 {
-	tc_derp_set_read_timeout(&cl->derp, 20);
+	/* Slot 0 is the command-line server, and may not exist: `socks` with no
+	 * address waits for a request to name one. Everything that does not name
+	 * a server needs it, and says so rather than failing obscurely. */
+	tc_client *cl = (set->n > 0 && set->s[0].up) ? &set->s[0].cl : NULL;
+	for (size_t i = 0; i < set->n; i++)
+		tc_derp_set_read_timeout(&set->s[i].cl.derp, 20);
 
 	static udp_assoc assocs[TC_SOCKS_MAX_ASSOC];
 	memset(assocs, 0, sizeof assocs);
@@ -4155,20 +4273,16 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				return 1;
 		}
 
-		if (cl->ctx.relay_stalled) {
-			cl->ctx.relay_stalled = false;
-			vlogf("a relay write stalled; rebuilding the connection");
-			if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
-			                  cl->ping_len, deadline) != TC_OK) {
+		for (size_t k = 0; k < set->n; k++) {
+			if (!set->s[k].up)
+				continue;
+			if (client_ready(&set->s[k].cl, deadline) != 0) {
 				fprintf(stderr, "tailcat-c: lost the relay\n");
 				return 1;
 			}
 		}
-
-		tc_wg_peer_tick(&cl->peer, t);
-		tc_tcp_mux_tick(cl->mux, t);
-		if (cl->umux != NULL)
-			tc_udp_mux_tick(cl->umux, t);
+		cl = (set->n > 0 && set->s[0].up) ? &set->s[0].cl : NULL;
+		(void)t;
 
 		/* Datagrams in both directions, and associations whose control
 		 * connection has gone. */
@@ -4187,9 +4301,11 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				assoc_close(&assocs[i]);
 				continue;
 			}
-			assoc_from_client(cl, &assocs[i]);
+			if (cl != NULL)
+				assoc_from_client(cl, &assocs[i]);
 		}
-		assoc_to_client(cl, assocs, TC_SOCKS_MAX_ASSOC);
+		if (cl != NULL)
+			assoc_to_client(cl, assocs, TC_SOCKS_MAX_ASSOC);
 
 		/* Accept whatever is waiting on each local listener. */
 		for (size_t i = 0; i < nls; i++) {
@@ -4217,7 +4333,7 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 								slot = &assocs[k];
 						}
 						tc_endpoint bnd;
-						if (cl->umux == NULL || slot == NULL ||
+						if (cl == NULL || cl->umux == NULL || slot == NULL ||
 						    assoc_open(cl, slot, bind_addr, fd) != TC_OK ||
 						    assoc_local(slot, &bnd) != TC_OK) {
 							vlogf("cannot open a UDP association");
@@ -4260,11 +4376,36 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 					beyond = ls[i].dst;
 				}
 
+				/* Which tunnel carries it. A request naming a tailcat
+				 * address goes to that server, brought up now if this is
+				 * the first time it has been asked for; anything else goes
+				 * to the one named on the command line. */
+				tc_client *via = cl;
+				if (socks && req.server[0] != '\0') {
+					server_slot *slot = server_find(set, req.server, deadline);
+					if (slot == NULL) {
+						vlogf("cannot reach the server named in the request");
+						(void)close(fd);
+						continue;
+					}
+					via = &slot->cl;
+					/* The bring-up may have taken seconds. */
+					t = now_ms();
+				}
+				if (via == NULL) {
+					/* `socks` with no address, asked for something that does
+					 * not name one. There is nowhere to send it. */
+					vlogf("no server for this request: give socks an address, "
+					      "or use a tailcat address as the hostname");
+					(void)close(fd);
+					continue;
+				}
+
 				tc_tcp_conn *c = NULL;
 				int crc = (beyond.ip_len == 16)
-				              ? tc_tcp_mux_connect_to(cl->mux, beyond.ip,
+				              ? tc_tcp_mux_connect_to(via->mux, beyond.ip,
 				                                      want, t, &c)
-				              : tc_tcp_mux_connect(cl->mux, want, t, &c);
+				              : tc_tcp_mux_connect(via->mux, want, t, &c);
 				if (crc != TC_OK) {
 					vlogf("no room for another connection");
 					(void)close(fd);
@@ -4273,7 +4414,7 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				if (tc_proxy_add(proxy, c, fd) != TC_OK) {
 					vlogf("no room for another connection");
 					(void)close(fd);
-					tc_tcp_mux_close(cl->mux, c, t);
+					tc_tcp_mux_close(via->mux, c, t);
 					continue;
 				}
 				if (beyond.ip_len == 16) {
@@ -4295,13 +4436,25 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 		tc_proxy_reap(proxy, t);
 		/* Only now, once the proxy has dropped anything that finished: the
 		 * mux is about to free the connections it points at. */
-		tc_tcp_mux_reap(cl->mux);
+		for (size_t k = 0; k < set->n; k++) {
+			if (set->s[k].up)
+				tc_tcp_mux_reap(set->s[k].cl.mux);
+		}
 
-		if (!progress && !tc_derp_has_pending(&cl->derp)) {
-			struct pollfd pfds[1 + TC_MAX_LISTENERS + TC_TCP_MAX_CONNS];
+		bool pending = false;
+		for (size_t k = 0; k < set->n && !pending; k++)
+			pending = set->s[k].up && tc_derp_has_pending(&set->s[k].cl.derp);
+
+		if (!progress && !pending) {
+			struct pollfd pfds[TC_MAX_SERVERS + TC_MAX_LISTENERS +
+			                   TC_TCP_MAX_CONNS];
 			nfds_t nfds = 0;
-			int dfd = tc_derp_fd(&cl->derp);
-			if (dfd >= 0) {
+			for (size_t k = 0; k < set->n; k++) {
+				if (!set->s[k].up)
+					continue;
+				int dfd = tc_derp_fd(&set->s[k].cl.derp);
+				if (dfd < 0)
+					continue;
 				pfds[nfds].fd = dfd;
 				pfds[nfds].events = POLLIN;
 				pfds[nfds].revents = 0;
@@ -4313,8 +4466,9 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				pfds[nfds].revents = 0;
 				nfds++;
 			}
-			for (size_t i = 0; i < TC_TCP_MAX_CONNS &&
-			                   nfds < 1 + TC_MAX_LISTENERS + TC_TCP_MAX_CONNS;
+			for (size_t i = 0;
+			     i < TC_TCP_MAX_CONNS &&
+			     nfds < TC_MAX_SERVERS + TC_MAX_LISTENERS + TC_TCP_MAX_CONNS;
 			     i++) {
 				int pfd = -1;
 				bool rd = false, wr = false;
@@ -4329,64 +4483,33 @@ static int run_listeners(tc_client *cl, local_listener *ls, size_t nls,
 				nfds++;
 			}
 
-			int wait_ms = 20;
-			uint64_t dl = tc_tcp_mux_next_deadline(cl->mux);
-			uint64_t wdl = tc_wg_peer_next_deadline(&cl->peer);
-			if (wdl < dl)
-				dl = wdl;
-			if (dl != UINT64_MAX) {
-				uint64_t nowv = now_ms();
-				wait_ms = (dl > nowv) ? (int)(dl - nowv) : 0;
-				if (wait_ms > 200)
-					wait_ms = 200;
+			/* The shortest wait any of them wants, so a busy tunnel is not
+			 * kept waiting by an idle one. */
+			int wait_ms = 200;
+			for (size_t k = 0; k < set->n; k++) {
+				if (!set->s[k].up)
+					continue;
+				int w = client_wait_ms(&set->s[k].cl, 200);
+				if (w < wait_ms)
+					wait_ms = w;
 			}
+			if (set->n == 0)
+				wait_ms = 20;
 			if (nfds > 0)
 				(void)poll(pfds, nfds, wait_ms);
+			else
+				(void)poll(NULL, 0, wait_ms);
 		}
 
-		pump_service_udp(&cl->ctx, cl->mux);
-
-		uint8_t src[32];
-		static uint8_t buf[TC_DERP_MAX_PACKET_SIZE];
-		size_t len = 0;
-		int rc = tc_derp_recv(&cl->derp, src, buf, sizeof buf, &len);
-		if (rc == TC_ERR_TIMEOUT) {
-			if (tc_derp_idle_ms(&cl->derp) > TC_DERP_DEAD_AFTER_MS) {
-				vlogf("no keep-alive; the relay is gone");
-				if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
-				                  cl->ping_len, deadline) != TC_OK) {
-					fprintf(stderr, "tailcat-c: lost the relay\n");
-					return 1;
-				}
-			}
-			continue;
-		}
-		if (rc == TC_ERR_CLOSED) {
-			if (relay_recover(&cl->derp, cl->ci.server_public, cl->ping,
-			                  cl->ping_len, deadline) != TC_OK) {
+		for (size_t k = 0; k < set->n; k++) {
+			if (!set->s[k].up)
+				continue;
+			if (client_recv_once(&set->s[k].cl, deadline) != 0) {
 				fprintf(stderr, "tailcat-c: relay: %s\n",
 				        tc_derp_error_string());
 				return 1;
 			}
-			continue;
 		}
-		if (rc != TC_OK) {
-			fprintf(stderr, "tailcat-c: relay: %s\n", tc_strerror(rc));
-			return 1;
-		}
-		if (memcmp(src, cl->ci.server_public, 32) != 0 || len == 0)
-			continue;
-		if (pump_relay_disco(&cl->ctx, buf, len))
-			continue;
-
-		static uint8_t inner[TC_DERP_MAX_PACKET_SIZE];
-		size_t inner_len = 0;
-		if (tc_wg_peer_input(&cl->peer, buf, len, inner, sizeof inner,
-		                     &inner_len, now_ms()) != TC_OK)
-			continue;
-		if (inner_len == 0)
-			continue;
-		deliver_inner(cl->mux, cl->umux, inner, inner_len);
 	}
 	return 0;
 }
@@ -4428,7 +4551,12 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
                                 const char *derpmap_url, const char *key_spec,
                                 bool open_browser)
 {
-	static tc_client cl;
+	static server_set set;
+	memset(&set, 0, sizeof set);
+	set.insecure = insecure;
+	set.derpmap_url = derpmap_url;
+	set.key_spec = key_spec;
+
 	uint64_t deadline = (timeout_s == 0)
 	                        ? UINT64_MAX
 	                        : now_ms() + (uint64_t)timeout_s * 1000u;
@@ -4512,9 +4640,20 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	int status = 1;
 	pid_t child = 0;
 	tc_proxy *proxy = NULL;
-	if (client_up(&cl, addr_str, insecure, derpmap_url, key_spec,
-	              now_ms() + 60000) != TC_OK)
-		goto out;
+	if (addr_str != NULL) {
+		if (client_up(&set.s[0].cl, addr_str, insecure, derpmap_url, key_spec,
+		              now_ms() + 60000) != TC_OK)
+			goto out;
+		(void)snprintf(set.s[0].addr, sizeof set.s[0].addr, "%s", addr_str);
+		set.s[0].up = true;
+		set.n = 1;
+	} else {
+		/* `socks` with no address, which upstream allows: the proxy waits
+		 * for a request whose hostname is a tailcat address and dials that.
+		 * Nothing is reachable until one arrives, and requests that name no
+		 * server are refused until then. */
+		vlogf("no server yet; waiting for a request that names one");
+	}
 
 	proxy = tc_proxy_new(TC_TCP_MAX_CONNS);
 	if (proxy == NULL) {
@@ -4528,7 +4667,7 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	 * that will never be answered, and if the address was wrong it stares
 	 * for good. Opening a window on someone's desktop is a visible act, so
 	 * it waits until there is something behind the URL. */
-	if (open_browser && nls > 0) {
+	if (open_browser && nls > 0 && set.n > 0) {
 		char url[TC_BROWSER_BUF];
 		if (tc_browser_url(url, sizeof url, bind_addr, ls[0].local_port) ==
 		    TC_OK)
@@ -4548,7 +4687,7 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 		}
 	}
 
-	status = run_listeners(&cl, ls, nls, proxy, socks, child, bind_addr,
+	status = run_listeners(&set, ls, nls, proxy, socks, child, bind_addr,
 	                       deadline);
 
 	if (child > 0) {
@@ -4561,9 +4700,9 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 
 out:
 
-	/* Order matters: the proxy refers to connections the mux owns. */
+	/* Order matters: the proxy refers to connections the muxes own. */
 	tc_proxy_free(proxy);
-	client_down(&cl);
+	server_set_down(&set);
 	for (size_t i = 0; i < nls; i++)
 		(void)close(ls[i].fd);
 	return status;
@@ -5704,10 +5843,6 @@ int main(int argc, char **argv)
 		                            derpmap_url, key_spec, true);
 	}
 	if (strcmp(args[0], "socks") == 0) {
-		if (nargs < 2) {
-			fprintf(stderr, "tailcat-c: socks needs an address\n");
-			return 2;
-		}
 		/* `socks <addr> [port] [cmd...]`, and the command needs no `--`,
 		 * because upstream's does not:
 		 *
@@ -5718,7 +5853,30 @@ int main(int argc, char **argv)
 		 * command otherwise. That is unambiguous for every command anyone
 		 * would run -- `curl` is not a port -- and `--` is still there for
 		 * the one case it is not, a command whose name is a number. */
-		size_t at = 2;
+		/* `socks [<tc-addr>] [port] [cmd...]`. Every part is optional now:
+		 * upstream's is
+		 *
+		 *     tailcat socks [--listen=<addr:port>] [<tc-addr>] [<cmd> ...]
+		 *
+		 * and with no address the proxy waits for a request whose hostname
+		 * is a tailcat address. So the first positional is an address if it
+		 * reads as one, then a port if that reads as one, and whatever is
+		 * left is a command. */
+		size_t at = 1;
+		const char *socks_addr = NULL;
+		if (at < nargs) {
+			static tc_conn_info probe_ci;
+			char probe_name[TC_DNS_NAME_LEN];
+			tc_dnsarg_kind kind;
+			if (tc_addr_parse(&probe_ci, args[at], strlen(args[at])) == TC_OK ||
+			    (tc_dns_classify(&kind, probe_name, sizeof probe_name,
+			                     args[at]) == TC_OK &&
+			     kind == TC_DNSARG_NAME)) {
+				socks_addr = args[at];
+				at++;
+			}
+		}
+
 		const char **specs = NULL;
 		size_t nspecs = 0;
 		if (at < nargs) {
@@ -5741,9 +5899,12 @@ int main(int argc, char **argv)
 			args[nargs] = NULL;
 			child = (const char *const *)&args[at];
 		}
-		const char *dst = dest_arg(args[1], NULL);
-		if (dst == NULL)
-			return 1;
+		const char *dst = NULL;
+		if (socks_addr != NULL) {
+			dst = dest_arg(socks_addr, NULL);
+			if (dst == NULL)
+				return 1;
+		}
 		return cmd_forward_or_socks(dst, specs, nspecs, bind_addr, true,
 		                            child, insecure,
 		                            timeout_given ? timeout_s : 0,

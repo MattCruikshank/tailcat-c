@@ -109,8 +109,6 @@ identities, `browse` and `readme` are all here.
 found by typing upstream's README at this binary rather than by reading our
 own feature list:
 
-- **`socks` recognising a tailcat address as a URL hostname**, which is what
-  makes the address argument optional there.
 - **`genkey --region=<relay-hostname>`**, for a relay you run yourself.
   `--relay` does this for one `serve`; what is missing is recording it in a
   *saved key*. `--fixed-region` and a numbered or named region already are.
@@ -198,7 +196,7 @@ direct peer-to-peer paths.
 | `ping --until-direct` | ✅ | ✅ |
 | `resolve` | ✅ | ✅ |
 | `forward` (local TCP port forwarding) | ✅ | ✅ |
-| `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, one server | ✅ (many servers) |
+| `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, up to 4 servers | ✅ (many servers) |
 | `socks <cmd>` with `all_proxy`, `--` optional | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ✅ (in-process SFTP client) | ✅ |
@@ -213,7 +211,8 @@ direct peer-to-peer paths.
 | **Not here** | | |
 | addresses in DNS TXT records | ✅ | ✅ |
 | the DNS safety probe | ✅ | ✅ |
-| `socks` with the address omitted | ❌ | ✅ (tc-addr as a URL hostname) |
+| `socks` with the address omitted | ✅ | ✅ |
+| a tc-addr as a URL hostname | ✅ | ✅ |
 
 | `genkey --fixed-region` | ✅ | ✅ |
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |

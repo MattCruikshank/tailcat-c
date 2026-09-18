@@ -32,12 +32,22 @@ def proxy_from_env():
 
 
 def main():
-    if sys.argv[1] == "--from-env":
+    # --host NAME asks for a specific destination hostname rather than the
+    # server itself. A tailcat address is a legal one: upstream lets an
+    # address stand in for a hostname so that one proxy can front several
+    # servers, and `socks` then needs no address of its own.
+    argv = sys.argv[1:]
+    want_host = None
+    if argv and argv[0] == "--host":
+        want_host = argv[1].encode()
+        argv = argv[2:]
+
+    if argv[0] == "--from-env":
         host, port = proxy_from_env()
-        dest_port = int(sys.argv[2])
+        dest_port = int(argv[1])
     else:
-        host, port = "127.0.0.1", int(sys.argv[1])
-        dest_port = int(sys.argv[2])
+        host, port = "127.0.0.1", int(argv[0])
+        dest_port = int(argv[1])
 
     s = socket.create_connection((host, port), timeout=30)
     s.settimeout(30)
@@ -52,7 +62,7 @@ def main():
     # Upstream's name for the far end of the tunnel. Anything else is a
     # destination to reach *through* the server, which needs it to be an exit
     # node -- so a proxy client that wants the server itself has to say so.
-    name = b"server.tailcat"
+    name = want_host if want_host is not None else b"server.tailcat"
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name +
               struct.pack("!H", dest_port))
     rep = s.recv(10)

@@ -75,7 +75,8 @@ and `hello` appears on the server. Works.
 | `socks <addr> 1080` | ✅ |
 | `socks <addr> -- curl …` | ✅ |
 | `socks <addr> curl …` (no `--`) | ✅ since the walk |
-| `socks curl http://<tc-addr>:8081/` | ❌ Upstream's SOCKS proxy recognises a tailcat address used as a hostname, so the address argument is optional. Not implemented. |
+| `socks curl http://<tc-addr>:8081/` | ✅ the address argument is optional, and a tc-addr hostname names the server to reach |
+| `socks <addr-a> …` and `<addr-b> …` through one proxy | ✅ up to four servers, dialled on demand |
 | `ping --until-direct <addr>` | ✅ a pong a second until one is direct; non-zero if none is |
 | `ping <addr>` | ✅ `pong in 61ms via DERP(nyc)`, upstream's format exactly. Works in both directions with the real tailcat — verified. |
 
@@ -132,7 +133,7 @@ difference.
 | `serve --key=new 8080` | ✅ forces an ephemeral one |
 | `--psk=false` | ✅ 104-byte address without a PSK; `--psk=true` and the default give 152 |
 | `genkey --region=derp.example.com` | ❌ bring-your-own-relay at genkey time. Good error: `no region matching "derp.example.com"; try --region list`. `--relay` does this for `serve`. |
-| `genkey --fixed-region` | ❌ `unknown flag` |
+| `genkey --fixed-region` | ✅ measures the nearest relay once and records it in the key |
 
 Guarding against a saved key being replaced works, and says why:
 `already exists; --force to replace it (every client with the old address
@@ -150,10 +151,15 @@ tailcat-c: the "ssh" service is not implemented here; see the feature table in R
 ```
 
 Same for `no-auth-ssh`, `exec` and `files`. By contrast the *flags* belonging
-to those features report only `unknown flag`:
-`--ssh-authorized-keys`, `--files`, `--fixed-region`, `--until-direct`,
-`--skip-dns-safety-check`. "Unknown" is true but less useful than "not
-implemented here" — a reader cannot tell a typo from a missing feature.
+to those features report only `unknown flag` — `--ssh-authorized-keys` and
+`--files`. "Unknown" is true but less useful than "not implemented here": a
+reader cannot tell a typo from a missing feature, and these are the last two
+places that distinction is lost.
+
+(This paragraph named five flags when the walk was first written.
+`--fixed-region`, `--until-direct` and `--skip-dns-safety-check` have since
+been implemented, which is the more satisfying way for the list to get
+shorter.)
 
 
 ## DNS names
@@ -203,8 +209,7 @@ walkthrough. PLAN.md 6.2 has what each would cost.
 
 | Missing | Upstream spelling | Nearest thing here |
 |---|---|---|
-| tc-addr as a URL hostname | `socks curl http://<tc-addr>:8081/` | `socks <addr> -- curl …` |
-| a relay baked into a saved key | `genkey --fixed-region`, `genkey --region=host` | `serve --relay host` |
+| a *self-hosted* relay in a saved key | `genkey --region=derp.example.com` | `serve --relay host` |
 | a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
 | shell, forced command, file server | `serve ssh`, `no-auth-ssh`, `exec`, `files` | `recv`, `ls` |
 | server on a bare invocation | `tailcat` | `tailcat-c serve` |

@@ -970,10 +970,9 @@ In rough order of what they cost:
    regions were not honoured at all. **`genkey --region=<relay-hostname>`**
    is still open: `--relay` does it for one `serve`, and what is missing is
    recording a self-hosted relay's hostname in a saved key.
-5. **`socks` recognising a tailcat address as a URL hostname**, which is what
-   makes its address argument optional. Our SOCKS server already ignores the
-   requested hostname except for `server.tailcat`; this means parsing it as
-   an address instead and dialling it.
+5. ~~**`socks` recognising a tailcat address as a URL hostname**~~: done,
+   6.6, and with it the "many servers" difference the feature table had
+   carried since phase 3.
 6. ~~**Addresses in DNS TXT records**~~: done, with the safety probe, which
    this entry insisted had to land with it. See 6.3.
 
@@ -1096,6 +1095,50 @@ was ephemeral or saved. Upstream distinguishes, and documents why -- the line
 tells you whether you are about to share a single-use address or re-listen on
 one that may already be in somebody's notes.
 
+### 6.6 One proxy, several servers ✅ · ~330 lines
+
+Upstream lets a tailcat address stand in for a destination hostname:
+
+    tailcat socks curl http://<tc-addr>:8081/
+
+which is why its `socks` needs no address of its own. The feature looks like
+hostname parsing and is really about lifetime: the address in that URL names
+a *different* server, so the proxy has to hold more than one tunnel, and
+`run_listeners` was written around exactly one `tc_client` threaded through
+every line of it.
+
+What made it tractable was that `tc_proxy` pairs a local descriptor with a
+`tc_tcp_conn` and has never known which mux the connection came from, so one
+proxy could always have served several tunnels. Only the loop had to change.
+
+Three steps, each built and tested before the next: split the client pump
+into `client_ready`, `client_wait_ms` and `client_recv_once` so several
+tunnels share one `poll` -- a turn per client, each polling separately, would
+make a quiet moment cost twenty milliseconds per server rather than twenty in
+total; recognise an address in the SOCKS hostname field *before* the
+resolver, since sending one to DNS would publish a bearer credential in
+cleartext exactly as `dnsaddr.c` refuses to; and give the loop a small set of
+tunnels instead of one.
+
+Four servers, because each holds a relay connection, a WireGuard session, two
+muxes and a path prober, and nobody has asked for more. Slot 0 is the
+command-line address when there is one, and takes everything that names no
+server: IP destinations, `server.tailcat`, and every UDP association -- UDP
+ASSOCIATE names no destination at all, so it cannot select a server, and
+saying that plainly beats picking one.
+
+Two costs, both stated in the code. Bringing up a tunnel is synchronous, so a
+first connection to a new server stalls the loop for a second or two and
+every other proxied connection waits; upstream does it on a goroutine and
+does not. And `socks` with a *mistyped* address now treats it as a command
+name, because with the address optional there is nothing else it could be.
+
+`live-socks-many` starts a proxy with no address and asks it for two servers
+by name. The two services answer with their own names, because a proxy that
+sent everything down one tunnel would still produce two replies -- checking
+that each reply came from the right place is the whole test. Confirmed by
+forcing every request onto the first tunnel, which fails it.
+
 ---
 
 ## Cross-cutting
@@ -1164,6 +1207,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 6.3 — DNS names and the safety probe | ~560 | ✅ done |
 | 6.4 — fuzzing and mutating the DERP codec | ~380 | ✅ done |
 | 6.5 — `--fixed-region`, and bugs 35 and 36 | ~120 | ✅ done |
+| 6.6 — one proxy, several servers | ~330 | ✅ done |
 | 6.2 — the gaps it found | ? | ⏸ not started |
 | — Ed25519 (RFC 8032) | 877 | ✅ done |
 

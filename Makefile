@@ -212,7 +212,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 # doc/usage.md is the source for src/usage_text.c, which is committed so that
@@ -442,6 +442,9 @@ live-forward: $(CLI)
 
 live-browse: $(CLI)
 	CLI=$(CLI) sh scripts/live-browse.sh
+
+live-socks-many: $(CLI)
+	CLI=$(CLI) sh scripts/live-socks-many.sh
 
 # The system ssh and scp, driven through our tunnel to a real SSH server.
 live-ssh: $(CLI)

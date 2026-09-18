@@ -388,6 +388,7 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: four Go clients at once" "make live-multi"
 	stage "live: forward and socks to a Go server" "make live-forward"
 	stage "live: a browser sent to the port we listened on" "make live-browse"
+	stage "live: one proxy, two servers, chosen by request" "make live-socks-many"
 	stage "live: SOCKS5 UDP ASSOCIATE" "make live-socksudp"
 	stage "live: reaching a third address via an exit node" "make live-exitnode"
 	stage "live: --allow admits and refuses" "make live-allow"

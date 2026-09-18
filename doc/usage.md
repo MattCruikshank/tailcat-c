@@ -91,6 +91,10 @@ A SOCKS5 proxy, optionally running a command with `all_proxy` set:
 
     tailcat-c socks <tc-addr> 1080
     tailcat-c socks <tc-addr> curl https://example.com
+    tailcat-c socks curl http://<tc-addr>:8081/   # the address may be omitted
+
+A tailcat address used as a hostname names the server to reach, so one proxy
+can front several of them and needs no address of its own.
     tailcat-c socks <tc-addr> 1080 -- curl https://example.com
 
 The argument after the address is the listening port if it reads as one and
