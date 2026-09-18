@@ -66,6 +66,17 @@ typedef struct {
 	 * This is the `serve ssh -- cmd` form: whatever the client asks for, it
 	 * gets this. */
 	bool forced;
+
+	/* What the client asked to run, when `forced` overrode it.
+	 *
+	 * Passed to the child as SSH_ORIGINAL_COMMAND, which is OpenSSH's name
+	 * for it and upstream's too. A forced command that wants to dispatch on
+	 * what was asked -- `git-upload-pack` deciding which repository, the
+	 * usual reason anyone writes one -- has nowhere else to read it. NULL
+	 * when the client asked for nothing, and the variable is then unset
+	 * rather than empty, because a script testing -n on it should see the
+	 * difference. */
+	const char *original_command;
 } tc_shell_opts;
 
 /* tc_shell_serve runs one session to completion and reaps the child.

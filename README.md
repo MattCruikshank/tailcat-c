@@ -1405,6 +1405,84 @@ worth knowing: scp's `-p` preserves timestamps and ssh's `-p` is the port, so
 scanning an scp command line with ssh's table swallows the first operand — the
 file being copied. Seven tests pin the distinction.
 
+**45. A saved key that embedded its relay was served without it.**
+*(Phase 6.8, found by implementing `genkey --embed-derp-map`.)* Two halves,
+both older than the flag that exposed them.
+
+`region_id == 0` used to mean one thing -- "the file named no region, so
+measure one at startup" -- and a key with its relay's hostnames embedded is
+exactly that shape, because the nodes replace the ID. So serving one
+re-measured the nearest relay and published an address naming a region number,
+while the address the user had already handed out named a host.
+
+Then the address builder collapsed embedded regions back to an ID unless
+`--full-address`, using "the region carries an inner ID" as its test for
+"this was resolved at startup". Upstream writes that inner ID, so its keys
+were indistinguishable from resolved ones. Ours round-tripped correctly only
+because our *writer* happened to omit the inner ID -- an accident, not a
+design.
+
+**This was breaking upstream's key files before this program could write
+one.** `tailcat genkey --embed-derp-map` has existed all along; `serve --key`
+on one was already wrong, and no test noticed because nothing here could make
+such a key to compare against. The fix for both halves is checked by
+generating with either binary and serving with the other: the addresses are
+now byte-identical in both directions.
+
+**46. `#ifdef __APPLE__` in a binary that starts on six systems.**
+*(Phase 6.8.)* `config_dir()` chose between `~/Library/Application Support`
+and `~/.config` at compile time. cosmocc defines neither `__APPLE__` nor
+`__linux__`, so the macOS branch was dead in every shipped build: on macOS we
+wrote keys to `~/.config/tailcat/keys/` while the real tailcat used
+`~/Library/Application Support/tailcat/keys/`, and the two implementations
+could not read each other's saved keys there.
+
+What makes this one worth the space is that **the rule was already written
+down, in this repository, and the tool to follow it already existed**.
+`include/tc/browser.h` says:
+
+> The opener depends on the operating system, which a fat APE does not know
+> until it runs. `#ifdef __APPLE__` is a question about the compiler, and the
+> same binary starts on six systems; `tc_host_os` asks Cosmopolitan at
+> runtime instead.
+
+That paragraph was written to explain a decision two files away from the code
+that contradicted it. Knowing the principle, documenting the principle, and
+building the helper for it were not enough; only going looking found the
+place it had not been applied.
+
+**47. The `/proc/self/exe` lookup never ran.** *(Phase 6.8, same look.)*
+`self_path()` guarded it with `#ifdef __linux__`, which cosmocc does not
+define, so every shipped build fell through to `argv[0]` -- on Linux too. Its
+own comment says why that is not enough: "a program found through PATH gets a
+bare name, and ssh runs the ProxyCommand through a shell whose PATH may
+differ." So `tailcat-c ssh`, invoked by bare name, handed ssh a ProxyCommand
+that only worked if the shell's PATH happened to agree.
+
+Cosmopolitan resolves the executable path itself on all six targets, so the
+answer was `GetProgramExecutableName()` rather than any guess of ours.
+Invoked through PATH, the ProxyCommand is now an absolute path.
+
+**48. `%AppData%` was read with the wrong case.** *(Phase 6.8, found while
+fixing 46 -- on the machine this is being written on.)* Windows environment
+variables are case-insensitive and Go reads them through
+`GetEnvironmentVariable`, so upstream's `os.UserConfigDir` finds `AppData`
+however it is spelled. Cosmopolitan's `getenv` matches exactly, and what is
+exported is `APPDATA`. The lookup missed, and **every Windows key went to
+`~/.config` instead of `%AppData%\tailcat\keys`** -- the same interop failure
+as bug 46, on the platform we actually test.
+
+Fixing the spelling then exposed an ordering bug the typo had been hiding:
+WSL exports the Windows `APPDATA` into the Linux environment, so a Linux run
+would have begun writing keys under `/mnt/c`. The branch had never been
+guarded by platform; it had simply never matched. It is now inside the same
+runtime `tc_host_os()` test as bug 46.
+
+Three bugs in one function, all the same mistake in different clothes: asking
+a question about the machine in a way that only happens to work on the machine
+it was written on. That the fat APE's whole premise is *one binary, six
+systems* is what makes it the mistake this project is most exposed to.
+
 Bugs 39 and 42 are worth reading together, because they are the same mistake
 at two layers of the same stack, made months apart, and both were found by one
 test that sent a lot of data and counted what arrived. Closing a connection

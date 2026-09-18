@@ -93,6 +93,8 @@ static void set_child_env(const tc_shell_opts *opts, const tc_ssh_pty *pty)
 	}
 	if (opts->peer_addr != NULL)
 		(void)setenv("TAILCAT_REMOTE_ADDR", opts->peer_addr, 1);
+	if (opts->original_command != NULL)
+		(void)setenv("SSH_ORIGINAL_COMMAND", opts->original_command, 1);
 }
 
 /* exec_child never returns. */

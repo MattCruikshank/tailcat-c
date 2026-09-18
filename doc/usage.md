@@ -109,6 +109,7 @@ Serve one, to named keys:
     tailcat-c serve --ssh-authorized-keys ~/.ssh/authorized_keys ssh
     tailcat-c serve --ssh-authorized-keys "ssh-ed25519 AAAAC3..." ssh
     tailcat-c serve --ssh-authorized-keys alice@github ssh
+    tailcat-c serve --ssh-authorized-keys alice@github,./contractor.pub ssh
 
 The three forms are a file, a literal key, and a GitHub account -- the last
 fetches `https://github.com/alice.keys`, says so before it does, and refuses
@@ -135,6 +136,12 @@ address can run commands as the user who started it, so the address is a
 password -- and unlike a password it is printed to the terminal and pasted
 into chat windows. `serve ssh` asks for a key as well, and `--allow` narrows
 which tunnels may connect in either case.
+
+An `ssh` or `no-auth-ssh` server also answers `sftp`, with the same reach the
+shell has -- refusing file transfer while offering a shell would only make
+people use `cat`. A forced command is the exception: it replaces everything,
+so there is no shell whose access to match, and no SFTP either. A session with
+a forced command finds what the client asked for in `$SSH_ORIGINAL_COMMAND`.
 
 Sessions get a real terminal where the platform has one. On Windows there are
 no pseudo-terminals, so they run on pipes; clients print "PTY allocation
@@ -183,6 +190,11 @@ Any other name is a destination to reach *through* it, which needs
 
 
 ## Identities
+
+`genkey --embed-derp-map` puts the relay's hostnames in the key itself, so
+every address it prints is self-contained and a client needs no relay-list
+fetch at all. It needs a decided region, so it implies `--fixed-region` unless
+`--region` names one.
 
 Without a saved key a server's address changes on every restart, which makes
 it useless in a script or a service file.
@@ -240,8 +252,15 @@ check that NAT traversal works.
 
     --key NAME          saved identity to use, or "new" for an ephemeral one
     --allow KEYS        comma-separated client nodekey: list, or "none"
-    --files DIR[:MODE]  directory for `serve files`; MODE is ro, rw, wo or wo+
+    --files DIR[:MODE]  directory for `serve files`; MODE is ro, rw, wo or wo+.
+                        Giving it implies the `files` service; with no
+                        directory, the current one is served read-only.
     --accept-dirs       for `recv`: accept directory trees (same as :wo+)
+    --serve LIST        serve these ports and services without the subcommand
+    --json              print {"listenAddr": "tc..."} on stdout when serving
+    --listen [ADDR]:PORT
+                        listen address and port for socks; --bind is the same
+                        thing without a port
     --ssh-authorized-keys SPEC
                         for `serve ssh`: a file, a literal key, or
                         user@github. May be given more than once.
@@ -251,7 +270,9 @@ check that NAT traversal works.
     --open-browser      for forward: open a browser at the local listener
     --timeout DUR       give up after DUR: seconds, or 30s, 2m, 1h30m
                         (0 = never)
-    --derpmap-url URL   where to fetch the relay list
+    --derpmap-url URL   where to fetch the relay list; the default can also
+                        come from $TAILCAT_DERPMAP_URL
+    --embed-derp-map    for `genkey`: bake the relay's hostnames into the key
     --insecure          skip TLS verification of the relay
     -v                  explain what is happening
     -p PORT             port for the pipe and ssh forms

@@ -89,6 +89,98 @@ int tc_key_format_hex(char *out, size_t cap, const char *prefix,
 /* ---- parsing ----------------------------------------------------------- */
 
 /* parse_public reads the "Public" object. */
+/* parse_nodes reads one region's "Nodes" array.
+ *
+ * Bounded by TC_ADDR_MAX_NODES, which is what an address can carry: a key file
+ * naming more nodes than an address can hold would save fine and then produce
+ * a different address, which is worse than refusing it. */
+static int parse_nodes(tc_json_reader *r, tc_derp_region *reg)
+{
+	tc_json_event ev;
+	if (tc_json_next(r, &ev) != TC_OK || ev.type != TC_JSON_ARRAY_BEGIN)
+		return TC_ERR_INVAL;
+	for (;;) {
+		if (tc_json_next(r, &ev) != TC_OK)
+			return TC_ERR_INVAL;
+		if (ev.type == TC_JSON_ARRAY_END)
+			return TC_OK;
+		if (ev.type != TC_JSON_OBJECT_BEGIN)
+			return TC_ERR_INVAL;
+		if (reg->num_nodes >= TC_ADDR_MAX_NODES)
+			return TC_ERR_TOOMANY;
+		tc_derp_node *node = &reg->nodes[reg->num_nodes];
+		memset(node, 0, sizeof *node);
+		for (;;) {
+			if (tc_json_next(r, &ev) != TC_OK)
+				return TC_ERR_INVAL;
+			if (ev.type == TC_JSON_OBJECT_END)
+				break;
+			if (ev.type != TC_JSON_KEY)
+				return TC_ERR_INVAL;
+			bool host = tc_json_key_is(&ev, "HostName");
+			bool v4 = tc_json_key_is(&ev, "IPv4");
+			bool v6 = tc_json_key_is(&ev, "IPv6");
+			if (!host && !v4 && !v6) {
+				if (tc_json_skip_value(r) != TC_OK)
+					return TC_ERR_INVAL;
+				continue;
+			}
+			if (tc_json_next(r, &ev) != TC_OK ||
+			    ev.type != TC_JSON_STRING)
+				return TC_ERR_INVAL;
+			char *dst = host ? node->hostname : (v4 ? node->ipv4 : node->ipv6);
+			size_t cap = host ? sizeof node->hostname
+			                  : (v4 ? sizeof node->ipv4 : sizeof node->ipv6);
+			if (tc_json_string_copy(&ev, dst, cap) != TC_OK)
+				return TC_ERR_INVAL;
+		}
+		reg->num_nodes++;
+	}
+}
+
+/* parse_regions reads the "Region" array. */
+static int parse_regions(tc_json_reader *r, tc_conn_info *ci)
+{
+	tc_json_event ev;
+	if (tc_json_next(r, &ev) != TC_OK || ev.type != TC_JSON_ARRAY_BEGIN)
+		return TC_ERR_INVAL;
+	for (;;) {
+		if (tc_json_next(r, &ev) != TC_OK)
+			return TC_ERR_INVAL;
+		if (ev.type == TC_JSON_ARRAY_END)
+			return TC_OK;
+		if (ev.type != TC_JSON_OBJECT_BEGIN)
+			return TC_ERR_INVAL;
+		if (ci->num_regions >= TC_ADDR_MAX_REGIONS)
+			return TC_ERR_TOOMANY;
+		tc_derp_region *reg = &ci->regions[ci->num_regions];
+		memset(reg, 0, sizeof *reg);
+		for (;;) {
+			if (tc_json_next(r, &ev) != TC_OK)
+				return TC_ERR_INVAL;
+			if (ev.type == TC_JSON_OBJECT_END)
+				break;
+			if (ev.type != TC_JSON_KEY)
+				return TC_ERR_INVAL;
+			if (tc_json_key_is(&ev, "Nodes")) {
+				if (parse_nodes(r, reg) != TC_OK)
+					return TC_ERR_INVAL;
+				continue;
+			}
+			if (tc_json_key_is(&ev, "RegionID")) {
+				if (tc_json_next(r, &ev) != TC_OK ||
+				    ev.type != TC_JSON_NUMBER)
+					return TC_ERR_INVAL;
+				reg->region_id = ev.num;
+				continue;
+			}
+			if (tc_json_skip_value(r) != TC_OK)
+				return TC_ERR_INVAL;
+		}
+		ci->num_regions++;
+	}
+}
+
 static int parse_public(tc_json_reader *r, tc_conn_info *ci)
 {
 	tc_json_event ev;
@@ -104,6 +196,17 @@ static int parse_public(tc_json_reader *r, tc_conn_info *ci)
 		bool is_disco = tc_json_key_is(&ev, "ServerDiscoPublic");
 		bool is_psk = tc_json_key_is(&ev, "PresharedKey");
 		bool is_region = tc_json_key_is(&ev, "RegionID");
+		bool is_nodes = tc_json_key_is(&ev, "Region");
+
+		if (is_nodes) {
+			/* An embedded region, written by `genkey --embed-derp-map`: the
+			 * relay's hostnames travel in the key and then in the address,
+			 * so a client needs no DERP map at all. Same shape as the
+			 * address encodes and as `parse` prints. */
+			if (parse_regions(r, ci) != TC_OK)
+				return TC_ERR_INVAL;
+			continue;
+		}
 
 		if (!is_pub && !is_disco && !is_psk && !is_region) {
 			/* Unknown members are skipped, so a file that gains a field
@@ -295,6 +398,68 @@ int tc_keyfile_format(char *out, size_t cap, size_t *out_len,
 	if (k->pub.region_id != 0) {
 		n = snprintf(out + off, cap - off, ",\n\t\t\"RegionID\": %lld",
 		             (long long)k->pub.region_id);
+		if (n < 0 || (size_t)n >= cap - off)
+			return TC_ERR_NOSPACE;
+		off += (size_t)n;
+	}
+	for (size_t ri = 0; ri < k->pub.num_regions; ri++) {
+		const tc_derp_region *reg = &k->pub.regions[ri];
+		n = snprintf(out + off, cap - off, "%s\n\t\t\t{",
+		             ri == 0 ? ",\n\t\t\"Region\": [" : ",");
+		if (n < 0 || (size_t)n >= cap - off)
+			return TC_ERR_NOSPACE;
+		off += (size_t)n;
+		if (reg->region_id != 0) {
+			/* Upstream writes this, so ours does too: two files for the
+			 * same key should differ only in the key. */
+			n = snprintf(out + off, cap - off,
+			             "\n\t\t\t\t\"RegionID\": %lld,",
+			             (long long)reg->region_id);
+			if (n < 0 || (size_t)n >= cap - off)
+				return TC_ERR_NOSPACE;
+			off += (size_t)n;
+		}
+		n = snprintf(out + off, cap - off, "\n\t\t\t\t\"Nodes\": [");
+		if (n < 0 || (size_t)n >= cap - off)
+			return TC_ERR_NOSPACE;
+		off += (size_t)n;
+		for (size_t ni = 0; ni < reg->num_nodes; ni++) {
+			const tc_derp_node *node = &reg->nodes[ni];
+			n = snprintf(out + off, cap - off,
+			             "%s\n\t\t\t\t\t{\n"
+			             "\t\t\t\t\t\t\"HostName\": \"%s\"",
+			             ni == 0 ? "" : ",", node->hostname);
+			if (n < 0 || (size_t)n >= cap - off)
+				return TC_ERR_NOSPACE;
+			off += (size_t)n;
+			if (node->ipv4[0] != '\0') {
+				n = snprintf(out + off, cap - off,
+				             ",\n\t\t\t\t\t\t\"IPv4\": \"%s\"",
+				             node->ipv4);
+				if (n < 0 || (size_t)n >= cap - off)
+					return TC_ERR_NOSPACE;
+				off += (size_t)n;
+			}
+			if (node->ipv6[0] != '\0') {
+				n = snprintf(out + off, cap - off,
+				             ",\n\t\t\t\t\t\t\"IPv6\": \"%s\"",
+				             node->ipv6);
+				if (n < 0 || (size_t)n >= cap - off)
+					return TC_ERR_NOSPACE;
+				off += (size_t)n;
+			}
+			n = snprintf(out + off, cap - off, "\n\t\t\t\t\t}");
+			if (n < 0 || (size_t)n >= cap - off)
+				return TC_ERR_NOSPACE;
+			off += (size_t)n;
+		}
+		n = snprintf(out + off, cap - off, "\n\t\t\t\t]\n\t\t\t}");
+		if (n < 0 || (size_t)n >= cap - off)
+			return TC_ERR_NOSPACE;
+		off += (size_t)n;
+	}
+	if (k->pub.num_regions > 0) {
+		n = snprintf(out + off, cap - off, "\n\t\t]");
 		if (n < 0 || (size_t)n >= cap - off)
 			return TC_ERR_NOSPACE;
 		off += (size_t)n;

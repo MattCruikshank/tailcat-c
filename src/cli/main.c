@@ -27,6 +27,12 @@
 #include "tc/addr.h"
 #include "tc/allowlist.h"
 #include "tc/browser.h"
+
+#ifdef __COSMOPOLITAN__
+/* For GetProgramExecutableName, which is how a fat APE learns its own path
+ * on whichever of the six systems it woke up on. */
+#include <cosmo.h>
+#endif
 #include "tc/dnsaddr.h"
 #include "tc/dropbox.h"
 #include "tc/authkeys.h"
@@ -171,17 +177,25 @@ static void usage(FILE *f)
 	        "clients need no map\n"
 	        "      --allow KEYS      comma-separated client nodekey: list "
 	        "for serve, or \"none\"\n"
+	        "      --serve LIST      serve these ports and services, as the "
+	        "serve subcommand takes them\n"
+	        "      --json            print {\"listenAddr\": ...} on stdout "
+	        "when serving\n"
 	        "      --files DIR[:MODE]\n"
 	        "                        for serve files: the directory, and ro "
-	        "(default), rw, wo or wo+\n"
+	        "(default), rw, wo or wo+.\n"
+	        "                        Giving it implies the files service; "
+	        "with no directory,\n"
+	        "                        the current one is served read-only\n"
 	        "      --accept-dirs     for recv: take directory trees. Senders "
 	        "then keep their own\n"
 	        "                        names and can tell a directory "
 	        "exists\n"
-	        "      --ssh-authorized-keys SPEC\n"
+	        "      --ssh-authorized-keys SPEC[,SPEC...]\n"
 	        "                        for serve ssh: a file, a literal "
 	        "ssh-ed25519 key,\n"
-	        "                        or user@github. Repeatable.\n"
+	        "                        or user@github. Comma-separated, and "
+	        "repeatable.\n"
 	        "      --skip-dns-safety-check\n"
 	        "                        for ssh: do not probe a DNS-named server for\n"
 	        "                        whether it admits strangers\n"
@@ -191,6 +205,9 @@ static void usage(FILE *f)
 	        "local listener, as browse does\n"
 	        "      --bind ADDR       listen address for forward and socks "
 	        "(default 127.0.0.1)\n"
+	        "      --listen [ADDR]:PORT\n"
+	        "                        the same, upstream's spelling for socks, "
+	        "with a port\n"
 	        "  -p, PORT              server port for ssh and cp (default 22)\n"
 	        "      --key NAME        saved identity to use, or \"new\" for "
 	        "an ephemeral one\n"
@@ -2048,8 +2065,18 @@ static bool recv_on_accept(void *ctx, tc_ssh_request_type type,
                            const char *arg)
 {
 	const serve_state *st = (const serve_state *)ctx;
-	if (st != NULL && st->ssh_shell)
+	if (st != NULL && st->ssh_shell) {
+		/* A shell server answers `sftp` too, with the same reach the shell
+		 * has, which is what upstream does: `scp` and `sftp` against an ssh
+		 * server are the ordinary way to move a file, and refusing them
+		 * while offering a shell is an inconsistency a user has to work
+		 * around with `cat`. A forced command is the exception -- it
+		 * replaces everything, so there is no shell whose access to
+		 * match. */
+		if (type == TC_SSH_REQ_SUBSYSTEM)
+			return strcmp(arg, "sftp") == 0 && st->ssh_forced == NULL;
 		return type == TC_SSH_REQ_SHELL || type == TC_SSH_REQ_EXEC;
+	}
 	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0)
 		return true;
 	vlogf("recv: refused a request for %s", arg);
@@ -2063,6 +2090,19 @@ static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 	(void)type;
 	(void)arg;
 
+	if (st->ssh_shell && type == TC_SSH_REQ_SUBSYSTEM) {
+		/* The sftp subsystem of a shell server: the whole filesystem, with
+		 * relative paths against the user's home, because that is what the
+		 * shell on the other branch would give them. */
+		static tc_fileserv fs;
+		int rc = tc_fileserv_open_shell(&fs, getenv("HOME"));
+		if (rc != TC_OK) {
+			fprintf(stderr, "tailcat-c: cannot serve files over ssh\n");
+			return rc;
+		}
+		return tc_fileserv_serve(&fs, s);
+	}
+
 	if (st->ssh_shell) {
 		/* The server pointer is what lets recv_read run the shell's pump
 		 * while it waits for tunnel bytes; without it a command's output
@@ -2073,10 +2113,16 @@ static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 		if (st->ssh_forced != NULL) {
 			so.command = st->ssh_forced;
 			so.forced = true;
-			if (type == TC_SSH_REQ_EXEC && arg[0] != '\0')
-				vlogf("ssh: ignoring \"%s\"; this server has a forced "
-				      "command",
+			if (type == TC_SSH_REQ_EXEC && arg[0] != '\0') {
+				/* Not discarded: the forced command gets it as
+				 * SSH_ORIGINAL_COMMAND, which is how one dispatches on
+				 * what was asked without letting the client choose what
+				 * runs. */
+				so.original_command = arg;
+				vlogf("ssh: the client asked for \"%s\"; running the "
+				      "forced command with it in SSH_ORIGINAL_COMMAND",
 				      arg);
+			}
 		} else if (type == TC_SSH_REQ_EXEC && arg[0] != '\0') {
 			so.command = arg;
 		}
@@ -2605,18 +2651,38 @@ static const char *config_dir(void)
 		(void)snprintf(buf, sizeof buf, "%s", v);
 		return buf;
 	}
-	/* Windows, where an APE may well be running. */
-	if ((v = getenv("AppData")) != NULL && v[0] != '\0') {
-		(void)snprintf(buf, sizeof buf, "%s", v);
-		return buf;
+	/* Windows, where an APE may well be running.
+	 *
+	 * Both spellings, because Windows environment variables are
+	 * case-insensitive and ours is not. Go reads this through
+	 * GetEnvironmentVariable, so upstream finds it however it is spelled;
+	 * Cosmopolitan's getenv matches exactly, and what is actually exported
+	 * is APPDATA. Looking for only "AppData" missed it, and every Windows
+	 * key went to ~/.config while the real tailcat used %AppData%. That was
+	 * bug 48 -- observed on the machine this was written on, which is the
+	 * only reason it was not another untested platform claim. */
+	if (tc_host_os() == TC_OS_WINDOWS) {
+		if ((v = getenv("APPDATA")) == NULL || v[0] == '\0')
+			v = getenv("AppData");
+		if (v != NULL && v[0] != '\0') {
+			(void)snprintf(buf, sizeof buf, "%s", v);
+			return buf;
+		}
 	}
 	if ((v = getenv("HOME")) == NULL || v[0] == '\0')
 		return NULL;
-#ifdef __APPLE__
-	(void)snprintf(buf, sizeof buf, "%s/Library/Application Support", v);
-#else
-	(void)snprintf(buf, sizeof buf, "%s/.config", v);
-#endif
+	/* Asked at runtime, because this binary is one file that starts on six
+	 * systems and the answer differs on one of them. It was `#ifdef
+	 * __APPLE__`, which cosmocc does not define at all, so the macOS branch
+	 * was dead in every shipped build: keys went to ~/.config there while
+	 * the real tailcat used ~/Library/Application Support, and the two
+	 * implementations could not read each other's saved keys on that
+	 * platform. That was bug 46, and tc/browser.h had already written down
+	 * the rule it broke. */
+	if (tc_host_os() == TC_OS_MACOS)
+		(void)snprintf(buf, sizeof buf, "%s/Library/Application Support", v);
+	else
+		(void)snprintf(buf, sizeof buf, "%s/.config", v);
 	return buf;
 }
 
@@ -2764,13 +2830,59 @@ static int list_keys(void)
 	return 0;
 }
 
+/* list_regions prints the relay regions and their codes.
+ *
+ * Its own function because `--region=list` generates nothing: it is a
+ * question, and answering it needs no key to write the answer into. It used
+ * to live in the middle of key generation, below the check that demands
+ * --key, so upstream's own `genkey --region=list` was an error here. */
+static int list_regions(const char *derpmap_url, bool insecure)
+{
+	static tc_derp_map m;
+	if (tc_derpmap_fetch(&m, derpmap_url, insecure, 15000) != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_derpmap_error_string());
+		return 1;
+	}
+	for (size_t i = 0; i < m.num_regions; i++)
+		printf("%4lld %-6s %s\n", (long long)m.regions[i].region_id,
+		       m.regions[i].region_code, m.regions[i].region_name);
+	return 0;
+}
+
 static int cmd_genkey(const char *key_spec, bool client, bool force,
                       bool delete_it, bool list, const char *region,
-                      bool fixed_region, bool psk, bool insecure,
-                      const char *derpmap_url)
+                      bool fixed_region, bool embed_map, bool psk,
+                      bool insecure, const char *derpmap_url)
 {
+	/* Embedding bakes one region's nodes into the key, so there has to be a
+	 * region to bake. "auto" is the one value that cannot be embedded,
+	 * because it means "decide at startup", and a hostname in --region is
+	 * already embedded by definition. Both are refused by name rather than
+	 * silently producing an address without the nodes in it. */
+	if (embed_map && region != NULL) {
+		if (strcmp(region, "auto") == 0 && !fixed_region) {
+			/* Upstream implies --fixed-region here rather than failing,
+			 * which is the kinder reading of what was asked: embedding is
+			 * a request for a decided region. */
+			fixed_region = true;
+		}
+		if (strchr(region, '.') != NULL) {
+			fprintf(stderr,
+			        "tailcat-c: --embed-derp-map does not take relay "
+			        "hostnames in --region; naming hosts already embeds "
+			        "them\n");
+			return 2;
+		}
+	}
+	if (embed_map && client) {
+		fprintf(stderr, "tailcat-c: a client key has no region to embed\n");
+		return 2;
+	}
 	if (list)
 		return list_keys();
+
+	if (region != NULL && strcmp(region, "list") == 0)
+		return list_regions(derpmap_url, insecure);
 
 	if (key_spec == NULL || key_spec[0] == '\0') {
 		fprintf(stderr, "tailcat-c: genkey needs --key <name-or-path>\n");
@@ -2850,18 +2962,6 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 	}
 
 	if (region != NULL && strcmp(region, "auto") != 0 && !client) {
-		if (strcmp(region, "list") == 0) {
-			static tc_derp_map m;
-			if (tc_derpmap_fetch(&m, derpmap_url, insecure, 15000) != TC_OK) {
-				fprintf(stderr, "tailcat-c: %s\n",
-				        tc_derpmap_error_string());
-				return 1;
-			}
-			for (size_t i = 0; i < m.num_regions; i++)
-				printf("%4lld %-6s %s\n", (long long)m.regions[i].region_id,
-				       m.regions[i].region_code, m.regions[i].region_name);
-			return 0;
-		}
 		char *end = NULL;
 		long v = strtol(region, &end, 10);
 		if (end != NULL && *end == '\0' && v > 0 && v < 65536) {
@@ -2892,6 +2992,50 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 	if (tc_keyfile_generate(&k, psk, region_id) != TC_OK) {
 		fprintf(stderr, "tailcat-c: %s\n", tc_keyfile_error_string());
 		return 1;
+	}
+
+	if (embed_map) {
+		/* Put the region's relay hostnames in the key itself, so every
+		 * address it produces is self-contained and a client needs no DERP
+		 * map fetch to reach us. `serve --full-address` does the same thing
+		 * at serve time; this bakes it in once.
+		 *
+		 * Two nodes at most and no IPv6, which is what upstream stores: an
+		 * address is pasted into chat windows and read aloud, and every
+		 * byte of it is one somebody has to carry. Two relays in a region
+		 * is enough redundancy to be worth having; the rest is length. */
+		if (region_id <= 0) {
+			fprintf(stderr, "tailcat-c: --embed-derp-map needs a region; "
+			                "use --fixed-region or --region <name>\n");
+			return 1;
+		}
+		static tc_derp_map em;
+		if (tc_derpmap_fetch(&em, derpmap_url, insecure, 15000) != TC_OK) {
+			fprintf(stderr, "tailcat-c: %s\n", tc_derpmap_error_string());
+			return 1;
+		}
+		const tc_derp_region *found = NULL;
+		for (size_t i = 0; i < em.num_regions; i++)
+			if (em.regions[i].region_id == region_id)
+				found = &em.regions[i];
+		if (found == NULL) {
+			fprintf(stderr,
+			        "tailcat-c: no relay region %lld in the map, so there "
+			        "is nothing to embed\n",
+			        (long long)region_id);
+			return 1;
+		}
+		tc_derp_region *dst = &k.pub.regions[0];
+		*dst = *found; /* including its ID, which upstream also records */
+		if (dst->num_nodes > 2)
+			dst->num_nodes = 2;
+		for (size_t i = 0; i < dst->num_nodes; i++)
+			dst->nodes[i].ipv6[0] = '\0';
+		k.pub.num_regions = 1;
+		/* The region ID goes, because the nodes replace it: an address
+		 * carries one or the other, and carrying both would say the same
+		 * thing twice and disagree if the map ever moved. */
+		k.pub.region_id = 0;
 	}
 
 	static char out[4096];
@@ -4919,10 +5063,10 @@ static pid_t spawn_with_proxy(const char *const *argv, const char *bind_addr,
 
 static int cmd_forward_or_socks(const char *addr_str, const char **specs,
                                 size_t nspecs, const char *bind_addr,
-                                bool socks, const char *const *child_argv,
-                                bool insecure, unsigned timeout_s,
-                                const char *derpmap_url, const char *key_spec,
-                                bool open_browser)
+                                uint16_t listen_port, bool socks,
+                                const char *const *child_argv, bool insecure,
+                                unsigned timeout_s, const char *derpmap_url,
+                                const char *key_spec, bool open_browser)
 {
 	static server_set set;
 	memset(&set, 0, sizeof set);
@@ -4941,7 +5085,9 @@ static int cmd_forward_or_socks(const char *addr_str, const char **specs,
 	/* Bind before dialling out: a port already in use should fail now,
 	 * cheaply, rather than after a handshake with a relay. */
 	if (socks) {
-		uint16_t want = 0;
+		/* `--listen :1080` names the port; a spec argument names it too, and
+		 * the spec wins because it is the more specific of the two. */
+		uint16_t want = listen_port;
 		if (nspecs > 0) {
 			tc_fwd_spec f;
 			if (tc_fwd_parse(&f, specs[0]) != TC_OK) {
@@ -5095,12 +5241,25 @@ out:
  *
  * argv[0] is not enough on its own: a program found through PATH gets a bare
  * name, and ssh runs the ProxyCommand through a shell whose PATH may differ.
- * /proc/self/exe is exact where it exists; otherwise argv[0] is used, and a
- * bare name is left for the shell to resolve as the user's own PATH would. */
+ *
+ * Cosmopolitan works the exact path out at startup on every platform it
+ * targets, which is better than anything asked here could be. This used to
+ * read /proc/self/exe under `#ifdef __linux__` -- a macro cosmocc does not
+ * define -- so the lookup never ran in any shipped build, on Linux either,
+ * and the "not enough on its own" fallback was the only path taken. Bug 47.
+ *
+ * The host build keeps the /proc reading, because there the compile-time
+ * question really is settled at build time. */
 static const char *self_path(const char *argv0)
 {
 	static char buf[1024];
-#ifdef __linux__
+#ifdef __COSMOPOLITAN__
+	const char *exe = GetProgramExecutableName();
+	if (exe != NULL && exe[0] != '\0') {
+		(void)snprintf(buf, sizeof buf, "%s", exe);
+		return buf;
+	}
+#else
 	ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
 	if (n > 0) {
 		buf[n] = '\0';
@@ -5365,7 +5524,7 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      files_mode mode, const char *const *exec_argv,
                      bool ssh_shell, bool ssh_no_auth,
                      const tc_authkeys *ssh_keys,
-                     const char *const *ssh_forced_argv)
+                     const char *const *ssh_forced_argv, bool json_out)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -5437,8 +5596,15 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		 * address.
 		 *
 		 * Zero means the file named no region, which is the same as
-		 * upstream's -1: choose by latency at startup. */
-		if (ci.region_id == 0)
+		 * upstream's -1: choose by latency at startup. Unless the file
+		 * embedded the relay's nodes instead, which is what
+		 * `genkey --embed-derp-map` writes -- there the region is named by
+		 * its hostnames and the ID is deliberately absent, so re-measuring
+		 * would replace a decided relay with whichever is nearest today and
+		 * publish an address the embedded one no longer matches. That was
+		 * bug 45, and it applied to upstream's key files before this
+		 * program could write one. */
+		if (ci.region_id == 0 && ci.num_regions == 0)
 			ci.region_id = -1;
 		if (ensure_relay(&ci, derpmap_url, insecure, 15000) != TC_OK)
 			return 1;
@@ -5457,7 +5623,18 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 	 * fetch and works with no DNS at all. */
 	static tc_conn_info advertised;
 	advertised = ci;
-	if (!full_address && ci.num_regions > 0 && ci.regions[0].region_id > 0) {
+	/* A saved key that carries its relay's nodes was made with
+	 * `genkey --embed-derp-map`, and the whole point of that flag is that
+	 * every address it produces is self-contained. Collapsing it back to a
+	 * region number here would undo it silently.
+	 *
+	 * The test has to be on the *key*, not on the resolved region: upstream
+	 * writes the region's ID inside the embedded region, so "there is an
+	 * inner region_id" does not distinguish an embedded key from one whose
+	 * region was measured at startup. That was the second half of bug 45. */
+	bool key_embedded = have_saved && saved.pub.num_regions > 0;
+	if (!full_address && !key_embedded && ci.num_regions > 0 &&
+	    ci.regions[0].region_id > 0) {
 		advertised.region_id = ci.regions[0].region_id;
 		advertised.num_regions = 0;
 	} else {
@@ -5527,6 +5704,21 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 	else
 		fprintf(stderr, "# listening with new address: %s\n", addr);
 	fflush(stderr);
+
+	/* The address again, on stdout, for something that is going to read it
+	 * rather than look at it. The comment lines above are shaped for a
+	 * person and are free to change; this is not. Upstream emits exactly
+	 * this object, so a script written against either works with both.
+	 *
+	 * An address is base64url and needs no JSON escaping, but it goes
+	 * through the escaper anyway: "this string happens not to need
+	 * escaping" is a property of today's address format, not of JSON. */
+	if (json_out) {
+		char esc[TC_ADDR_STR_MAX * 2 + 8];
+		if (tc_json_escape(esc, sizeof esc, addr) == TC_OK)
+			printf("{\"listenAddr\":\"%s\"}\n", esc);
+		fflush(stdout);
+	}
 
 	int status = 1;
 	tc_tcp_mux *mux = NULL;
@@ -5902,12 +6094,26 @@ int main(int argc, char **argv)
 	const char *relay = NULL;
 	/* NULL means the built-in default; --derpmap-url overrides, matching
 	 * upstream's flag of the same name. */
-	const char *derpmap_url = NULL;
+	/* Upstream takes this from the environment as the default, so a fleet
+	 * running its own relays can point every invocation at its own map
+	 * without editing each command line. The flag still wins. */
+	const char *derpmap_url = getenv("TAILCAT_DERPMAP_URL");
+	if (derpmap_url != NULL && derpmap_url[0] == '\0')
+		derpmap_url = NULL;
 	/* Loopback by default. Listening on the network is a decision with
 	 * consequences -- anyone who can reach this machine can then reach the
 	 * server through it -- so it has to be asked for. */
 	const char *bind_addr = "127.0.0.1";
+	/* `--json`: the address as {"listenAddr": ...} on stdout, for a script
+	 * that would otherwise have to parse a comment line meant for people. */
+	bool json_out = false;
+	/* `--serve=<list>`: upstream's root-flag spelling of the serve
+	 * subcommand's arguments. */
+	const char *serve_flag = NULL;
 	bool open_browser = false;
+	/* A port from `--listen addr:port`. Zero means "as before", which for
+	 * socks is an OS-assigned port. */
+	uint16_t listen_port = 0;
 	/* `recv --accept-dirs`: the recursive drop box. See tc/dropbox.h for what
 	 * it trades away. */
 	bool accept_dirs = false;
@@ -5934,6 +6140,9 @@ int main(int argc, char **argv)
 	bool gk_client = false, gk_force = false, gk_delete = false;
 	bool gk_list = false, gk_psk = true;
 	bool gk_fixed_region = false;
+	/* `genkey --embed-derp-map`: put the region's relay hostnames in the
+	 * saved key, so every address it produces is self-contained. */
+	bool gk_embed = false;
 	const char *gk_region = "auto";
 	/* Upstream's default address names a region by number; --full-address
 	 * embeds the relay so a client needs no DERP map at all. */
@@ -6108,22 +6317,53 @@ int main(int argc, char **argv)
 			gk_psk = !BOOL_VAL(true);
 		} else if (strcmp(a, "--fixed-region") == 0) {
 			gk_fixed_region = BOOL_VAL(true);
+		} else if (strcmp(a, "--embed-derp-map") == 0) {
+			gk_embed = BOOL_VAL(true);
 		} else if (strcmp(a, "--ssh-authorized-keys") == 0) {
 			/* Remembered, not resolved. One of the three forms is an HTTPS
 			 * request to github.com, and a flag on a command that will
 			 * never use it must not cause one -- see resolve_ssh_keys.
 			 *
-			 * Repeatable, and each one adds to the list. Upstream takes a
-			 * single argument; accepting several is strictly more useful
-			 * and cannot mean anything else, since the list is a union
-			 * either way. */
+			 * Upstream's value is a *comma-separated* list of sources, and
+			 * that is the spelling its README shows. Ours is also
+			 * repeatable, which cannot mean anything different since the
+			 * result is a union either way.
+			 *
+			 * A comma cannot appear in any of the three source forms: a
+			 * GitHub username is alphanumerics and hyphens, a literal key
+			 * is base64, and a path containing a comma is a path nobody
+			 * writes. Splitting is therefore unambiguous. */
 			NEED_VAL();
-			if (nkeyspecs >= sizeof keyspecs / sizeof keyspecs[0]) {
-				fprintf(stderr, "tailcat-c: too many "
-				                "--ssh-authorized-keys\n");
-				return 2;
+			{
+				const char *p = val;
+				while (*p != '\0') {
+					const char *comma = strchr(p, ',');
+					size_t len = comma != NULL ? (size_t)(comma - p)
+					                           : strlen(p);
+					if (len > 0) {
+						if (nkeyspecs >=
+						    sizeof keyspecs / sizeof keyspecs[0]) {
+							fprintf(stderr, "tailcat-c: too many "
+							                "--ssh-authorized-keys\n");
+							return 2;
+						}
+						static char store[16][512];
+						if (len >= sizeof store[0]) {
+							fprintf(stderr, "tailcat-c: that "
+							                "--ssh-authorized-keys source "
+							                "is too long\n");
+							return 2;
+						}
+						memcpy(store[nkeyspecs], p, len);
+						store[nkeyspecs][len] = '\0';
+						keyspecs[nkeyspecs] = store[nkeyspecs];
+						nkeyspecs++;
+					}
+					if (comma == NULL)
+						break;
+					p = comma + 1;
+				}
 			}
-			keyspecs[nkeyspecs++] = val;
 		} else if (strcmp(a, "--files") == 0) {
 			/* Upstream's spelling, suffix and all: `--files /srv/pub:rw`.
 			 * The directory is remembered here and only takes effect when
@@ -6160,9 +6400,34 @@ int main(int argc, char **argv)
 					files_dir = trimmed;
 				}
 			}
-		} else if (strcmp(a, "--bind") == 0) {
+		} else if (strcmp(a, "--bind") == 0 || strcmp(a, "--listen") == 0) {
+			/* Two names for one thing, because upstream uses `--bind` for
+			 * `forward` and `--listen` for `socks`, and a reader copying
+			 * either from its README should not have to know which. Ours
+			 * takes a bare address for both; upstream's `--listen` also
+			 * accepts `address:port`, so a value with a colon is split. */
 			NEED_VAL();
-			bind_addr = val;
+			const char *colon = strrchr(val, ':');
+			if (colon != NULL && colon != val) {
+				static char host[64];
+				size_t hlen = (size_t)(colon - val);
+				if (hlen >= sizeof host) {
+					fprintf(stderr, "tailcat-c: that listen address is too "
+					                "long\n");
+					return 2;
+				}
+				memcpy(host, val, hlen);
+				host[hlen] = '\0';
+				bind_addr = host;
+				if (!port_arg(colon + 1, &listen_port))
+					return 2;
+			} else if (colon == val) {
+				/* ":8080" -- a bare port means localhost, as upstream says. */
+				if (!port_arg(colon + 1, &listen_port))
+					return 2;
+			} else {
+				bind_addr = val;
+			}
 		} else if (strcmp(a, "--accept-dirs") == 0) {
 			/* Upstream's spelling for `recv`. It is the same thing as
 			 * `--files <dir>:wo+`, and upstream describes the trade in the
@@ -6170,6 +6435,16 @@ int main(int argc, char **argv)
 			 * which is the right instinct: this is the flag that gives part
 			 * of the guarantee away. */
 			accept_dirs = BOOL_VAL(true);
+		} else if (strcmp(a, "--serve") == 0) {
+			/* Upstream's root flag: the same list the `serve` subcommand
+			 * takes as arguments, so `tailcat --serve=80 <addr>`-shaped
+			 * invocations and scripts written against it work. Stored
+			 * whole; the serve dispatch splits it exactly as it splits the
+			 * positional arguments, so there is one parser for one syntax. */
+			NEED_VAL();
+			serve_flag = val;
+		} else if (strcmp(a, "--json") == 0) {
+			json_out = BOOL_VAL(true);
 		} else if (strcmp(a, "--open-browser") == 0) {
 			open_browser = BOOL_VAL(true);
 		} else if (strcmp(a, "--until-direct") == 0) {
@@ -6221,6 +6496,20 @@ int main(int argc, char **argv)
 #undef BOOL_VAL
 	}
 
+	/* `--serve=<list>` and `--files=<dir>` are upstream's flag spellings of
+	 * what the `serve` subcommand takes as arguments, so either of them
+	 * means a server was asked for. Rewritten into the subcommand form
+	 * here, above the guards below, because those guards ask "is this a
+	 * serve?" and have to see the answer this makes true.
+	 *
+	 * Rewriting rather than handling separately: one syntax deserves one
+	 * parser, and the alternative is two places that must agree about what
+	 * "all" means. */
+	if (nargs == 0 && (serve_flag != NULL || files_dir != NULL)) {
+		args[0] = "serve";
+		nargs = 1;
+	}
+
 	/* --files means something only to `serve ... files`. Anywhere else it
 	 * would be accepted and ignored, which is how someone ends up believing
 	 * a server is sharing a directory it has never opened. Checked here
@@ -6243,6 +6532,12 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	/* `--serve=<list>` and `--files=<dir>` are upstream's flag spellings of
+	 * what the `serve` subcommand takes as arguments. Either of them means
+	 * a server was asked for, so a bare invocation carrying one is not the
+	 * one-shot pipe below. Rewritten into the subcommand form rather than
+	 * handled separately: one syntax deserves one parser, and the
+	 * alternative is two places that must agree about what "all" means. */
 	if (nargs == 0) {
 		/* A bare invocation is a server, as upstream's is: it prints an
 		 * address, waits for one connection, and pipes it to stdout.
@@ -6261,7 +6556,8 @@ int main(int argc, char **argv)
 			timeout_s = 60;
 		return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
 		                 key_spec, full_address, false, &allow, NULL,
-		                 TC_FILES_RO, NULL, false, false, NULL, NULL);
+		                 TC_FILES_RO, NULL, false, false, NULL, NULL,
+		                 json_out);
 	}
 	/* Outside the port server, a deadline of zero would mean "give up at
 	 * once", which nobody asks for by typing --timeout 0. */
@@ -6304,18 +6600,50 @@ int main(int argc, char **argv)
 		                until_direct);
 	}
 	if (strcmp(args[0], "serve") == 0) {
-		if (nargs == 1) {
-			if (files_dir != NULL) {
-				fprintf(stderr,
-				        "tailcat-c: --files names a directory but the "
-				        "service list does not include \"files\"\n");
+		/* The services asked for, from the arguments and from `--serve`,
+		 * which is the same list under a flag. `--files` adds `files` to it,
+		 * because upstream says giving the directory implies the service --
+		 * and being told to name it twice is a rule with no purpose. */
+		const char *svc[32];
+		size_t nsvc = 0;
+		for (size_t i = 1; i < nargs && nsvc < 30; i++)
+			svc[nsvc++] = args[i];
+		if (serve_flag != NULL) {
+			static char split[512];
+			if ((size_t)snprintf(split, sizeof split, "%s", serve_flag) >=
+			    sizeof split) {
+				fprintf(stderr, "tailcat-c: that --serve list is too "
+				                "long\n");
 				return 2;
 			}
+			char *p = split;
+			while (*p != '\0' && nsvc < 30) {
+				char *comma = strchr(p, ',');
+				if (comma != NULL)
+					*comma = '\0';
+				if (*p != '\0')
+					svc[nsvc++] = p;
+				if (comma == NULL)
+					break;
+				p = comma + 1;
+			}
+		}
+		if (files_dir != NULL) {
+			bool named = false;
+			for (size_t i = 0; i < nsvc; i++)
+				if (strcmp(svc[i], "files") == 0)
+					named = true;
+			if (!named && nsvc < 30)
+				svc[nsvc++] = "files";
+		}
+
+		if (nsvc == 0) {
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
 			                 key_spec, full_address, false, &allow, NULL,
-			                 TC_FILES_RO, NULL, false, false, NULL, NULL);
+			                 TC_FILES_RO, NULL, false, false, NULL, NULL,
+			                 json_out);
 		}
 
 		static tc_portset ports;
@@ -6325,10 +6653,11 @@ int main(int argc, char **argv)
 		bool want_ssh = false;
 		bool ssh_no_auth = false;
 		const char *const *exec_argv = NULL;
-		for (size_t i = 1; i < nargs; i++) {
-			tc_portset_service svc = TC_PORTSET_SVC_NONE;
-			int rc = tc_portset_parse(&ports, args[i], &svc);
-			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_EXIT_NODE) {
+		for (size_t i = 0; i < nsvc; i++) {
+			tc_portset_service svc_kind = TC_PORTSET_SVC_NONE;
+			int rc = tc_portset_parse(&ports, svc[i], &svc_kind);
+			if (rc == TC_ERR_UNSUPPORTED &&
+			    svc_kind == TC_PORTSET_SVC_EXIT_NODE) {
 				/* Implemented, unlike the other named services. It is the
 				 * one that has to be asked for by name rather than implied,
 				 * because it makes this machine a proxy for everything it
@@ -6337,27 +6666,31 @@ int main(int argc, char **argv)
 				continue;
 			}
 			if (rc == TC_ERR_UNSUPPORTED &&
-			    (svc == TC_PORTSET_SVC_SSH ||
-			     svc == TC_PORTSET_SVC_NO_AUTH_SSH)) {
+			    (svc_kind == TC_PORTSET_SVC_SSH ||
+			     svc_kind == TC_PORTSET_SVC_NO_AUTH_SSH)) {
 				want_ssh = true;
-				ssh_no_auth = (svc == TC_PORTSET_SVC_NO_AUTH_SSH);
+				ssh_no_auth = (svc_kind == TC_PORTSET_SVC_NO_AUTH_SSH);
 				continue;
 			}
-			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_FILES) {
+			if (rc == TC_ERR_UNSUPPORTED &&
+			    svc_kind == TC_PORTSET_SVC_FILES) {
 				/* SFTP over SSH on port 22 of the tunnel address, which is
 				 * where scp and sftp look for one. `--files` says which
 				 * directory and in which mode; without it there is nothing
 				 * to serve. */
 				if (files_dir == NULL) {
-					fprintf(stderr,
-					        "tailcat-c: serve files needs a directory: "
-					        "tailcat-c serve --files /srv/pub files\n");
-					return 2;
+					/* Upstream: "If empty, the current directory is served
+					 * read-only." Read-only is the part that makes this
+					 * safe to default: `serve files` in a directory shares
+					 * what is already there and cannot be written to. */
+					files_dir = ".";
+					files_mode_arg = TC_FILES_RO;
 				}
 				want_files = true;
 				continue;
 			}
-			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_EXEC) {
+			if (rc == TC_ERR_UNSUPPORTED &&
+			    svc_kind == TC_PORTSET_SVC_EXEC) {
 				/* Like inetd: every connection runs the command, with the
 				 * connection as its stdin and stdout. The command is
 				 * whatever follows `--`, and without one there is nothing
@@ -6377,7 +6710,7 @@ int main(int argc, char **argv)
 				fprintf(stderr,
 				        "tailcat-c: the \"%s\" service is not implemented "
 				        "here; see the feature table in README.md\n",
-				        tc_portset_service_name(svc));
+				        tc_portset_service_name(svc_kind));
 				return 2;
 			}
 			if (rc != TC_OK) {
@@ -6427,14 +6760,12 @@ int main(int argc, char **argv)
 			return 2;
 		}
 		if (files_dir != NULL && !want_files) {
-			/* A named directory that nothing serves is almost certainly a
-			 * forgotten word rather than a deliberate no-op, and the silent
-			 * version of this is a server whose operator believes it is
-			 * sharing files. */
-			fprintf(stderr,
-			        "tailcat-c: --files names a directory but the service "
-			        "list does not include \"files\"\n");
-			return 2;
+			/* Upstream: "Giving --files implies the 'files' service." Which
+			 * is the right way round -- naming a directory to serve and then
+			 * being told you also have to say `files` is a rule with no
+			 * purpose, and the alternative reading, that the flag was
+			 * ignored, is worse. */
+			want_files = true;
 		}
 		if (want_files && !dir_is_usable(files_dir))
 			return 2;
@@ -6451,7 +6782,7 @@ int main(int argc, char **argv)
 		                 key_spec, full_address, exit_node, &allow,
 		                 want_files ? files_dir : NULL, files_mode_arg,
 		                 exec_argv, want_ssh, ssh_no_auth, &ssh_keys,
-		                 want_ssh ? child_argv : NULL);
+		                 want_ssh ? child_argv : NULL, json_out);
 	}
 	if (strcmp(args[0], "readme") == 0) {
 		/* Upstream embeds its own README.md here. Ours is an engineering log
@@ -6485,7 +6816,7 @@ int main(int argc, char **argv)
 		                 timeout_given ? timeout_s : 0, derpmap_url, key_spec,
 		                 full_address, false, &allow, args[1],
 		                 accept_dirs ? TC_FILES_WO_PLUS : TC_FILES_WO, NULL,
-		                 false, false, NULL, NULL);
+		                 false, false, NULL, NULL, json_out);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {
@@ -6502,7 +6833,7 @@ int main(int argc, char **argv)
 		if (dst == NULL)
 			return 1;
 		return cmd_forward_or_socks(dst, &args[2], nargs - 2, bind_addr,
-		                            false, NULL, insecure,
+		                            listen_port, false, NULL, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, open_browser);
 	}
@@ -6523,7 +6854,8 @@ int main(int argc, char **argv)
 			return 1;
 		return cmd_forward_or_socks(dst, (const char **)(uintptr_t)
 		                                     browse_map,
-		                            1, bind_addr, false, NULL, insecure,
+		                            1, bind_addr, listen_port, false, NULL,
+		                            insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, true);
 	}
@@ -6590,15 +6922,15 @@ int main(int argc, char **argv)
 			if (dst == NULL)
 				return 1;
 		}
-		return cmd_forward_or_socks(dst, specs, nspecs, bind_addr, true,
-		                            child, insecure,
+		return cmd_forward_or_socks(dst, specs, nspecs, bind_addr,
+		                            listen_port, true, child, insecure,
 		                            timeout_given ? timeout_s : 0,
 		                            derpmap_url, key_spec, false);
 	}
 	if (strcmp(args[0], "genkey") == 0) {
 		return cmd_genkey(key_spec, gk_client, gk_force, gk_delete, gk_list,
-		                  gk_region, gk_fixed_region, gk_psk, insecure,
-		                  derpmap_url);
+		                  gk_region, gk_fixed_region, gk_embed, gk_psk,
+		                  insecure, derpmap_url);
 	}
 	if (strcmp(args[0], "printpub") == 0)
 		return cmd_printpub(key_spec);

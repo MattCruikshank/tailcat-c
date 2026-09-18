@@ -64,6 +64,16 @@ typedef struct {
  * above it. */
 int tc_fileserv_open(tc_fileserv *fs, const char *dir, bool writable);
 
+/* tc_fileserv_open_shell serves the whole filesystem read-write, with
+ * relative paths resolved against `home`.
+ *
+ * For the SFTP subsystem of a server that already grants a shell, which is
+ * what upstream does and for the same reason: confining file transfer while
+ * handing out arbitrary command execution protects nothing, and refusing
+ * symlinks would break most real paths. The access is the shell's access,
+ * stated once, here. */
+int tc_fileserv_open_shell(tc_fileserv *fs, const char *home);
+
 /* tc_fileserv_handle_req answers one request. Refusals are statuses, not
  * failures: see tc/sftpserve.h. */
 int tc_fileserv_handle_req(tc_fileserv *fs, const tc_sftp_request *req,

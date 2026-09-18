@@ -17,7 +17,19 @@
  * something more interesting than it is. */
 #define OFLAGS(x) ((int)(unsigned)(x))
 
+static int rootdir_open(tc_rootdir *r, const char *dir, bool unconfined);
+
 int tc_rootdir_open(tc_rootdir *r, const char *dir)
+{
+	return rootdir_open(r, dir, false);
+}
+
+int tc_rootdir_open_unconfined(tc_rootdir *r, const char *dir)
+{
+	return rootdir_open(r, dir, true);
+}
+
+static int rootdir_open(tc_rootdir *r, const char *dir, bool unconfined)
 {
 	if (r == NULL || dir == NULL)
 		return TC_ERR_INVAL;
@@ -31,7 +43,21 @@ int tc_rootdir_open(tc_rootdir *r, const char *dir)
 	if (fd < 0)
 		return TC_ERR_INVAL;
 	r->fd = fd;
+	r->unconfined = unconfined;
 	return TC_OK;
+}
+
+/* open_loose resolves a path the way the shell would: relative to the working
+ * directory, absolute if it says so, following whatever it points at. */
+static int open_loose(const tc_rootdir *r, const char *path, bool want_dir,
+                      int flags)
+{
+	int f = want_dir ? OFLAGS(O_RDONLY | O_DIRECTORY) : flags;
+	if (path[0] == '/')
+		return open(path, f, 0600);
+	if (path[0] == '\0' || strcmp(path, ".") == 0)
+		return dup(r->fd);
+	return openat(r->fd, path, f, 0600);
 }
 
 void tc_rootdir_close(tc_rootdir *r)
@@ -122,6 +148,9 @@ int tc_rootdir_resolve(const tc_rootdir *r, const char *path, bool want_dir,
 		return -1;
 	}
 
+	if (r->unconfined)
+		return open_loose(r, path, want_dir, flags);
+
 	const char *parts[TC_ROOTDIR_MAX_DEPTH];
 	size_t lens[TC_ROOTDIR_MAX_DEPTH];
 	size_t n = 0;
@@ -163,6 +192,35 @@ int tc_rootdir_parent(const tc_rootdir *r, const char *path, char *name,
 	if (r == NULL || r->fd < 0 || path == NULL || name == NULL) {
 		errno = EINVAL;
 		return -1;
+	}
+
+	if (r->unconfined) {
+		/* Split on the last separator and open the directory above it, the
+		 * ordinary way. */
+		const char *slash = strrchr(path, '/');
+		const char *base = slash != NULL ? slash + 1 : path;
+		if (base[0] == '\0' || strcmp(base, ".") == 0 ||
+		    strcmp(base, "..") == 0) {
+			errno = EINVAL;
+			return -1;
+		}
+		if ((size_t)snprintf(name, name_cap, "%s", base) >= name_cap) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		if (slash == NULL)
+			return dup(r->fd);
+		char dir[TC_SFTP_DIRBUF];
+		size_t dlen = (size_t)(slash - path);
+		if (dlen == 0)
+			return open("/", OFLAGS(O_RDONLY | O_DIRECTORY));
+		if (dlen >= sizeof dir) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		memcpy(dir, path, dlen);
+		dir[dlen] = '\0';
+		return open_loose(r, dir, true, 0);
 	}
 
 	const char *parts[TC_ROOTDIR_MAX_DEPTH];

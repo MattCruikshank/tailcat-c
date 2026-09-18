@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  *
- * A directory a client cannot get out of.
+ * A directory a client cannot get out of -- and, in one deliberate case,
+ * one it can.
  *
  * Two services here let a client name paths -- `serve files`, where it reads
  * them, and the recursive drop box, where it creates them -- and both need
@@ -39,6 +40,18 @@
  * policies, in tc/fileserv.h and tc/dropbox.h. Keeping the two apart is the
  * same reason tc/sftp.h has no opinions -- a change to path handling must not
  * quietly become a change to permissions.
+ *
+ * ---- the case with no fence ---------------------------------------------
+ *
+ * tc_rootdir_open_unconfined resolves paths the ordinary way instead. It
+ * exists for one caller: the SFTP subsystem of a server that already grants a
+ * shell, where confining file transfer would protect nothing -- the client can
+ * run `cat` -- while breaking most real paths, since a filesystem is full of
+ * symlinks. Upstream makes the same choice for the same case.
+ *
+ * It is a field on this struct rather than a separate type so that the two
+ * cannot silently swap places: every caller says which it wants by choosing a
+ * constructor, and the confined one is the one with the short name.
  */
 #ifndef TC_ROOTDIR_H_
 #define TC_ROOTDIR_H_
@@ -54,16 +67,41 @@
 #define TC_ROOTDIR_MAX_NAME 256
 #define TC_ROOTDIR_MAX_DEPTH 64
 
+/* Room for the directory half of a path while it is split off. */
+#define TC_SFTP_DIRBUF 1024
+
 typedef struct {
 	/* The anchor every path is resolved from. Holding it open is what stops
 	 * the tree being swapped underneath a running session by renaming a
 	 * directory above it. */
 	int fd;
 	char path[1024];
+
+	/* Resolve paths normally instead: follow symlinks, and let a path leave
+	 * the directory.
+	 *
+	 * This is not a hole in the fence; it is for the case with no fence. A
+	 * shell server serves SFTP with the same reach the shell already has --
+	 * upstream does the same, and confining the file transfer while handing
+	 * out arbitrary command execution would protect nothing while breaking
+	 * every path through a symlink, which on a real filesystem is most of
+	 * them.
+	 *
+	 * It is a separate field rather than "root is /" precisely so the two
+	 * cannot be confused: a *confined* server rooted at / would still refuse
+	 * symlinks, and that is a different and legitimate thing to want. */
+	bool unconfined;
 } tc_rootdir;
 
-/* tc_rootdir_open holds `dir` open for the session. */
+/* tc_rootdir_open holds `dir` open for the session, confining every path to
+ * it. */
 int tc_rootdir_open(tc_rootdir *r, const char *dir);
+
+/* tc_rootdir_open_unconfined resolves paths against `dir` without confining
+ * them: an absolute path is absolute, `..` climbs, and symlinks are followed.
+ *
+ * Only for a session that already has a shell. See the `unconfined` field. */
+int tc_rootdir_open_unconfined(tc_rootdir *r, const char *dir);
 void tc_rootdir_close(tc_rootdir *r);
 
 /* tc_rootdir_resolve opens what `path` names, beneath the root, without

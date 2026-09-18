@@ -28,7 +28,8 @@
 #define FX_PERMISSION_DENIED 3
 #define FX_FAILURE 4
 
-int tc_fileserv_open(tc_fileserv *fs, const char *dir, bool writable)
+static int fileserv_open(tc_fileserv *fs, const char *dir, bool writable,
+                         bool unconfined)
 {
 	if (fs == NULL || dir == NULL)
 		return TC_ERR_INVAL;
@@ -36,12 +37,27 @@ int tc_fileserv_open(tc_fileserv *fs, const char *dir, bool writable)
 	for (size_t i = 0; i < TC_FILESERV_MAX_HANDLES; i++)
 		fs->h[i].fd = -1;
 
-	int rc = tc_rootdir_open(&fs->root, dir);
+	int rc = unconfined ? tc_rootdir_open_unconfined(&fs->root, dir)
+	                    : tc_rootdir_open(&fs->root, dir);
 	if (rc != TC_OK)
 		return rc;
 	fs->writable = writable;
 	fs->next_handle = 1;
 	return TC_OK;
+}
+
+int tc_fileserv_open(tc_fileserv *fs, const char *dir, bool writable)
+{
+	return fileserv_open(fs, dir, writable, false);
+}
+
+int tc_fileserv_open_shell(tc_fileserv *fs, const char *home)
+{
+	/* Read-write, because the shell can write. Falling back to "/" keeps a
+	 * session on a machine with no home directory working rather than
+	 * failing at the first relative path. */
+	const char *cwd = (home != NULL && home[0] != '\0') ? home : "/";
+	return fileserv_open(fs, cwd, true, true);
 }
 
 void tc_fileserv_close(tc_fileserv *fs)
