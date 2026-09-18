@@ -29,7 +29,10 @@
 #include "tc/browser.h"
 #include "tc/dnsaddr.h"
 #include "tc/dropbox.h"
+#include "tc/authkeys.h"
+#include "tc/http.h"
 #include "tc/fileserv.h"
+#include "tc/shellsrv.h"
 #include "tc/duration.h"
 #include "tc/sshclient.h"
 #include "tc/crypto.h"
@@ -115,6 +118,13 @@ static void usage(FILE *f)
 	        "<dir>; the sender picks\n"
 	        "                                          no names, overwrites "
 	        "nothing, reads nothing\n"
+	        "  tailcat-c serve --files <dir> files      share <dir> over "
+	        "sftp; add :rw to allow writes\n"
+	        "  tailcat-c serve --ssh-authorized-keys <spec> ssh\n"
+	        "                                          a shell, for the keys "
+	        "in <spec>\n"
+	        "  tailcat-c serve no-auth-ssh             a shell for ANYONE "
+	        "holding the address\n"
 	        "  tailcat-c forward <tc-addr> <maps>      forward local ports, "
 	        "e.g. 8080, 18080:8080,\n"
 	        "                                          or "
@@ -157,6 +167,13 @@ static void usage(FILE *f)
 	        "clients need no map\n"
 	        "      --allow KEYS      comma-separated client nodekey: list "
 	        "for serve, or \"none\"\n"
+	        "      --files DIR[:MODE]\n"
+	        "                        for serve files: the directory, and ro "
+	        "(default), rw or wo\n"
+	        "      --ssh-authorized-keys SPEC\n"
+	        "                        for serve ssh: a file, a literal "
+	        "ssh-ed25519 key,\n"
+	        "                        or user@github. Repeatable.\n"
 	        "      --skip-dns-safety-check\n"
 	        "                        for ssh: do not probe a DNS-named server for\n"
 	        "                        whether it admits strangers\n"
@@ -1450,6 +1467,22 @@ typedef struct {
 	 * `--files <dir>:wo files`, so the two share one field rather than
 	 * having a `recv_dir` beside a `files_dir` that could disagree. */
 	files_mode mode;
+
+	/* `serve ssh` and `serve no-auth-ssh`: a shell on port 22 of the tunnel
+	 * address. The key list is empty for no-auth-ssh, and that emptiness is
+	 * never what admits anyone -- ssh_any_key is, and it is a separate flag
+	 * precisely so an empty list cannot be mistaken for permission. */
+	bool ssh_shell;
+	bool ssh_any_key;
+	tc_authkeys ssh_keys;
+	/* A forced command: `serve ssh -- /usr/bin/backup`. Whatever the client
+	 * asks to run, it gets this. */
+	const char *ssh_forced;
+	/* The running server, so the io callbacks can drive the shell's pump
+	 * while they wait. See tc/sshserver.h. */
+	tc_ssh_server *ssh;
+	uint8_t ssh_peer_key[32];
+	char ssh_peer_addr[96];
 	/* `serve exec -- cmd`: the command to run for each connection, NULL when
 	 * the service is not in use. */
 	const char *const *exec_argv;
@@ -1475,7 +1508,7 @@ typedef struct {
 static bool port_is_served(void *ctx, uint16_t port)
 {
 	const serve_state *st = (const serve_state *)ctx;
-	if (st->files_dir != NULL && port == 22)
+	if ((st->files_dir != NULL || st->ssh_shell) && port == 22)
 		return true;
 	/* The exec service answers everywhere, because it is not a service on a
 	 * port: it is what this server does. Upstream's own example connects to
@@ -1962,6 +1995,14 @@ static int recv_read(void *ctx, uint8_t *buf, size_t cap, size_t *nread)
 			return TC_ERR_TIMEOUT;
 		if (serve_pump_once(io->st, io->deadline) != 0)
 			return TC_ERR_CLOSED;
+		/* An interactive session has output of its own to move, and this
+		 * loop is the only thing running while it waits. See
+		 * tc/sshserver.h; it does nothing at all for the other services. */
+		if (io->st->ssh != NULL) {
+			int irc = tc_ssh_server_idle(io->st->ssh);
+			if (irc != TC_OK)
+				return irc;
+		}
 	}
 }
 
@@ -1997,7 +2038,9 @@ static int recv_write(void *ctx, const uint8_t *buf, size_t len)
 static bool recv_on_accept(void *ctx, tc_ssh_request_type type,
                            const char *arg)
 {
-	(void)ctx;
+	const serve_state *st = (const serve_state *)ctx;
+	if (st != NULL && st->ssh_shell)
+		return type == TC_SSH_REQ_SHELL || type == TC_SSH_REQ_EXEC;
 	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0)
 		return true;
 	vlogf("recv: refused a request for %s", arg);
@@ -2010,6 +2053,30 @@ static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 	serve_state *st = (serve_state *)ctx;
 	(void)type;
 	(void)arg;
+
+	if (st->ssh_shell) {
+		/* The server pointer is what lets recv_read run the shell's pump
+		 * while it waits for tunnel bytes; without it a command's output
+		 * would reach the client on their next keystroke. */
+		st->ssh = s;
+		tc_shell_opts so;
+		memset(&so, 0, sizeof so);
+		if (st->ssh_forced != NULL) {
+			so.command = st->ssh_forced;
+			so.forced = true;
+			if (type == TC_SSH_REQ_EXEC && arg[0] != '\0')
+				vlogf("ssh: ignoring \"%s\"; this server has a forced "
+				      "command",
+				      arg);
+		} else if (type == TC_SSH_REQ_EXEC && arg[0] != '\0') {
+			so.command = arg;
+		}
+		so.peer_key = st->ssh_peer_key;
+		so.peer_addr = st->ssh_peer_addr;
+		int rc = tc_shell_serve(s, &so);
+		st->ssh = NULL;
+		return rc;
+	}
 
 	if (st->mode == TC_FILES_WO) {
 		tc_dropbox db;
@@ -2037,6 +2104,109 @@ static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 		return rc;
 	}
 	return tc_fileserv_serve(&fs, s);
+}
+
+/* ssh_banner says what this server is about to hand out.
+ *
+ * Upstream warns loudly about no-auth-ssh and so does this, for the same
+ * reason: it is the one service here where the address alone is enough to run
+ * commands as the person who started the server. Every other service has
+ * something narrower behind it -- a directory, a fixed command, a set of
+ * ports -- and a shell has nothing. The warning is not a disclaimer, it is
+ * the operating instruction: the address is the credential, so treat it like
+ * one.
+ *
+ * It goes to stderr with the rest of the startup notes, before the address is
+ * printed, so it is read before it can be acted on. */
+static void ssh_banner(const tc_authkeys *keys, const char *forced,
+                       bool no_auth)
+{
+	if (no_auth) {
+		fprintf(stderr,
+		        "# WARNING: serving a shell with no client "
+		        "authentication\n");
+		fprintf(stderr,
+		        "# anyone who has this address can run commands as %s on "
+		        "this machine\n",
+		        getenv("USER") != NULL ? getenv("USER")
+		                               : "the user running this");
+		fprintf(stderr, "# the address is the only secret: treat it exactly "
+		                "like a password\n");
+		fprintf(stderr, "# `serve ssh --ssh-authorized-keys ...` asks for a "
+		                "key as well\n");
+	} else {
+		size_t n = keys != NULL ? keys->count : 0;
+		size_t skipped = keys != NULL ? keys->skipped : 0;
+		fprintf(stderr, "# serving a shell to %zu authorized key%s\n", n,
+		        n == 1 ? "" : "s");
+		if (skipped > 0)
+			fprintf(stderr,
+			        "# %zu key%s skipped: only ed25519 can be verified "
+			        "here\n",
+			        skipped, skipped == 1 ? " was" : "s were");
+	}
+	if (forced != NULL)
+		fprintf(stderr, "# every session runs: %s\n", forced);
+	if (!tc_shell_have_pty())
+		fprintf(stderr,
+		        "# no pseudo-terminals on this platform, so sessions run on "
+		        "pipes\n"
+		        "#   (clients will print \"PTY allocation request "
+		        "failed\"; `ssh -T` avoids it)\n");
+}
+
+/* fetch_keys_url is what tc_authkeys_add_spec calls for `user@github`.
+ *
+ * Said out loud before it happens. It is a network request to a third party,
+ * made because of a command-line argument, and a server that quietly phoned
+ * home would be a surprise however ordinary the URL. */
+static int fetch_keys_url(void *ctx, const char *url, char *out, size_t cap)
+{
+	const bool *insecure = (const bool *)ctx;
+	fprintf(stderr, "# fetching keys from %s\n", url);
+	fflush(stderr);
+
+	tc_http_options o;
+	memset(&o, 0, sizeof o);
+	o.insecure_skip_verify = (insecure != NULL && *insecure);
+	o.timeout_ms = 15000;
+
+	size_t len = 0;
+	int status = 0;
+	int rc = tc_http_get(url, (uint8_t *)out, cap - 1, &len, &status, &o);
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not fetch %s: %s\n", url,
+		        tc_http_error_string());
+		return rc;
+	}
+	if (status != 200) {
+		/* 404 is the interesting one: it means no such account, and saying
+		 * "not found" beats "HTTP 404" to anyone who typed a name wrong. */
+		fprintf(stderr, "tailcat-c: %s returned HTTP %d%s\n", url, status,
+		        status == 404 ? " (no such account?)" : "");
+		return TC_ERR_NOTFOUND;
+	}
+	out[len] = '\0';
+	return TC_OK;
+}
+
+/* resolve_ssh_keys turns the --ssh-authorized-keys arguments into a list.
+ *
+ * Separate from the flag loop because `user@github` fetches over the network,
+ * and that must happen only for a command that is actually going to serve a
+ * shell. Reports its own errors. */
+static bool resolve_ssh_keys(tc_authkeys *ks, const char *const *specs,
+                             size_t n, bool insecure)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (tc_authkeys_add_spec(ks, specs[i], fetch_keys_url, &insecure) !=
+		    TC_OK) {
+			fprintf(stderr, "tailcat-c: --ssh-authorized-keys %s\n",
+			        tc_authkeys_error_string());
+			return false;
+		}
+	}
+	return true;
 }
 
 /* dir_is_usable checks a directory the user named on the command line.
@@ -2068,16 +2238,45 @@ static void run_recv_session(serve_state *st, serve_client *sc,
 	tc_ssh_server_opts opts;
 	memset(&opts, 0, sizeof opts);
 	opts.host_seed = st->ssh_host_seed;
-	/* The tunnel is the authentication. See tc/sshserver.h: reaching this
-	 * point took a WireGuard handshake keyed to an address the sender had to
-	 * be given, and `--allow` can narrow that further. */
-	opts.any_key_authenticates = true;
+	if (st->ssh_shell && !st->ssh_any_key) {
+		/* `serve ssh`: a named list, and only those keys. The tunnel is
+		 * still the outer gate, but a shell is not a drop box -- whoever
+		 * gets one can do anything this account can, so the address alone
+		 * is not enough and upstream does not make it enough either. */
+		opts.authorized = st->ssh_keys.key[0];
+		opts.num_authorized = st->ssh_keys.count;
+	} else {
+		/* The tunnel is the authentication. See tc/sshserver.h: reaching
+		 * this point took a WireGuard handshake keyed to an address the
+		 * sender had to be given, and `--allow` can narrow that further.
+		 *
+		 * For `recv` and `serve files` that is a statement of where the
+		 * authentication is, not a weakening: scp cannot register a key in
+		 * advance. For `no-auth-ssh` it is exactly what was asked for, and
+		 * the warnings at startup say so. */
+		opts.any_key_authenticates = true;
+	}
+	opts.allow_shell = st->ssh_shell;
+	opts.allow_pty = st->ssh_shell;
 	opts.read = recv_read;
 	opts.write = recv_write;
 	opts.io_ctx = &io;
 	opts.on_accept = recv_on_accept;
 	opts.on_start = recv_on_start;
 	opts.app_ctx = st;
+
+	/* Who is on the other end, for the shell's environment. The same two
+	 * names and the same formats `serve exec` uses, so a command written for
+	 * one works under the other. */
+	memcpy(st->ssh_peer_key, sc->ctx.server_key, 32);
+	tc_endpoint ep;
+	memset(&ep, 0, sizeof ep);
+	tc_tcp_remote_addr(conn, ep.ip);
+	ep.ip_len = 16;
+	ep.port = tc_tcp_remote_port(conn);
+	if (tc_endpoint_format(st->ssh_peer_addr, sizeof st->ssh_peer_addr,
+	                       &ep) != TC_OK)
+		st->ssh_peer_addr[0] = '\0';
 
 	st->in_ssh = true;
 	int rc = tc_ssh_server_run(&opts);
@@ -2158,7 +2357,8 @@ static int serve_pump_once(serve_state *st, uint64_t deadline)
 				 * tunnel address, which is where `cp` and `scp` look for
 				 * one. Everything else on our address is still a local
 				 * service, so `recv` and `serve <ports>` compose. */
-				if (st->files_dir != NULL && port == 22 &&
+				if ((st->files_dir != NULL || st->ssh_shell) &&
+				    port == 22 &&
 				    memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
 					if (st->in_ssh) {
 						vlogf("recv: already serving a session; refusing");
@@ -5099,7 +5299,10 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      const char *derpmap_url, const char *key_spec,
                      bool full_address, bool exit_node,
                      const tc_allowlist *allow, const char *files_dir,
-                     files_mode mode, const char *const *exec_argv)
+                     files_mode mode, const char *const *exec_argv,
+                     bool ssh_shell, bool ssh_no_auth,
+                     const tc_authkeys *ssh_keys,
+                     const char *const *ssh_forced_argv)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -5216,6 +5419,25 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 	opts.insecure_skip_verify = insecure;
 	opts.timeout_ms = 15000;
 
+	/* `serve ssh -- cmd args...`, joined back into the one string an SSH
+	 * exec request carries and the far shell will read. Quoted on the way,
+	 * so an argument with a space in it survives the round trip. Done here
+	 * rather than beside the serve loop because the banner below needs it
+	 * and the banner comes first. */
+	static char forced_buf[1024];
+	const char *ssh_forced = NULL;
+	if (ssh_shell && ssh_forced_argv != NULL && ssh_forced_argv[0] != NULL) {
+		size_t nf = 0;
+		while (ssh_forced_argv[nf] != NULL)
+			nf++;
+		if (tc_proxycmd_join(forced_buf, sizeof forced_buf, ssh_forced_argv,
+		                     nf, NULL) != TC_OK) {
+			fprintf(stderr, "tailcat-c: that forced command is too long\n");
+			return 1;
+		}
+		ssh_forced = forced_buf;
+	}
+
 	tc_derp_client derp;
 	if (tc_derp_connect(&derp, &opts, me.private_key, me.public_key) != TC_OK) {
 		fprintf(stderr, "tailcat-c: relay: %s\n", tc_derp_error_string());
@@ -5225,6 +5447,11 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 
 	/* The address goes to stderr: stdout is the data pipe. */
 	fprintf(stderr, "# relay %s\n", relay_host);
+	/* Before the address, deliberately. The address is what gets copied and
+	 * handed to somebody, so a warning that it is equivalent to a password
+	 * has to arrive before it rather than after. */
+	if (ssh_shell)
+		ssh_banner(ssh_keys, ssh_forced, ssh_no_auth);
 	/* Which kind of identity this is, because it decides whether the
 	 * address is safe to share once or is one that may already be in
 	 * somebody's notes. Upstream prints the same distinction for the
@@ -5274,7 +5501,12 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		st.files_dir = files_dir;
 		st.mode = mode;
 		st.exec_argv = exec_argv;
-		if (files_dir != NULL) {
+		st.ssh_shell = ssh_shell;
+		st.ssh_any_key = ssh_no_auth;
+		if (ssh_keys != NULL)
+			st.ssh_keys = *ssh_keys;
+		st.ssh_forced = ssh_forced;
+		if (ssh_shell || files_dir != NULL) {
 			/* The SSH host key is derived from the tunnel identity rather
 			 * than generated, so it is the same on every run for as long as
 			 * the address is. A host key that changed per run would make
@@ -5288,7 +5520,9 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 			tc_blake2s(st.ssh_host_seed, sizeof st.ssh_host_seed,
 			           "tailcat-c ssh host key v1", 25, me.private_key,
 			           sizeof me.private_key);
-			if (mode == TC_FILES_WO) {
+			if (ssh_shell) {
+				/* Already said, above the address. */
+			} else if (mode == TC_FILES_WO) {
 				fprintf(stderr, "# receiving files into %s\n", files_dir);
 				fprintf(stderr,
 				        "# the sender chooses nothing: names are ours, "
@@ -5604,6 +5838,14 @@ int main(int argc, char **argv)
 	 * `files` appears in a serve list, which is upstream's arrangement. */
 	const char *files_dir = NULL;
 	files_mode files_mode_arg = TC_FILES_RO;
+	/* `--ssh-authorized-keys`, as given. Whether the flag appeared is not
+	 * the same question as whether the list is empty: a flag that was given
+	 * and produced nothing is a different mistake from one that was never
+	 * given, and they get different messages. */
+	const char *keyspecs[16];
+	size_t nkeyspecs = 0;
+	static tc_authkeys ssh_keys;
+	tc_authkeys_init(&ssh_keys);
 	/* The server port ssh and cp reach through the tunnel. */
 	const char *ssh_port = "22";
 	/* An empty --key means "the saved default if there is one", which is how
@@ -5787,6 +6029,22 @@ int main(int argc, char **argv)
 			gk_psk = !BOOL_VAL(true);
 		} else if (strcmp(a, "--fixed-region") == 0) {
 			gk_fixed_region = BOOL_VAL(true);
+		} else if (strcmp(a, "--ssh-authorized-keys") == 0) {
+			/* Remembered, not resolved. One of the three forms is an HTTPS
+			 * request to github.com, and a flag on a command that will
+			 * never use it must not cause one -- see resolve_ssh_keys.
+			 *
+			 * Repeatable, and each one adds to the list. Upstream takes a
+			 * single argument; accepting several is strictly more useful
+			 * and cannot mean anything else, since the list is a union
+			 * either way. */
+			NEED_VAL();
+			if (nkeyspecs >= sizeof keyspecs / sizeof keyspecs[0]) {
+				fprintf(stderr, "tailcat-c: too many "
+				                "--ssh-authorized-keys\n");
+				return 2;
+			}
+			keyspecs[nkeyspecs++] = val;
 		} else if (strcmp(a, "--files") == 0) {
 			/* Upstream's spelling, suffix and all: `--files /srv/pub:rw`.
 			 * The directory is remembered here and only takes effect when
@@ -5884,6 +6142,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "tailcat-c: --files belongs to `serve ... files`\n");
 		return 2;
 	}
+	if (nkeyspecs > 0 && (nargs == 0 || strcmp(args[0], "serve") != 0)) {
+		fprintf(stderr,
+		        "tailcat-c: --ssh-authorized-keys belongs to `serve ssh`\n");
+		return 2;
+	}
 
 	if (nargs == 0) {
 		/* A bare invocation is a server, as upstream's is: it prints an
@@ -5903,7 +6166,7 @@ int main(int argc, char **argv)
 			timeout_s = 60;
 		return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
 		                 key_spec, full_address, false, &allow, NULL,
-		                 TC_FILES_RO, NULL);
+		                 TC_FILES_RO, NULL, false, false, NULL, NULL);
 	}
 	/* Outside the port server, a deadline of zero would mean "give up at
 	 * once", which nobody asks for by typing --timeout 0. */
@@ -5957,13 +6220,15 @@ int main(int argc, char **argv)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
 			                 key_spec, full_address, false, &allow, NULL,
-			                 TC_FILES_RO, NULL);
+			                 TC_FILES_RO, NULL, false, false, NULL, NULL);
 		}
 
 		static tc_portset ports;
 		tc_portset_clear(&ports);
 		bool exit_node = false;
 		bool want_files = false;
+		bool want_ssh = false;
+		bool ssh_no_auth = false;
 		const char *const *exec_argv = NULL;
 		for (size_t i = 1; i < nargs; i++) {
 			tc_portset_service svc = TC_PORTSET_SVC_NONE;
@@ -5974,6 +6239,13 @@ int main(int argc, char **argv)
 				 * because it makes this machine a proxy for everything it
 				 * can reach. */
 				exit_node = true;
+				continue;
+			}
+			if (rc == TC_ERR_UNSUPPORTED &&
+			    (svc == TC_PORTSET_SVC_SSH ||
+			     svc == TC_PORTSET_SVC_NO_AUTH_SSH)) {
+				want_ssh = true;
+				ssh_no_auth = (svc == TC_PORTSET_SVC_NO_AUTH_SSH);
 				continue;
 			}
 			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_FILES) {
@@ -6019,6 +6291,46 @@ int main(int argc, char **argv)
 				return 2;
 			}
 		}
+		if (want_ssh && ssh_no_auth && nkeyspecs > 0) {
+			/* Two different answers to "who may log in", and guessing which
+			 * one was meant is not this program's job. */
+			fprintf(stderr,
+			        "tailcat-c: no-auth-ssh admits everyone, so "
+			        "--ssh-authorized-keys cannot also apply; use `serve "
+			        "ssh` if you want the list to mean something\n");
+			return 2;
+		}
+		if (want_ssh && !ssh_no_auth) {
+			if (nkeyspecs == 0) {
+				fprintf(stderr,
+				        "tailcat-c: serve ssh needs --ssh-authorized-keys "
+				        "<file|key|user@github>\n"
+				        "  (or `serve no-auth-ssh`, which lets in anyone "
+				        "who has the address)\n");
+				return 2;
+			}
+			if (!resolve_ssh_keys(&ssh_keys, keyspecs, nkeyspecs, insecure))
+				return 2;
+			if (ssh_keys.count == 0) {
+				/* The flag was given and yielded nothing. Almost always a
+				 * file of RSA keys, so say that rather than "empty". */
+				fprintf(stderr,
+				        "tailcat-c: --ssh-authorized-keys produced no "
+				        "usable keys");
+				if (ssh_keys.skipped > 0)
+					fprintf(stderr, " (%zu were skipped: only ed25519 keys "
+					                "can be verified here)",
+					        ssh_keys.skipped);
+				fprintf(stderr, "\n");
+				return 2;
+			}
+		}
+		if (!want_ssh && nkeyspecs > 0) {
+			fprintf(stderr,
+			        "tailcat-c: --ssh-authorized-keys belongs to `serve "
+			        "ssh`\n");
+			return 2;
+		}
 		if (files_dir != NULL && !want_files) {
 			/* A named directory that nothing serves is almost certainly a
 			 * forgotten word rather than a deliberate no-op, and the silent
@@ -6031,11 +6343,20 @@ int main(int argc, char **argv)
 		}
 		if (want_files && !dir_is_usable(files_dir))
 			return 2;
+		if (want_ssh && want_files) {
+			/* Both want port 22 of the same address, and only one of them
+			 * can have it. Refused rather than silently ranked. */
+			fprintf(stderr,
+			        "tailcat-c: ssh and files both want port 22; serve one "
+			        "or the other\n");
+			return 2;
+		}
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
 		                 key_spec, full_address, exit_node, &allow,
 		                 want_files ? files_dir : NULL, files_mode_arg,
-		                 exec_argv);
+		                 exec_argv, want_ssh, ssh_no_auth, &ssh_keys,
+		                 want_ssh ? child_argv : NULL);
 	}
 	if (strcmp(args[0], "readme") == 0) {
 		/* Upstream embeds its own README.md here. Ours is an engineering log
@@ -6068,7 +6389,7 @@ int main(int argc, char **argv)
 		return cmd_serve(relay, &no_ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url, key_spec,
 		                 full_address, false, &allow, args[1], TC_FILES_WO,
-		                 NULL);
+		                 NULL, false, false, NULL, NULL);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

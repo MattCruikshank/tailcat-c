@@ -61,6 +61,20 @@ Receive files into a directory, as a write-only drop box:
 The sender chooses nothing. Names are the server's, nothing is overwritten,
 the directory cannot be listed and nothing can be read back.
 
+Share a directory instead, for reading:
+
+    tailcat-c serve --files ~/public files
+
+Or for reading and writing:
+
+    tailcat-c serve --files ~/shared:rw files
+
+Read-only is the default, because handing out write access by accident is not
+recoverable. Everything is confined to that directory: `..` cannot climb out
+of it and a symlink is refused rather than followed, so a link inside the
+directory pointing anywhere else is not served. `recv <dir>` is the same
+command with the third mode, `--files <dir>:wo files`.
+
 Copy files, using the system `scp`:
 
     tailcat-c cp report.pdf <tc-addr>:
@@ -73,6 +87,44 @@ List what a server offers:
 
 
 ## Shells and proxies
+
+## A shell
+
+Serve one, to named keys:
+
+    tailcat-c serve --ssh-authorized-keys ~/.ssh/authorized_keys ssh
+    tailcat-c serve --ssh-authorized-keys "ssh-ed25519 AAAAC3..." ssh
+    tailcat-c serve --ssh-authorized-keys alice@github ssh
+
+The three forms are a file, a literal key, and a GitHub account -- the last
+fetches `https://github.com/alice.keys`, says so before it does, and refuses
+to start if it cannot. Only ed25519 keys can be verified here; others in a
+file are skipped, and a file with none left is an error rather than a server
+nobody can log into.
+
+Key options are refused, not ignored. A line like `command="/usr/bin/backup"
+ssh-ed25519 AAAA...` restricts that key, and reading the key while dropping
+the restriction would grant more than the file says.
+
+To run one fixed command instead of a shell:
+
+    tailcat-c serve --ssh-authorized-keys ~/.ssh/authorized_keys ssh -- \
+        /usr/bin/backup
+
+Or serve a shell to anyone holding the address:
+
+    tailcat-c serve no-auth-ssh
+
+**That last one has no client authentication at all.** Anyone with the
+address can run commands as the user who started it, so the address is a
+password -- and unlike a password it is printed to the terminal and pasted
+into chat windows. `serve ssh` asks for a key as well, and `--allow` narrows
+which tunnels may connect in either case.
+
+Sessions get a real terminal where the platform has one. On Windows there are
+no pseudo-terminals, so they run on pipes; clients print "PTY allocation
+request failed" and carry on, which is what `ssh -T` does deliberately. The
+server says which it is at startup.
 
 Run a command on a server, using the system `ssh`:
 
@@ -173,6 +225,10 @@ check that NAT traversal works.
 
     --key NAME          saved identity to use, or "new" for an ephemeral one
     --allow KEYS        comma-separated client nodekey: list, or "none"
+    --files DIR[:MODE]  directory for `serve files`; MODE is ro, rw or wo
+    --ssh-authorized-keys SPEC
+                        for `serve ssh`: a file, a literal key, or
+                        user@github. May be given more than once.
     --relay HOST        serve through this relay instead of choosing one
     --full-address      embed the relay in the address, so clients need no map
     --bind ADDR         listen address for forward and socks (default 127.0.0.1)
@@ -198,6 +254,11 @@ on the tailcat server.
 cannot be narrowed afterwards, and it is exactly as secret as the least
 careful place it has been pasted. `--allow` restricts by client key and is off
 by default.
+
+**`serve no-auth-ssh` is a shell for anyone holding the address.** It is the
+only service here where the address alone is enough to run commands: every
+other one has something narrower behind it -- a directory, a fixed command, a
+set of ports. Prefer `serve ssh` with a key list, and `--allow` on top.
 
 **`serve exit-node` reaches everything this machine can**, including loopback
 services and a cloud metadata endpoint. Use `--allow` with it.
