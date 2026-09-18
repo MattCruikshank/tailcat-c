@@ -221,7 +221,7 @@ direct peer-to-peer paths.
 | non-ed25519 authorized keys (RSA, ECDSA) | ❌ skipped, and said so | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
-| macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
+| macOS, FreeBSD, OpenBSD, NetBSD | built, untested — see [BSD-plan.md](BSD-plan.md) | ✅ (macOS) |
 | aarch64 | ✅ all 36 test binaries pass on real aarch64 instructions (qemu-user) | ✅ |
 | Browser (WebAssembly) | ❌ | ✅ |
 | Persistent keys on disk | ✅ | ✅ |
