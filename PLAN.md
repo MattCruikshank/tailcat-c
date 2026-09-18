@@ -14,11 +14,19 @@ against a real OpenSSH.
 other than effort: WebAssembly, on a toolchain that does not exist for
 Cosmopolitan, and TLS 1.3, on an Ed25519 certificate Mbed TLS cannot parse.
 
-What is left of upstream's surface is deliberate rather than pending:
-`serve ssh` as a general shell server, and the read-write and recursive file
-modes. Both are recorded in 5.5 with the reasoning, because a drop box that
-can run commands or let a sender choose names is not the thing this
-implements.
+What is left of upstream's surface is upstream's *recursive* drop box
+(`--files <dir>:wo+`), recorded in 5.5 with the reasoning, and three
+differences that are choices rather than gaps: authorized keys must be
+ed25519, `authorized_keys` options are refused rather than honoured, and
+Windows sessions run on pipes because Cosmopolitan has no pseudo-terminals
+there.
+
+An earlier version of this paragraph listed `serve ssh` as a deliberate
+omission, on the reasoning that a drop box which can run commands is not a
+drop box. That reasoning was sound about `recv` and wrong about the project:
+`serve ssh` is a separate service with its own key list, not a loosening of
+the drop box, and the two now sit side by side refusing each other's
+requests. 5.6 records what it took.
 
 Sizes are rough C line counts for the new code, excluding tests, which have
 run about 1:1 with implementation on this project. "Risk" is about how likely
@@ -307,7 +315,8 @@ include multi-client serving. 3.5 moved to Phase 5 and `browse` was judged not
 worth writing; everything else is finished.
 
 What remains of upstream's command set -- `recv`, `ls`, `serve ssh`,
-`serve files` -- is gated entirely on having an SSH server.
+`serve files` -- is gated entirely on having an SSH server. (All four are
+done; this paragraph is the plan as written, kept for the record.)
 
 ---
 
@@ -735,7 +744,91 @@ Upstream's `ls` also disables host key checking, for the same reason our
 its node key in the tailcat address, so the SSH host key adds nothing." Good
 to know we reached the same conclusion independently.
 
-### 5.6 WebAssembly build · blocked on the toolchain
+### 5.6 The other three serve services ✅ · ~1,400 lines, plus 640 of tests
+
+`files`, `ssh` and `no-auth-ssh`, on the SSH and SFTP server 5.4 and 5.5
+built. The SFTP framing loop moved out of the drop box into `tc/sftpserve.h`
+first, because two policies behind one protocol is fine and two copies of a
+length check is not.
+
+**`serve files`** is the drop box's opposite. There the server chooses every
+filename and that one rule does most of the work; here the client names
+paths, which is exactly what the drop box refuses to allow, so nothing
+transferred and the confinement had to be built properly.
+
+Upstream uses Go's `os.Root`, which refuses to traverse a symlink or a `..`
+out of the tree at the system-call level. C has no such thing. The walk in
+`tc_fileserv_resolve` splits the path itself, pops `..` *before* any of it
+reaches the filesystem — so `a/../../etc` is rejected as a path rather than
+opened and then regretted — and opens every component with
+`openat(O_NOFOLLOW)` from the directory above it. That last part is what a
+`realpath()` check cannot do: realpath resolves the link and compares
+afterwards, which is both a different answer and a race against whoever can
+swap a component in between. Here there is no separate check to race.
+
+`READDIR` answers one entry per call. A NAME reply may carry any number and
+most servers batch; the client loops until EOF either way, so this trades a
+round trip per file for not needing a second builder. Worth revisiting for a
+directory of thousands, not for handing someone a folder.
+
+**`serve ssh`** is a real shell: `forkpty` where the platform has one, `sh -c`
+for an exec request, an exit status, and live window resizing. Windows has no
+pseudo-terminals — Cosmopolitan's `forkpty` is ENOSYS there, established with
+a throwaway probe before any of this was designed, the same way `res_query`
+was checked in 6.3 — so sessions run on pipes and the server says so. That is
+the fallback OpenSSH itself makes.
+
+The awkward part was not the shell but the *shape of the loop*. Everything
+else this server does is request and response, where nothing needs sending
+while nothing has been asked. A shell writes when it feels like it, and a
+server that only wrote when a packet arrived would deliver a command's output
+on the user's next keystroke. So the server grew an idle hook: a pump that
+runs inside the read callback while it waits. Writing from there is safe
+because a write that would have to wait for the peer's window returns
+`TC_ERR_AGAIN` rather than reading a packet from inside the reader — and that
+needed `tc_ssh_server_write` split into a partial form, because the
+whole-buffer one can return `AGAIN` having already sent part of it, and a
+pump that requeued the whole thing would duplicate output at an offset
+depending on the peer's window.
+
+**`--ssh-authorized-keys`** takes upstream's three forms: a file, a literal
+key, and `user@github`. Two decisions worth recording:
+
+- **Key options are refused, never dropped.** Every one of them is a
+  restriction, and a server that reads the key while discarding
+  `command="..."` has granted strictly more than the file says — silently,
+  and for as long as it runs. Skipping the line would be no better, since the
+  same key without its restriction is the thing being asked for. So the line
+  is malformed as far as this program is concerned, and it says so. `serve
+  ssh -- cmd` is the forced-command feature, spelled where it cannot be lost.
+- **The network form resolves late.** `user@github` is an HTTPS request to a
+  third party, made because of a command-line argument, so it happens only
+  once the command is known to need it. Parsing it in the flag loop meant
+  `tailcat-c ping --ssh-authorized-keys alice@github <addr>` phoned
+  github.com for a flag that command never reads.
+
+**`serve no-auth-ssh`** is implemented with upstream's warnings, and prints
+them *before* the address. The address is what gets copied out of a terminal
+and pasted to somebody; a warning that it is equivalent to a password is
+advice about a decision already taken if it arrives afterwards. It also names
+the account whose shell is being handed out, because "anyone can run commands"
+is abstract in a way "anyone can run commands as mattc" is not.
+
+**What the live tests found** is the entry's real content. `make live-shell`
+drives all of it with a real OpenSSH client, and between it and `make
+live-files` it produced bugs 38 and 39 plus two more in the pump. Bug 39 is
+the one to remember: closing a socket with unread bytes on it sends RST,
+which discards unsent output, and it had been quietly shortening large
+transfers for *every* service since the SSH server was written. `recv` and
+`ls` never showed it, because a drop box upload has nothing at the end to
+lose. It took a service that sends a lot to make it visible, which is an
+argument for the breadth of a test suite rather than its depth.
+
+Still not implemented: upstream's **recursive drop box** (`--files <dir>:wo+`),
+which is the one mode that lets a sender create directories. 5.5 records what
+that trades away, and none of it has changed.
+
+### 5.7 WebAssembly build · blocked on the toolchain
 
 Upstream compiles to WASM for the browser demo. Cosmopolitan does **not**
 target WASM: cosmocc is GCC for x86_64 and aarch64, and there is no clang,
@@ -976,11 +1069,14 @@ In rough order of what they cost:
 6. ~~**Addresses in DNS TXT records**~~: done, with the safety probe, which
    this entry insisted had to land with it. See 6.3.
 
-Not on this list, and deliberately: the `ssh`, `no-auth-ssh`, `exec` and
-`files` services (5.4 and 5.5 say why), and bare `tailcat` starting a server,
-which is a one-line change this project declines because printing usage for
-a bare invocation is better behaviour and the explicit `serve` is right
-there.
+Both of those judgements have since been reversed, and the entries are kept
+because being wrong in a recorded way is the useful kind.
+
+The `ssh`, `no-auth-ssh`, `exec` and `files` services are implemented (5.6).
+Bare `tailcat` starts a server, because the argument for printing usage
+ignored who actually types the bare name: the first line of upstream's README
+is `$ tailcat`, so the people most likely to run it that way are following
+that and expecting a server. `--help` serves the other case and says so.
 
 ### 6.3 DNS names, and the probe that has to come with them ✅ · ~560 lines
 

@@ -91,11 +91,6 @@ widening the connection key from a port pair to a four-tuple.
 
 **Still out of scope**, in descending order of how much it would take:
 
-- **`serve ssh` as a general shell server**, deliberately. `recv` serves
-  sftp and nothing else, and a drop box that can run commands is not a drop
-  box. Upstream's read-write and recursive file modes (`:rw`, `:wo+`) are
-  not implemented either; PLAN.md 5.5 records what the recursive one trades
-  away.
 - The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
   this means a second toolchain and a second build of everything — arguably
   against the premise of a project whose whole point is one fat APE.
@@ -200,7 +195,10 @@ direct peer-to-peer paths.
 | `socks <cmd>` with `all_proxy`, `--` optional | ✅ | ✅ |
 | `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
 | `ls` (SFTP remote listing) | ✅ (in-process SFTP client) | ✅ |
-| SSH *server* (`serve ssh`) | serves sftp for `recv`; no shell, no PTY | ✅ |
+| SSH *server* (`serve ssh`) | ✅ shell, pty, exec, forced command | ✅ |
+| `serve no-auth-ssh` | ✅ with upstream's warnings | ✅ |
+| `serve files` (`--files <dir>[:ro\|:rw\|:wo]`) | ✅ read, list, stat, write | ✅ |
+| `--ssh-authorized-keys` (file, literal key, `user@github`) | ✅ ed25519 only | ✅ |
 | `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
@@ -219,7 +217,9 @@ direct peer-to-peer paths.
 | `genkey --fixed-region` | ✅ | ✅ |
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
 | reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
-| `serve` services: `ssh`, `no-auth-ssh`, `exec`, `files` | ❌ | ✅ |
+| upstream's recursive drop box (`:wo+`) | ❌ | ✅ |
+| non-ed25519 authorized keys (RSA, ECDSA) | ❌ skipped, and said so | ✅ |
+| `authorized_keys` options (`command=`, `from=`) | ❌ refused, never ignored | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
@@ -230,13 +230,20 @@ direct peer-to-peer paths.
 So: tailcat-c does the **whole data path** — address, relay, tunnel, TCP,
 UDP, and the direct peer-to-peer path with its NAT traversal — in both roles
 and interoperably, plus everything built on top of it: serving ports,
-forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and the SSH
-and SFTP subset behind `recv` and `ls`.
+forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and all four
+`serve` services — `ssh`, `no-auth-ssh`, `exec` and `files` — on an SSH and
+SFTP server of our own.
 
-What is left is the **browser build**, which Cosmopolitan cannot target, and
-two deliberate omissions: `serve ssh` as a general shell server, and
-upstream's read-write and recursive file modes. A drop box that can run
-commands is not a drop box.
+What is left is the **browser build**, which Cosmopolitan cannot target.
+
+The remaining differences are small and deliberate. Authorized keys must be
+ed25519, because that is the only signature this server verifies — an RSA key
+in the list would be one that can never authenticate, so those lines are
+skipped and counted rather than silently kept. `authorized_keys` options are
+refused outright: `command="..."` is a restriction, and a server that reads
+the key while dropping the restriction has granted more than the file says.
+Upstream's recursive drop box (`:wo+`) is still not implemented; PLAN.md 5.5
+records what it trades away.
 
 ## Build
 
@@ -1222,6 +1229,58 @@ argument handling reaches commands whose only tests are live ones, and the
 tier has to be chosen by what the change touches rather than by how big it
 looks.
 
+**38. A full-sized channel packet overflowed the buffer it was built into.**
+*(Phase 5.6, found by `make live-files` on the first 40KB download.)* An SSH
+CHANNEL_DATA chunk was capped at the peer's `remote_max_packet`, which is
+itself capped at 32768 -- and then a nine-byte header was written in front of
+it, into a 32768-byte buffer. 32768 + 9 does not fit.
+
+Nothing had reached it in four months of use because nothing wrote a large
+enough block in one call: the drop box only ever sends short STATUS replies,
+`ls` sends short requests, and every other user of the channel writes small.
+`serve files` sends 32KB DATA replies, and the very first download failed with
+"output buffer too small" -- on both sides, since the client had the same line.
+The bound is now `remote_max_packet - TC_SSH_CHANNEL_DATA_OVERHEAD`, and the
+constant exists so the next person to write that line has to think about it.
+
+**39. Closing the socket discarded the end of every large transfer.**
+*(Phase 5.6, found by `make live-shell` asking for 200000 lines.)* Closing a
+socket that still has unread incoming bytes makes the kernel send RST rather
+than FIN, and an RST discards whatever of our output has not yet left the send
+buffer. An SSH client sends CHANNEL_WINDOW_ADJUST continuously while it reads,
+so at the end of any large transfer there is almost always something unread.
+
+`seq 1 200000` came back as 198436 lines. Then 200000. Then 198436 again. The
+symptom was a transfer that looked entirely successful and was simply short, at
+a length that depended on timing -- and the same cause was behind the
+"Connection to ... closed by remote host" that every client had been printing
+since the SSH server was written, which had been filed away as cosmetic. It was
+not cosmetic; it was the client reporting a reset connection, which is exactly
+what it was.
+
+The wind-down now waits for the peer's CHANNEL_CLOSE before the caller drops
+the transport. Two things about this one are worth keeping:
+
+- **It affected every service, not the new one.** `recv` and `ls` had been
+  carrying it for months. They never showed it because a drop box upload is
+  the client writing and the server replying "ok" -- there is nothing at the
+  end to lose. It took a service that *sends* a lot to make it visible.
+- **The obvious fix was wrong.** Sending SSH_MSG_DISCONNECT looks like the
+  polite ending and makes OpenSSH exit 255: it reads a disconnect as the
+  server hanging up, and discards the exit status just delivered. Tried,
+  measured, reverted, and the comment in the code says so, because it is the
+  kind of thing a future reader would otherwise add back.
+
+Two more from the same afternoon, both in the shell's pump and both producing
+the same truncated-but-plausible output: a drain loop that stopped when the
+*child* exited rather than when its *output* ended -- a shell can leave tens of
+thousands of lines in a pty after it has been reaped -- and a `poll` that only
+read on POLLIN. Once a hung-up pty has nothing left to deliver it reports
+POLLHUP alone, and the end-of-file itself (on Linux, `read` failing with EIO)
+is only handed to something that actually calls `read`. A loop that waited for
+POLLIN therefore never learned the session was over, and hung with the child
+long since gone.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -1702,6 +1761,34 @@ recv` drop box since then.
       than what the client printed; `make live-recv-serve` does it through a
       real relay.
 
+- [x] **Phase 5.6 — the other three `serve` services.** `files`, `ssh` and
+      `no-auth-ssh`, on the SSH and SFTP server Phase 5.5 built.
+
+      `serve files` is a second policy beside the drop box, and the opposite
+      one: the client names paths. Upstream confines them with Go's
+      `os.Root`, which refuses to traverse a symlink or a `..` at the system
+      call level. C has no such thing, so the walk pops `..` *before* any of
+      it reaches the filesystem and opens every component with
+      `openat(O_NOFOLLOW)` — a symlink is refused rather than resolved, which
+      is the part a `realpath()` check cannot do without losing a race.
+
+      `serve ssh` is a real shell: a pty where the platform has one, `sh -c`
+      for an exec request, an exit status, and window resizing. Windows has
+      no pseudo-terminals — Cosmopolitan's `forkpty` is ENOSYS there, checked
+      with a probe before any of it was designed — so sessions there run on
+      pipes, which is the same thing OpenSSH falls back to.
+
+      `--ssh-authorized-keys` takes upstream's three forms: a file, a literal
+      key, and `user@github`. Key options are refused rather than ignored,
+      because `command="..."` is a restriction and reading the key without it
+      grants more than the file says.
+
+      `make live-shell` drives all of it with a real OpenSSH client, and it
+      is what found the two truncation bugs described in [the bug
+      list](#bugs-this-verification-has-actually-caught) — including bug 39, which had been
+      quietly shortening large transfers for every service, not just this
+      one.
+
 - [x] **`ls`, in-process.** Upstream's `ls` is the one file command it does
       not shell out for, so ours does not either: an SSH client and an SFTP
       client over our own tunnel, printing what upstream prints. `make
@@ -1709,9 +1796,11 @@ recv` drop box since then.
 
 **Phases 1 through 5 are done**, apart from the browser build, which
 Cosmopolitan cannot target, and TLS 1.3, which is blocked on Mbed TLS's X.509
-parser rather than on effort. What is left of upstream's surface is two
-deliberate omissions: `serve ssh` as a general shell server, and the
-read-write and recursive file modes. See [PLAN.md](PLAN.md) for the detail.
+parser rather than on effort. What is left of upstream's surface is
+upstream's recursive drop box (`:wo+`), and three differences that are
+choices rather than gaps: authorized keys must be ed25519, `authorized_keys`
+options are refused rather than honoured, and `serve no-auth-ssh` warns
+before it prints the address. See [PLAN.md](PLAN.md) for the detail.
 
 ## Licence
 

@@ -140,29 +140,50 @@ Guarding against a saved key being replaced works, and says why:
 loses access)`.
 
 
-## Services we do not implement
+## The `serve` services
 
-These all fail cleanly and **name the feature**, which is the behaviour to
-keep:
+All four are implemented now. This section used to be called "services we do
+not implement" and consisted of four refusals; keeping the heading honest
+seemed better than keeping the paragraph.
 
-```
-$ tailcat-c serve ssh
-tailcat-c: the "ssh" service is not implemented here; see the feature table in README.md
-```
+| Instruction | Result |
+|---|---|
+| `tailcat-c serve exec -- /usr/bin/fortune` | ✅ a command per connection |
+| `tailcat-c serve --files ~/pub files` | ✅ read-only over SFTP |
+| `tailcat-c serve --files ~/pub:rw files` | ✅ read-write |
+| `tailcat-c serve --ssh-authorized-keys ~/.ssh/authorized_keys ssh` | ✅ |
+| `tailcat-c serve --ssh-authorized-keys alice@github ssh` | ✅ fetches, and says so |
+| `tailcat-c serve --ssh-authorized-keys <f> ssh -- /usr/bin/backup` | ✅ forced command |
+| `tailcat-c serve no-auth-ssh` | ✅ with warnings, before the address |
 
-Same for `no-auth-ssh` and `files`. `exec` is implemented now — a command per
-connection, with the connection as its stdin and stdout, and the caller's key
-and address in its environment.
+Four differences from upstream, all deliberate and all reported rather than
+silent:
 
-By contrast the *flags* belonging to the remaining features report only
-`unknown flag` — `--ssh-authorized-keys` and `--files`. "Unknown" is true but
-less useful than "not implemented here": a reader cannot tell a typo from a
-missing feature, and these are the last two places that distinction is lost.
+- **Only ed25519 authorized keys.** It is the only signature this SSH server
+  verifies, so an RSA line in the list would be a key that could never
+  authenticate. Those lines are skipped and *counted*, and the startup line
+  says how many — a file that was entirely RSA produces no keys, which is
+  fatal rather than a server nobody can log into.
+- **`authorized_keys` options are refused, not ignored.** `command="..."`,
+  `from="..."`, `no-pty` and the rest are restrictions, and a server that
+  read the key while dropping the restriction would grant strictly more than
+  the file says, silently, for as long as it runs. `serve ssh -- cmd` is the
+  forced-command feature, spelled where it cannot be lost.
+- **No pseudo-terminals on Windows.** Cosmopolitan's `forkpty` is ENOSYS
+  there, so sessions run on pipes and the server says so at startup. Clients
+  print "PTY allocation request failed" and carry on, which is what OpenSSH
+  does on any host that will not give it one.
+- **The no-auth-ssh warning comes before the address**, and names the account
+  whose shell is being handed out. Upstream warns too; printing it first is
+  the difference, and it is there because the address is what gets copied out
+  of the terminal.
 
-(This paragraph named five flags when the walk was first written.
-`--fixed-region`, `--until-direct` and `--skip-dns-safety-check` have since
-been implemented, which is the more satisfying way for the list to get
-shorter.)
+`--files` and `--ssh-authorized-keys` are now real flags, so the paragraph
+that used to complain about them reporting `unknown flag` is gone. Both are
+refused with a specific message when they appear on a command that cannot use
+them — and `--ssh-authorized-keys` is not *resolved* until the command is
+known to need it, so `tailcat-c ping --ssh-authorized-keys alice@github
+<addr>` does not make an HTTPS request for a flag it will never read.
 
 
 ## DNS names
@@ -214,12 +235,12 @@ walkthrough. PLAN.md 6.2 has what each would cost.
 |---|---|---|
 | a *self-hosted* relay in a saved key | `genkey --region=derp.example.com` | `serve --relay host` |
 | a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
-| shell, forced command, file server | `serve ssh`, `no-auth-ssh`, `exec`, `files` | `recv`, `ls` |
+| a recursive drop box | `--files <dir>:wo+` | `--files <dir>:wo` (flat) |
 
-The four `serve` services are refusals rather than omissions — PLAN 5.4 and
-5.5 record the reasoning, and it is mostly that a drop box which can run
-commands is not a drop box. Everything else on this list is simply not
-written yet, and none of it is large.
+The four `serve` services were on this list when the walk was written and are
+not any more. What is left is the recursive drop box, the one file mode that
+lets a sender create directories — PLAN 5.5 records what that trades away —
+plus the two address forms above. None of it is large.
 
 One thing the walk changed rather than recorded: `-p 10.0.0.1:22` and the
 pipe form's port argument used to accept that string and connect to port
