@@ -21,13 +21,22 @@
  *      captured from one connection replayable on every other.
  *
  * Each has a test below that fails if the mistake is made.
+ *
+ * Those four are exercised with ed25519 requests built here, because building
+ * them here is what lets a test bend one field at a time. What that cannot
+ * catch is a format misunderstanding, since a request we assemble and a
+ * request we parse would share it -- so test_real_requests below runs golden
+ * vectors instead: keys from ssh-keygen, signatures from openssl. See
+ * tools/gen-sshauth-vectors.py.
  */
 
 #include "tc/sshauth.h"
 
+#include "tc/authkeys.h"
 #include "tc/ed25519.h"
 #include "tc/sshwire.h"
 
+#include "sshauth_vectors.h"
 #include "tctest.h"
 
 #include <string.h>
@@ -101,6 +110,22 @@ static void make_key(uint8_t seed[32], uint8_t pub[32], uint8_t fill)
 	TCT_EQ_INT(tc_ed25519_public_from_seed(pub, seed), TC_OK);
 }
 
+/* pubkey_of builds the authorized-keys entry for an ed25519 public key: the
+ * wire blob, which is what the server compares and what the client signs
+ * over, rather than the bare 32 bytes. */
+static tc_ssh_pubkey pubkey_of(const uint8_t pub[32])
+{
+	tc_ssh_pubkey k;
+	memset(&k, 0, sizeof k);
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, k.blob, sizeof k.blob);
+	tc_ssh_put_cstring(&w, "ssh-ed25519");
+	tc_ssh_put_string(&w, pub, 32);
+	TCT_TRUE(tc_ssh_wbuf_ok(&w));
+	k.len = tc_ssh_wbuf_len(&w);
+	return k;
+}
+
 static void test_a_good_request_is_accepted(void)
 {
 	TCT_CASE("a signed request from an authorized key is accepted");
@@ -119,17 +144,26 @@ static void test_a_good_request_is_accepted(void)
 	TCT_TRUE(req.has_signature);
 	TCT_EQ_STR(req.user, "tester");
 	TCT_EQ_STR(req.service, "ssh-connection");
-	TCT_EQ_MEM(req.pubkey, pub, 32);
+	TCT_EQ_STR(req.algo, "ssh-ed25519");
+	tc_ssh_pubkey expect = pubkey_of(pub);
+	TCT_EQ_INT((int)req.pubkey.len, (int)expect.len);
+	TCT_EQ_MEM(req.pubkey.blob, expect.blob, expect.len);
 
-	uint8_t authorized[32];
-	memcpy(authorized, pub, 32);
-	TCT_EQ_INT(tc_ssh_auth_check(&req, sid, authorized, 1), TC_OK);
+	tc_ssh_pubkey authorized = expect;
+	TCT_EQ_INT(tc_ssh_auth_check(&req, sid, &authorized, 1), TC_OK);
 
 	TCT_CASE("and one key among several is found");
-	uint8_t many[4 * 32];
+	tc_ssh_pubkey many[4];
 	memset(many, 0, sizeof many);
-	memcpy(many + 2 * 32, pub, 32);
+	many[2] = expect;
 	TCT_EQ_INT(tc_ssh_auth_check(&req, sid, many, 4), TC_OK);
+
+	TCT_CASE("a truncated authorized entry does not match a longer key");
+	/* The length is part of the comparison, not just the bytes: a stored
+	 * prefix of a key must not admit the key it is a prefix of. */
+	tc_ssh_pubkey prefix = expect;
+	prefix.len = expect.len - 1;
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &prefix, 1) != TC_OK);
 }
 
 static void test_an_unauthorized_key_is_refused(void)
@@ -152,15 +186,14 @@ static void test_an_unauthorized_key_is_refused(void)
 
 	uint8_t other_seed[32], other_pub[32];
 	make_key(other_seed, other_pub, 0x33);
-	uint8_t authorized[32];
-	memcpy(authorized, other_pub, 32);
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	tc_ssh_pubkey authorized = pubkey_of(other_pub);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
 	TCT_CASE("mistake 3: an empty authorized list denies rather than allows");
 	/* The opposite convention from --allow, and deliberately so: an absent
 	 * allow list means no restriction, an empty key list means nobody has
 	 * been given a key. Reading the second as the first opens the door. */
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 0) != TC_OK);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 0) != TC_OK);
 	TCT_TRUE(tc_ssh_auth_check(&req, sid, NULL, 0) != TC_OK);
 	TCT_TRUE(tc_ssh_auth_check(&req, sid, NULL, 1) != TC_OK);
 }
@@ -185,9 +218,8 @@ static void test_the_query_form_never_authenticates(void)
 	TCT_TRUE(!req.has_signature);
 
 	/* Even though the key *is* authorized. */
-	uint8_t authorized[32];
-	memcpy(authorized, pub, 32);
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	tc_ssh_pubkey authorized = pubkey_of(pub);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
 	TCT_CASE("and the flag is checked, not just the signature that is absent");
 	/* The check above passes for a weaker reason than it looks: a parsed
@@ -206,10 +238,10 @@ static void test_the_query_form_never_authenticates(void)
 	TCT_TRUE(signed_len > 0);
 	tc_ssh_auth_request valid;
 	TCT_EQ_INT(tc_ssh_auth_parse(&valid, signed_msg, signed_len), TC_OK);
-	TCT_EQ_INT(tc_ssh_auth_check(&valid, sid, authorized, 1), TC_OK);
+	TCT_EQ_INT(tc_ssh_auth_check(&valid, sid, &authorized, 1), TC_OK);
 
 	valid.has_signature = false;
-	TCT_TRUE(tc_ssh_auth_check(&valid, sid, authorized, 1) != TC_OK);
+	TCT_TRUE(tc_ssh_auth_check(&valid, sid, &authorized, 1) != TC_OK);
 }
 
 static void test_the_session_id_is_bound(void)
@@ -232,12 +264,11 @@ static void test_the_session_id_is_bound(void)
 
 	tc_ssh_auth_request req;
 	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, len), TC_OK);
-	uint8_t authorized[32];
-	memcpy(authorized, pub, 32);
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	tc_ssh_pubkey authorized = pubkey_of(pub);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
 	TCT_CASE("and it is accepted on the session it was made for");
-	TCT_EQ_INT(tc_ssh_auth_check(&req, other, authorized, 1), TC_OK);
+	TCT_EQ_INT(tc_ssh_auth_check(&req, other, &authorized, 1), TC_OK);
 }
 
 static void test_the_signed_fields_are_bound(void)
@@ -258,24 +289,165 @@ static void test_the_signed_fields_are_bound(void)
 
 	tc_ssh_auth_request req;
 	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, len), TC_OK);
-	uint8_t authorized[32];
-	memcpy(authorized, pub, 32);
-	TCT_EQ_INT(tc_ssh_auth_check(&req, sid, authorized, 1), TC_OK);
+	tc_ssh_pubkey authorized = pubkey_of(pub);
+	TCT_EQ_INT(tc_ssh_auth_check(&req, sid, &authorized, 1), TC_OK);
 
 	snprintf(req.user, sizeof req.user, "root");
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
 	TCT_CASE("and so does changing the service name");
 	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, len), TC_OK);
 	snprintf(req.service, sizeof req.service, "ssh-userauth");
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
 	TCT_CASE("and any single-bit change to the signature");
+	/* The raw 64 bytes are the tail of the signature blob, which is the
+	 * algorithm name and then the signature string. */
 	for (int bit = 0; bit < 64; bit += 7) {
 		TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, len), TC_OK);
-		req.signature[bit % 64] ^= (uint8_t)(1u << (bit % 8));
-		if (tc_ssh_auth_check(&req, sid, authorized, 1) == TC_OK)
+		TCT_TRUE(req.sigblob_len > 64);
+		req.sigblob[req.sigblob_len - 64 + (size_t)(bit % 64)] ^=
+		    (uint8_t)(1u << (bit % 8));
+		if (tc_ssh_auth_check(&req, sid, &authorized, 1) == TC_OK)
 			TCT_FAILF("a tampered signature was accepted (bit %d)", bit);
+	}
+	tct_checks++;
+
+	TCT_CASE("and naming a different algorithm than the key blob carries");
+	/* Algorithm confusion: the request names the signature algorithm, the
+	 * blob names the key type. An ed25519 key offered under an RSA
+	 * algorithm must not verify -- and must not be handed to the RSA code
+	 * either, which is the more interesting half. */
+	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, len), TC_OK);
+	snprintf(req.algo, sizeof req.algo, "rsa-sha2-256");
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
+
+	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, len), TC_OK);
+	snprintf(req.algo, sizeof req.algo, "ecdsa-sha2-nistp256");
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
+}
+
+static void test_real_requests(void)
+{
+	/* Requests nothing in this repository produced: RSA under both SHA-2
+	 * signature algorithms, ECDSA on both curves, and ed25519. The RSA ones
+	 * are the point -- their key blobs say `ssh-rsa` while the request says
+	 * `rsa-sha2-256`, and the message signed contains the latter. An
+	 * implementation that used one name where the other belongs verifies its
+	 * own signatures perfectly and no client's. */
+	for (size_t i = 0; i < tc_sshauth_num_vectors; i++) {
+		const tc_sshauth_vector *v = &tc_sshauth_vectors[i];
+		TCT_CASE(v->name);
+
+		tc_ssh_auth_request req;
+		TCT_EQ_INT(tc_ssh_auth_parse(&req, v->payload, v->payload_len),
+		           TC_OK);
+		TCT_EQ_INT((int)req.method, (int)TC_SSH_AUTH_METHOD_PUBLICKEY);
+		TCT_TRUE(req.has_signature);
+		TCT_EQ_STR(req.algo, v->algo);
+		TCT_EQ_STR(req.user, TC_SSHAUTH_VECTOR_USER);
+		TCT_EQ_STR(req.service, TC_SSHAUTH_VECTOR_SERVICE);
+
+		/* The authorized entry comes from the vector, not from the parse, so
+		 * a parser that mangled the blob could not also supply the thing it
+		 * is compared against. */
+		tc_ssh_pubkey authorized;
+		memset(&authorized, 0, sizeof authorized);
+		TCT_TRUE(v->keyblob_len <= sizeof authorized.blob);
+		memcpy(authorized.blob, v->keyblob, v->keyblob_len);
+		authorized.len = v->keyblob_len;
+		TCT_EQ_INT((int)req.pubkey.len, (int)v->keyblob_len);
+		TCT_EQ_MEM(req.pubkey.blob, v->keyblob, v->keyblob_len);
+
+		TCT_EQ_INT(tc_ssh_auth_check(&req, tc_sshauth_vector_sid, &authorized,
+		                             1),
+		           TC_OK);
+
+		/* And the same authorized_keys line a person would paste in. */
+		tc_ssh_pubkey parsed;
+		TCT_EQ_INT(tc_authkeys_parse_line(v->authorized_line, &parsed), TC_OK);
+		TCT_EQ_INT((int)parsed.len, (int)v->keyblob_len);
+		TCT_EQ_MEM(parsed.blob, v->keyblob, v->keyblob_len);
+
+		TCT_CASE("on another session id it is refused");
+		uint8_t other[TC_SSH_HASH_LEN];
+		memcpy(other, tc_sshauth_vector_sid, sizeof other);
+		other[0] ^= 1;
+		TCT_TRUE(tc_ssh_auth_check(&req, other, &authorized, 1) != TC_OK);
+
+		TCT_CASE("a single flipped bit in the signature is refused");
+		/* Every eleventh bit rather than all of them: an RSA signature is
+		 * 2048 bits and the loop is the slow part of this file. */
+		for (size_t bit = 0; bit < req.sigblob_len * 8; bit += 11) {
+			TCT_EQ_INT(tc_ssh_auth_parse(&req, v->payload, v->payload_len),
+			           TC_OK);
+			req.sigblob[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+			if (tc_ssh_auth_check(&req, tc_sshauth_vector_sid, &authorized,
+			                      1) == TC_OK)
+				TCT_FAILF("%s: a tampered signature was accepted (bit %zu)",
+				          v->name, bit);
+		}
+		tct_checks++;
+
+		TCT_CASE("under any other algorithm name it is refused");
+		/* Algorithm confusion, in the form a client can actually send it: the
+		 * request names one algorithm and the key blob is a different kind of
+		 * key. Both the signature check and the key-type check should stop
+		 * it, and it must not reach a verifier expecting another shape. */
+		for (size_t j = 0; j < tc_ssh_auth_num_algos; j++) {
+			if (strcmp(tc_ssh_auth_algos[j], v->algo) == 0)
+				continue;
+			TCT_EQ_INT(tc_ssh_auth_parse(&req, v->payload, v->payload_len),
+			           TC_OK);
+			snprintf(req.algo, sizeof req.algo, "%s", tc_ssh_auth_algos[j]);
+			if (tc_ssh_auth_check(&req, tc_sshauth_vector_sid, &authorized,
+			                      1) == TC_OK)
+				TCT_FAILF("%s: accepted as %s", v->name,
+				          tc_ssh_auth_algos[j]);
+		}
+		tct_checks++;
+
+		TCT_CASE("and another vector's key does not authorize it");
+		for (size_t j = 0; j < tc_sshauth_num_vectors; j++) {
+			if (j == i)
+				continue;
+			const tc_sshauth_vector *w = &tc_sshauth_vectors[j];
+			tc_ssh_pubkey wrong;
+			memset(&wrong, 0, sizeof wrong);
+			memcpy(wrong.blob, w->keyblob, w->keyblob_len);
+			wrong.len = w->keyblob_len;
+			TCT_EQ_INT(tc_ssh_auth_parse(&req, v->payload, v->payload_len),
+			           TC_OK);
+			if (tc_ssh_auth_check(&req, tc_sshauth_vector_sid, &wrong, 1) ==
+			    TC_OK)
+				TCT_FAILF("%s: authorized by %s's key", v->name, w->name);
+		}
+		tct_checks++;
+	}
+
+	TCT_CASE("a key blob swapped between two requests is refused");
+	/* The blob is inside the signed message, so pasting another key into a
+	 * valid request cannot be made to verify -- and this is the shape of the
+	 * attack that a verifier checking the signature against the *offered*
+	 * key while authorizing the *stored* one would fall for. */
+	TCT_TRUE(tc_sshauth_num_vectors >= 2);
+	for (size_t i = 0; i + 1 < tc_sshauth_num_vectors; i++) {
+		const tc_sshauth_vector *v = &tc_sshauth_vectors[i];
+		const tc_sshauth_vector *w = &tc_sshauth_vectors[i + 1];
+		tc_ssh_auth_request req;
+		TCT_EQ_INT(tc_ssh_auth_parse(&req, v->payload, v->payload_len), TC_OK);
+		memset(&req.pubkey, 0, sizeof req.pubkey);
+		memcpy(req.pubkey.blob, w->keyblob, w->keyblob_len);
+		req.pubkey.len = w->keyblob_len;
+		snprintf(req.algo, sizeof req.algo, "%s", w->algo);
+
+		tc_ssh_pubkey authorized;
+		memset(&authorized, 0, sizeof authorized);
+		memcpy(authorized.blob, w->keyblob, w->keyblob_len);
+		authorized.len = w->keyblob_len;
+		if (tc_ssh_auth_check(&req, tc_sshauth_vector_sid, &authorized, 1) ==
+		    TC_OK)
+			TCT_FAILF("%s's signature passed for %s's key", v->name, w->name);
 	}
 	tct_checks++;
 }
@@ -295,10 +467,11 @@ static void test_other_methods(void)
 	tc_ssh_auth_request req;
 	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, tc_ssh_wbuf_len(&w)), TC_OK);
 	TCT_EQ_INT((int)req.method, (int)TC_SSH_AUTH_METHOD_NONE);
-	uint8_t sid[TC_SSH_HASH_LEN], authorized[32];
+	uint8_t sid[TC_SSH_HASH_LEN], any[32];
 	memset(sid, 0, sizeof sid);
-	memset(authorized, 0, sizeof authorized);
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	memset(any, 0x5a, sizeof any);
+	tc_ssh_pubkey authorized = pubkey_of(any);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
 	TCT_CASE("a password request parses as a method we do not implement");
 	tc_ssh_wbuf_init(&w, msg, sizeof msg);
@@ -310,18 +483,19 @@ static void test_other_methods(void)
 	tc_ssh_put_cstring(&w, "hunter2");
 	TCT_EQ_INT(tc_ssh_auth_parse(&req, msg, tc_ssh_wbuf_len(&w)), TC_OK);
 	TCT_EQ_INT((int)req.method, (int)TC_SSH_AUTH_METHOD_OTHER);
-	TCT_TRUE(tc_ssh_auth_check(&req, sid, authorized, 1) != TC_OK);
+	TCT_TRUE(tc_ssh_auth_check(&req, sid, &authorized, 1) != TC_OK);
 
-	TCT_CASE("an RSA key parses as a method we cannot check");
-	/* Not malformed: a client offering an RSA key gets a FAILURE and tries
-	 * another, which is what lets an agent with several keys work. */
+	TCT_CASE("a DSA key parses as a method we cannot check");
+	/* Not malformed: a client offering a key we will not verify gets a
+	 * FAILURE and tries another, which is what lets an agent with several
+	 * keys work. ssh-dss signs with SHA-1 and is not in our list. */
 	tc_ssh_wbuf_init(&w, msg, sizeof msg);
 	tc_ssh_put_byte(&w, TC_SSH_MSG_USERAUTH_REQUEST);
 	tc_ssh_put_cstring(&w, "tester");
 	tc_ssh_put_cstring(&w, "ssh-connection");
 	tc_ssh_put_cstring(&w, "publickey");
 	tc_ssh_put_bool(&w, false);
-	tc_ssh_put_cstring(&w, "ssh-rsa");
+	tc_ssh_put_cstring(&w, "ssh-dss");
 	uint8_t fake[64];
 	memset(fake, 7, sizeof fake);
 	tc_ssh_put_string(&w, fake, sizeof fake);
@@ -396,23 +570,33 @@ static void test_replies(void)
 	TCT_EQ_INT((int)len, 1);
 	TCT_EQ_INT(msg[0], TC_SSH_MSG_USERAUTH_SUCCESS);
 
-	TCT_CASE("PK_OK echoes the key it is approving");
+	TCT_CASE("PK_OK echoes the algorithm and the key it is approving");
 	uint8_t pub[32];
 	memset(pub, 0x5e, sizeof pub);
-	TCT_EQ_INT(tc_ssh_auth_pk_ok_build(msg, sizeof msg, &len, pub), TC_OK);
+	tc_ssh_pubkey k = pubkey_of(pub);
+	TCT_EQ_INT(tc_ssh_auth_pk_ok_build(msg, sizeof msg, &len, "ssh-ed25519",
+	                                   &k),
+	           TC_OK);
 	tc_ssh_rbuf_init(&r, msg, len);
 	TCT_EQ_INT(tc_ssh_get_byte(&r), TC_SSH_MSG_USERAUTH_PK_OK);
 	TCT_TRUE(tc_ssh_get_string_eq(&r, "ssh-ed25519"));
 	size_t n = 0;
-	const uint8_t *blob = tc_ssh_get_string(&r, 256, &n);
+	const uint8_t *blob = tc_ssh_get_string(&r, TC_SSH_MAX_KEYBLOB, &n);
 	TCT_TRUE(blob != NULL);
-	tc_ssh_rbuf inner;
-	tc_ssh_rbuf_init(&inner, blob, n);
-	TCT_TRUE(tc_ssh_get_string_eq(&inner, "ssh-ed25519"));
-	size_t klen = 0;
-	const uint8_t *key = tc_ssh_get_string(&inner, 32, &klen);
-	TCT_TRUE(key != NULL && klen == 32);
-	TCT_EQ_MEM(key, pub, 32);
+	TCT_EQ_INT((int)n, (int)k.len);
+	TCT_EQ_MEM(blob, k.blob, k.len);
+
+	TCT_CASE("and the algorithm it echoes is the request's, not the key's");
+	/* RFC 8332: an RSA key is offered under rsa-sha2-256 while its blob
+	 * still says ssh-rsa. A reply that echoed the blob's name instead
+	 * would be answering about an algorithm the client did not ask about,
+	 * and OpenSSH treats that as a mismatch. */
+	TCT_EQ_INT(tc_ssh_auth_pk_ok_build(msg, sizeof msg, &len, "rsa-sha2-256",
+	                                   &k),
+	           TC_OK);
+	tc_ssh_rbuf_init(&r, msg, len);
+	TCT_EQ_INT(tc_ssh_get_byte(&r), TC_SSH_MSG_USERAUTH_PK_OK);
+	TCT_TRUE(tc_ssh_get_string_eq(&r, "rsa-sha2-256"));
 
 	TCT_CASE("a service request round trips");
 	tc_ssh_wbuf w;
@@ -433,6 +617,7 @@ int main(void)
 	test_the_query_form_never_authenticates();
 	test_the_session_id_is_bound();
 	test_the_signed_fields_are_bound();
+	test_real_requests();
 	test_other_methods();
 	test_malformed_requests();
 	test_replies();

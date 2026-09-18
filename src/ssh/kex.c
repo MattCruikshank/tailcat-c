@@ -28,6 +28,24 @@ const char *const tc_ssh_comp_algs[1] = { "none" };
 
 /* ---- KEXINIT ----------------------------------------------------------- */
 
+int tc_ssh_ext_info_build(uint8_t *out, size_t cap, size_t *out_len,
+                          const char *const *algos, size_t num_algos)
+{
+	if (out == NULL || algos == NULL || num_algos == 0)
+		return TC_ERR_INVAL;
+	tc_ssh_wbuf w;
+	tc_ssh_wbuf_init(&w, out, cap);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_EXT_INFO);
+	tc_ssh_put_u32(&w, 1); /* one extension */
+	tc_ssh_put_cstring(&w, "server-sig-algs");
+	tc_ssh_put_namelist(&w, algos, num_algos);
+	if (!tc_ssh_wbuf_ok(&w))
+		return TC_ERR_NOSPACE;
+	if (out_len != NULL)
+		*out_len = tc_ssh_wbuf_len(&w);
+	return TC_OK;
+}
+
 int tc_ssh_kexinit_build(uint8_t *out, size_t cap, size_t *out_len)
 {
 	if (out == NULL)

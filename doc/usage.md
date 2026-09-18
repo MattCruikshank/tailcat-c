@@ -113,9 +113,13 @@ Serve one, to named keys:
 
 The three forms are a file, a literal key, and a GitHub account -- the last
 fetches `https://github.com/alice.keys`, says so before it does, and refuses
-to start if it cannot. Only ed25519 keys can be verified here; others in a
-file are skipped, and a file with none left is an error rather than a server
-nobody can log into.
+to start if it cannot.
+
+The keys that can be verified here are ed25519, ECDSA on P-256 and P-384, and
+RSA signed with SHA-256 or SHA-512. Not `ssh-rsa` or `ssh-dss`, which sign
+with SHA-1; not the `sk-` hardware forms; not P-521; not certificates. A line
+naming one of those is skipped, and a file with none left is an error rather
+than a server nobody can log into.
 
 Key options are refused, not ignored -- as upstream refuses them, for the
 same reason. A line like `command="/usr/bin/backup" ssh-ed25519 AAAA...`

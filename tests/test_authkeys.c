@@ -17,11 +17,14 @@
  *
  * The keys below are real ed25519 public keys in OpenSSH's own encoding,
  * generated for this test. They are public halves and there are no private
- * halves anywhere, so they authenticate nobody.
+ * halves anywhere, so they authenticate nobody. The RSA and ECDSA lines come
+ * from tests/sshauth_vectors.h, which ssh-keygen wrote -- a hand-made line
+ * would only prove this file agrees with itself about the format.
  */
 
 #include "tc/authkeys.h"
 
+#include "sshauth_vectors.h"
 #include "tctest.h"
 
 #include <stdio.h>
@@ -39,9 +42,9 @@
 
 static void ok_line(const char *line, const char *why)
 {
-	uint8_t key[32];
+	tc_ssh_pubkey key;
 	tct_checks++;
-	int rc = tc_authkeys_parse_line(line, key);
+	int rc = tc_authkeys_parse_line(line, &key);
 	if (rc != TC_OK)
 		TCT_FAILF("refused a good line (%s): %s", why,
 		          tc_authkeys_error_string());
@@ -49,9 +52,9 @@ static void ok_line(const char *line, const char *why)
 
 static void bad_line(const char *line, int want, const char *why)
 {
-	uint8_t key[32];
+	tc_ssh_pubkey key;
 	tct_checks++;
-	int rc = tc_authkeys_parse_line(line, key);
+	int rc = tc_authkeys_parse_line(line, &key);
 	if (rc != want)
 		TCT_FAILF("\"%.40s\" (%s): got %d, want %d [%s]", line, why, rc, want,
 		          tc_authkeys_error_string());
@@ -72,12 +75,14 @@ static void test_good_lines(void)
 	 * them: two different lines must give two different keys, and the same
 	 * line twice must give the same one. */
 	TCT_CASE("the bytes are the key");
-	uint8_t a1[32], a2[32], b[32];
-	TCT_EQ_INT(tc_authkeys_parse_line(KEY_A, a1), TC_OK);
-	TCT_EQ_INT(tc_authkeys_parse_line(KEY_A " different comment", a2), TC_OK);
-	TCT_EQ_INT(tc_authkeys_parse_line(KEY_B, b), TC_OK);
-	TCT_EQ_MEM(a1, a2, 32);
-	TCT_TRUE(memcmp(a1, b, 32) != 0);
+	tc_ssh_pubkey a1, a2, b;
+	TCT_EQ_INT(tc_authkeys_parse_line(KEY_A, &a1), TC_OK);
+	TCT_EQ_INT(tc_authkeys_parse_line(KEY_A " different comment", &a2),
+	           TC_OK);
+	TCT_EQ_INT(tc_authkeys_parse_line(KEY_B, &b), TC_OK);
+	TCT_EQ_INT(a1.len, a2.len);
+	TCT_EQ_MEM(a1.blob, a2.blob, a1.len);
+	TCT_TRUE(a1.len != b.len || memcmp(a1.blob, b.blob, a1.len) != 0);
 }
 
 static void test_blank_and_comment(void)
@@ -91,20 +96,58 @@ static void test_blank_and_comment(void)
 	bad_line("\r", TC_ERR_NOTFOUND, "a bare CR");
 }
 
+/* An authorized_keys line for each algorithm the server can verify, exactly
+ * as ssh-keygen wrote it. `ssh-rsa` is the one to look at: the file names the
+ * key *type*, never the rsa-sha2-* signature algorithm the connection will
+ * negotiate, so a parser that asked whether it could verify under `ssh-rsa`
+ * would answer no -- correctly, since that means SHA-1 -- and skip every RSA
+ * key in the world. */
+static void test_every_supported_algorithm(void)
+{
+	TCT_CASE("a real line for each algorithm we accept");
+	for (size_t i = 0; i < tc_sshauth_num_vectors; i++) {
+		const tc_sshauth_vector *v = &tc_sshauth_vectors[i];
+		ok_line(v->authorized_line, v->name);
+
+		tc_ssh_pubkey k;
+		TCT_EQ_INT(tc_authkeys_parse_line(v->authorized_line, &k), TC_OK);
+		TCT_EQ_INT((int)k.len, (int)v->keyblob_len);
+		TCT_EQ_MEM(k.blob, v->keyblob, v->keyblob_len);
+	}
+
+	TCT_CASE("and every one of them is a distinct key");
+	for (size_t i = 0; i < tc_sshauth_num_vectors; i++) {
+		for (size_t j = i + 1; j < tc_sshauth_num_vectors; j++) {
+			const tc_sshauth_vector *a = &tc_sshauth_vectors[i];
+			const tc_sshauth_vector *b = &tc_sshauth_vectors[j];
+			if (a->keyblob_len == b->keyblob_len &&
+			    memcmp(a->keyblob, b->keyblob, a->keyblob_len) == 0)
+				TCT_FAILF("%s and %s are the same key", a->name, b->name);
+		}
+	}
+	tct_checks++;
+}
+
 static void test_other_algorithms_are_skipped(void)
 {
-	TCT_CASE("other algorithms are skipped, not refused");
-	/* Skipped rather than refused because a real authorized_keys has RSA in
-	 * it, and refusing the whole file over a key we cannot verify would make
-	 * the common case fail. The caller turns "every line was skipped" into
-	 * an error of its own. */
-	bad_line("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7 bob@host",
-	         TC_ERR_UNSUPPORTED, "rsa");
-	bad_line("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=",
-	         TC_ERR_UNSUPPORTED, "ecdsa");
+	TCT_CASE("algorithms we cannot verify are skipped, not refused");
+	/* Skipped rather than refused because a real authorized_keys may hold a
+	 * hardware key or an old DSA one, and refusing the whole file over a
+	 * line we cannot use would make the common case fail. The caller turns
+	 * "every line was skipped" into an error of its own.
+	 *
+	 * The blob is never looked at for these -- the algorithm settles it --
+	 * which is why these truncated ones are skipped rather than malformed. */
 	bad_line("sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2",
 	         TC_ERR_UNSUPPORTED, "a security key");
+	bad_line("sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTIt",
+	         TC_ERR_UNSUPPORTED, "an ecdsa security key");
 	bad_line("ssh-dss AAAAB3NzaC1kc3M=", TC_ERR_UNSUPPORTED, "dsa");
+	/* P-521 is a curve mbedtls is not built with here. Skipping it is the
+	 * honest answer; accepting it and failing at verification time would be
+	 * a key that looks configured and never works. */
+	bad_line("ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjE=",
+	         TC_ERR_UNSUPPORTED, "P-521");
 }
 
 static void test_options_are_refused(void)
@@ -150,6 +193,43 @@ static void test_malformed(void)
 	         "hMUFRYXGBkaGxwdHg==",
 	         TC_ERR_INVAL, "a 31-byte key");
 
+	TCT_CASE("a blob that stops early, for each algorithm we do read");
+	/* These name types we support, so the blob is parsed -- and it ends in
+	 * the middle of a field. Malformed, not skipped. */
+	bad_line("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7", TC_ERR_INVAL,
+	         "a truncated rsa key");
+	bad_line("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=",
+	         TC_ERR_INVAL, "a truncated ecdsa key");
+
+	TCT_CASE("a blob with bytes after the key");
+	/* Under a byte comparison a second encoding is a second identity rather
+	 * than a way in, but it is still bytes nothing read, and it would be
+	 * stored and echoed back in PK_OK. OpenSSH parses and refuses; so do we.
+	 *
+	 * This is KEY_A's blob with one 0xff appended. */
+	bad_line("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ3n0Fh0VCpYRgLnDqFadXAJ"
+	         "3MLVGqR3TqBOGm5t6eVj/w==",
+	         TC_ERR_INVAL, "a trailing byte");
+
+	TCT_CASE("an ecdsa key naming one curve and carrying another");
+	/* The curve appears twice, in the algorithm and inside the blob. This is
+	 * a real P-384 key relabelled P-256: taken at its word it would be a
+	 * point read on the wrong group. */
+	{
+		const tc_sshauth_vector *p384 = NULL;
+		for (size_t i = 0; i < tc_sshauth_num_vectors; i++)
+			if (strcmp(tc_sshauth_vectors[i].name, "nistp384") == 0)
+				p384 = &tc_sshauth_vectors[i];
+		TCT_TRUE(p384 != NULL);
+		if (p384 != NULL) {
+			char line[1024];
+			const char *space = strchr(p384->authorized_line, ' ');
+			TCT_TRUE(space != NULL);
+			(void)snprintf(line, sizeof line, "ecdsa-sha2-nistp256%s", space);
+			bad_line(line, TC_ERR_INVAL, "P-384 bytes labelled P-256");
+		}
+	}
+
 	TCT_EQ_INT(tc_authkeys_parse_line(NULL, NULL), TC_ERR_INVAL);
 }
 
@@ -162,14 +242,14 @@ static void test_text_and_dedup(void)
 	    "# my authorized_keys\n"
 	    "\n"
 	    KEY_A " alice@laptop\n"
-	    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7 bob@host\n"
+	    "ssh-dss AAAAB3NzaC1kc3M= bob@host\n"
 	    KEY_B " carol@desktop\n"
 	    "\n"
 	    "   \n"
 	    KEY_C "\n";
 	TCT_EQ_INT(tc_authkeys_add_text(&ks, file), TC_OK);
 	TCT_EQ_INT(ks.count, 3);
-	TCT_EQ_INT(ks.skipped, 1); /* the RSA line, reported rather than lost */
+	TCT_EQ_INT(ks.skipped, 1); /* the DSA line, reported rather than lost */
 
 	TCT_CASE("a file with no trailing newline");
 	tc_authkeys_init(&ks);
@@ -187,8 +267,8 @@ static void test_text_and_dedup(void)
 	TCT_CASE("a file of nothing but unsupported keys yields nothing");
 	tc_authkeys_init(&ks);
 	TCT_EQ_INT(tc_authkeys_add_text(
-	               &ks, "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7 a@b\n"
-	                    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHA=\n"),
+	               &ks, "ssh-dss AAAAB3NzaC1kc3M= a@b\n"
+	                    "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA=\n"),
 	           TC_OK);
 	TCT_EQ_INT(ks.count, 0);
 	TCT_EQ_INT(ks.skipped, 2);
@@ -308,7 +388,7 @@ static void test_specs(void)
 	 * empty list is a server nobody can log into, and the operator would
 	 * have no idea why. */
 	tc_authkeys_init(&ks);
-	g_fetch_body = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7 alice\n";
+	g_fetch_body = "ssh-dss AAAAB3NzaC1kc3M= alice\n";
 	TCT_EQ_INT(tc_authkeys_add_spec(&ks, "alice@github", fake_fetch, NULL),
 	           TC_ERR_NOTFOUND);
 	TCT_EQ_INT(ks.count, 0);
@@ -348,6 +428,7 @@ int main(void)
 {
 	test_good_lines();
 	test_blank_and_comment();
+	test_every_supported_algorithm();
 	test_other_algorithms_are_skipped();
 	test_options_are_refused();
 	test_malformed();

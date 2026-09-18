@@ -21,9 +21,9 @@
 
 #define KEXINIT_MAX 2048
 
-/* RFC 8308's extension negotiation. OpenSSH and Go both send it right after
- * NEWKEYS; it carries no obligation and is ignored here. */
-#define TC_SSH_MSG_EXT_INFO 7
+/* RFC 8308's extension negotiation -- TC_SSH_MSG_EXT_INFO, from tc/sshkex.h.
+ * OpenSSH, Go and our own server all send it right after NEWKEYS. It carries
+ * no obligation for a client that only has one key type, and is ignored. */
 
 struct tc_ssh_client {
 	const tc_ssh_client_opts *opts;

@@ -464,6 +464,22 @@ static int kex_exchange(tc_ssh_server *s)
 	if (!first)
 		s->rekeys++;
 	s->kex_done = true;
+
+	/* RFC 8308: immediately after NEWKEYS, and only the first time. A client
+	 * that wants it says so with the `ext-info-c` marker in its KEXINIT
+	 * algorithm lists; sending it regardless is allowed and simpler, and a
+	 * client that did not ask ignores an unknown message type.
+	 *
+	 * Failing to send it would leave RSA keys unusable from OpenSSH -- see
+	 * tc/sshkex.h -- so this is load-bearing rather than informational. */
+	if (first) {
+		uint8_t ext[256];
+		size_t ext_len = 0;
+		if (tc_ssh_ext_info_build(ext, sizeof ext, &ext_len,
+		                          tc_ssh_auth_algos,
+		                          tc_ssh_auth_num_algos) == TC_OK)
+			(void)send_packet(s, ext, ext_len);
+	}
 	rc = TC_OK;
 
 keys_done:
@@ -494,7 +510,12 @@ static int do_auth(tc_ssh_server *s)
 	if (strcmp(service, "ssh-userauth") != 0)
 		return TC_ERR_INVAL;
 
-	uint8_t buf[512];
+	/* Big enough for the largest reply built below, which is PK_OK: it
+	 * echoes the offered key blob verbatim, and an RSA-4096 blob is 535
+	 * bytes. Sizing this at 512 would have been a connection dropped rather
+	 * than a key refused, on the query form every OpenSSH client sends
+	 * first -- and only for people with large keys. */
+	uint8_t buf[TC_SSH_MAX_KEYBLOB + 128];
 	size_t buf_len = 0;
 	rc = tc_ssh_service_accept_build(buf, sizeof buf, &buf_len,
 	                                 "ssh-userauth");
@@ -560,13 +581,13 @@ static int do_auth(tc_ssh_server *s)
 		if (req.method == TC_SSH_AUTH_METHOD_PUBLICKEY && !req.has_signature) {
 			bool known = s->opts->any_key_authenticates;
 			for (size_t i = 0; i < s->opts->num_authorized; i++)
-				if (tc_ct_equal(s->opts->authorized +
-				                    i * TC_SSH_ED25519_PUB_LEN,
-				                req.pubkey, TC_SSH_ED25519_PUB_LEN))
+				if (s->opts->authorized[i].len == req.pubkey.len &&
+				    tc_ct_equal(s->opts->authorized[i].blob,
+				                req.pubkey.blob, req.pubkey.len))
 					known = true;
 			if (known)
 				rc = tc_ssh_auth_pk_ok_build(buf, sizeof buf, &buf_len,
-				                             req.pubkey);
+				                             req.algo, &req.pubkey);
 			else
 				rc = tc_ssh_auth_failure_build(buf, sizeof buf, &buf_len);
 			if (rc != TC_OK)
@@ -583,8 +604,8 @@ static int do_auth(tc_ssh_server *s)
 		 * key is on a list, which something below this layer has already
 		 * answered. An unsigned request never gets here. */
 		bool ok = s->opts->any_key_authenticates
-		              ? tc_ssh_auth_check(&req, s->session_id, req.pubkey, 1) ==
-		                    TC_OK
+		              ? tc_ssh_auth_check(&req, s->session_id, &req.pubkey,
+		                                  1) == TC_OK
 		              : tc_ssh_auth_check(&req, s->session_id,
 		                                  s->opts->authorized,
 		                                  s->opts->num_authorized) == TC_OK;

@@ -15,7 +15,7 @@
  * the client prints what we wrote and exits zero. If any one of them is
  * wrong, it does not.
  *
- * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex>
+ * Usage: livesshd <port> <host-seed-hex> <authorized>
  *                 [<dir> [ro|rw|wo|wo+] | shell]
  *
  * The mode picks the policy the directory is served under: `wo` is the drop
@@ -37,6 +37,8 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include "tc/authkeys.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +75,40 @@ static int unhex(const char *s, uint8_t *out, size_t want)
 		if (hi < 0 || lo < 0)
 			return -1;
 		out[i] = (uint8_t)(hi << 4 | lo);
+	}
+	return 0;
+}
+
+/* read_authorized turns the third argument into the key list.
+ *
+ * Two forms, told apart by inspection rather than by a flag, because they
+ * cannot be confused for one another: 64 hex digits are one raw ed25519
+ * public key, which is what the older scripts pass and what our own client
+ * prints; anything else is authorized_keys text, one or more lines, parsed by
+ * the same code the real server uses.
+ *
+ * The second form is the one that matters for RSA and ECDSA, whose keys have
+ * no fixed length and are never written as bare hex anywhere. */
+static int read_authorized(const char *arg, tc_authkeys *ks)
+{
+	tc_authkeys_init(ks);
+
+	uint8_t raw[32];
+	if (unhex(arg, raw, sizeof raw) == 0) {
+		tc_ssh_wbuf w;
+		tc_ssh_wbuf_init(&w, ks->key[0].blob, sizeof ks->key[0].blob);
+		tc_ssh_put_cstring(&w, "ssh-ed25519");
+		tc_ssh_put_string(&w, raw, sizeof raw);
+		if (!tc_ssh_wbuf_ok(&w))
+			return -1;
+		ks->key[0].len = tc_ssh_wbuf_len(&w);
+		ks->count = 1;
+		return 0;
+	}
+
+	if (tc_authkeys_add_text(ks, arg) != TC_OK || ks->count == 0) {
+		fprintf(stderr, "livesshd: %s\n", tc_authkeys_error_string());
+		return -1;
 	}
 	return 0;
 }
@@ -239,7 +275,9 @@ int main(int argc, char **argv)
 {
 	if (argc < 4 || argc > 6) {
 		fprintf(stderr, "usage: livesshd <port> <host-seed-hex> "
-		                "<authorized-hex> [<dir> [ro|rw|wo]]\n");
+		                "<authorized> [<dir> [ro|rw|wo]]\n"
+		                "  <authorized> is 64 hex digits (one ed25519 key) "
+		                "or authorized_keys text\n");
 		return 2;
 	}
 	if (argc >= 5 && strcmp(argv[4], "shell") == 0)
@@ -261,12 +299,16 @@ int main(int argc, char **argv)
 		}
 	}
 	int port = atoi(argv[1]);
-	uint8_t seed[32], authorized[32];
-	if (unhex(argv[2], seed, sizeof seed) != 0 ||
-	    unhex(argv[3], authorized, 32) != 0) {
-		fprintf(stderr, "livesshd: bad hex\n");
+	uint8_t seed[32];
+	if (unhex(argv[2], seed, sizeof seed) != 0) {
+		fprintf(stderr, "livesshd: bad host seed hex\n");
 		return 2;
 	}
+	static tc_authkeys authorized;
+	if (read_authorized(argv[3], &authorized) != 0)
+		return 2;
+	fprintf(stderr, "livesshd: %zu authorized key(s), %zu skipped\n",
+	        authorized.count, authorized.skipped);
 
 	int ls = socket(AF_INET, SOCK_STREAM, 0);
 	if (ls < 0) {
@@ -304,8 +346,8 @@ int main(int argc, char **argv)
 	tc_ssh_server_opts opts;
 	memset(&opts, 0, sizeof opts);
 	opts.host_seed = seed;
-	opts.authorized = authorized;
-	opts.num_authorized = 1;
+	opts.authorized = authorized.key;
+	opts.num_authorized = authorized.count;
 	opts.read = sock_read;
 	opts.write = sock_write;
 	opts.io_ctx = &fd;

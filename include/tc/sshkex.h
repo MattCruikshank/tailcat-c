@@ -79,6 +79,19 @@ extern const char *const tc_ssh_comp_algs[1];
  * cookie and a different hash. */
 int tc_ssh_kexinit_build(uint8_t *out, size_t cap, size_t *out_len);
 
+/* SSH_MSG_EXT_INFO, RFC 8308. Sent once, straight after NEWKEYS. */
+#define TC_SSH_MSG_EXT_INFO 7
+
+/* tc_ssh_ext_info_build writes an EXT_INFO carrying server-sig-algs: the
+ * public key algorithms this server will verify a signature under.
+ *
+ * A client that is never told assumes the server has only SHA-1 `ssh-rsa`,
+ * which OpenSSH has declined to use by default since 8.8 -- so it will not
+ * offer an RSA key at all, and the failure looks like the key being wrong
+ * rather than the server being quiet. */
+int tc_ssh_ext_info_build(uint8_t *out, size_t cap, size_t *out_len,
+                          const char *const *algos, size_t num_algos);
+
 /* What a peer's KEXINIT resolved to. */
 typedef struct {
 	/* The index into our own list, so the caller names the algorithm rather

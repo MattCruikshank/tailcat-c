@@ -217,7 +217,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-dropbox-tree live-files live-shell live-ssh-serve live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshkeys live-sshloop live-dropbox live-dropbox-tree live-files live-shell live-ssh-serve live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 # doc/usage.md is the source for src/usage_text.c, which is committed so that
@@ -483,6 +483,12 @@ live-sshloop: $(BUILD)/livesshd $(BUILD)/livesshcli
 
 live-sshd: $(BUILD)/livesshd
 	BUILD=$(BUILD) sh scripts/live-sshd.sh
+
+# Every authorized-key algorithm, negotiated by a real OpenSSH client. The
+# unit tests cover the formats; this covers EXT_INFO, without which an RSA
+# key is never offered at all.
+live-sshkeys: $(BUILD)/livesshd
+	BUILD=$(BUILD) sh scripts/live-sshkeys.sh
 
 # And the drop box, driven by a real scp and sftp. The refusals are the
 # feature, so the checks are on the filesystem afterwards rather than on what

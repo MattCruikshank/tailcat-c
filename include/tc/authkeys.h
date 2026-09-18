@@ -18,22 +18,29 @@
  * `serve ssh` becomes a server nobody can log into, or worse, one whose
  * operator thinks three people can.
  *
- * ---- only ed25519 -------------------------------------------------------
+ * ---- which algorithms ---------------------------------------------------
  *
- * Lines naming any other algorithm are skipped, not refused: a real
- * authorized_keys file has RSA and ECDSA keys in it, and refusing the file
- * because of them would make the common case fail. But a file whose lines
- * were *all* skipped yields no keys, and an empty list is fatal above -- so
- * "your keys are all RSA" surfaces as a refusal to start rather than as a
- * server that silently admits nobody.
+ * Whatever the SSH server can verify, which is the list in tc/sshauth.h:
+ * ed25519, ECDSA on P-256 and P-384, and RSA signing with SHA-256 or
+ * SHA-512. The two must agree, so this asks rather than keeping its own
+ * copy -- a key accepted here and unverifiable there would be a key that
+ * silently never works.
  *
- * This is a real limitation and not a simplification: the SSH server here
- * verifies ed25519 signatures and nothing else, so an RSA key in the list
- * would be a key that can never authenticate.
+ * Lines naming anything else are skipped rather than refused: a real
+ * authorized_keys may hold a `sk-` hardware key or an old DSA one, and
+ * refusing the whole file over a line we cannot use would make the common
+ * case fail. A file whose lines were *all* skipped yields no keys, and an
+ * empty list is fatal above -- so "none of your keys are usable here"
+ * surfaces as a refusal to start rather than a server that admits nobody.
+ *
+ * Still absent, and deliberately: `ssh-rsa` and `ssh-dss`, which sign with
+ * SHA-1; the `sk-*` hardware forms; and OpenSSH certificates. See
+ * tc/sshauth.h.
  */
 #ifndef TC_AUTHKEYS_H_
 #define TC_AUTHKEYS_H_
 
+#include "tc/sshauth.h"
 #include "tc/tc.h"
 
 #include <stdbool.h>
@@ -45,11 +52,13 @@
 #define TC_AUTHKEYS_MAX 64
 
 typedef struct {
-	uint8_t key[TC_AUTHKEYS_MAX][32];
+	/* Wire-format blobs, because that is what the server compares against
+	 * and what the client's signature covers. */
+	tc_ssh_pubkey key[TC_AUTHKEYS_MAX];
 	size_t count;
 	/* Lines that named an algorithm we cannot verify. Counted so the caller
-	 * can say "3 keys, 2 skipped (not ed25519)" rather than leaving someone
-	 * to wonder where their RSA key went. */
+	 * can say "3 keys, 2 skipped" rather than leaving someone to wonder
+	 * where a key went. */
 	size_t skipped;
 } tc_authkeys;
 
@@ -57,9 +66,9 @@ void tc_authkeys_init(tc_authkeys *ks);
 
 /* tc_authkeys_parse_line reads one authorized_keys line.
  *
- * Returns TC_OK and fills out on an ed25519 key, TC_ERR_UNSUPPORTED for a
- * well-formed line naming another algorithm, TC_ERR_NOTFOUND for a blank or
- * comment line, and TC_ERR_INVAL for a line that is malformed.
+ * Returns TC_OK and fills out on a key we can verify, TC_ERR_UNSUPPORTED for
+ * a well-formed line naming an algorithm we cannot, TC_ERR_NOTFOUND for a
+ * blank or comment line, and TC_ERR_INVAL for a line that is malformed.
  *
  * Leading options -- `no-pty,from="10.0.0.0/8" ssh-ed25519 AAAA...` -- are
  * *refused*, not ignored. Every one of them is a restriction, and a server
@@ -68,7 +77,7 @@ void tc_authkeys_init(tc_authkeys *ks);
  * key without its restriction is the thing being asked for. So the line is
  * malformed as far as this program is concerned, and it says so.
  */
-int tc_authkeys_parse_line(const char *line, uint8_t out[32]);
+int tc_authkeys_parse_line(const char *line, tc_ssh_pubkey *out);
 
 /* tc_authkeys_add_text reads many lines. Returns TC_ERR_TOOMANY if the list
  * fills. Malformed lines are an error; unsupported and blank ones are not. */

@@ -199,7 +199,7 @@ direct peer-to-peer paths.
 | `serve no-auth-ssh` | ✅ with upstream's warnings | ✅ |
 | `serve files` (`--files <dir>[:ro\|:rw\|:wo\|:wo+]`) | ✅ read, list, stat, write, drop box, tree drop box | ✅ |
 | `recv --accept-dirs` (recursive drop box) | ✅ | ✅ |
-| `--ssh-authorized-keys` (file, literal key, `user@github`) | ✅ ed25519 only | ✅ |
+| `--ssh-authorized-keys` (file, literal key, `user@github`) | ✅ ed25519, ECDSA P-256/P-384, RSA (SHA-2) | ✅ |
 | `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
 | `genkey`, `printpub` (saved identities) | ✅ | ✅ |
@@ -218,11 +218,11 @@ direct peer-to-peer paths.
 | `genkey --fixed-region` | ✅ | ✅ |
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
 | reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
-| non-ed25519 authorized keys (RSA, ECDSA) | ❌ skipped, and said so | ✅ |
+| `ssh-rsa` (SHA-1), `ssh-dss`, `sk-*`, P-521, certificates | ❌ skipped, and said so | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | **built, never run** — see [BSD-plan.md](BSD-plan.md) | ✅ (macOS) |
-| aarch64 | ✅ all 36 test binaries pass on real aarch64 instructions (qemu-user) | ✅ |
+| aarch64 | ✅ all 40 test binaries pass on real aarch64 instructions (qemu-user) | ✅ |
 | Browser (WebAssembly) | ❌ | ✅ |
 | Persistent keys on disk | ✅ | ✅ |
 
@@ -235,9 +235,13 @@ SFTP server of our own.
 
 What is left of upstream's surface is the **browser build**, which
 Cosmopolitan cannot target, and one difference that is a choice rather than a
-gap: authorized keys must be ed25519, because that is the only signature this
-server verifies. An RSA line would be a key that could never authenticate, so
-those are skipped and counted rather than silently kept.
+gap: an authorized key must be one of ed25519, ECDSA on P-256 or P-384, or RSA
+verified with SHA-256 or SHA-512 — everything anyone actually has. What is not
+accepted is `ssh-rsa` and `ssh-dss`, which sign with SHA-1; the `sk-*`
+hardware forms; P-521, which this Mbed TLS build does not carry; and OpenSSH
+certificates. Upstream takes all of those. A line naming one is skipped and
+counted rather than silently kept, because a key accepted into the list and
+unverifiable at login would look configured and never work.
 
 Getting to that point took asking an awkward question. The walkthrough of
 upstream's README had been kept up to date *by hand* as features landed —
@@ -372,7 +376,7 @@ scripts/wslmake.sh 'make test'
 
 ## Verification
 
-37 test binaries, 10,185 assertions, under two toolchains and on both
+40 test binaries, 11,490 assertions, under two toolchains and on both
 architectures. The method matters
 more than the count, and it is the same one everywhere: **check against
 something that is not ours.**
@@ -1939,7 +1943,8 @@ recv` drop box since then.
       subset, with TinySSH as a reference and not a dependency. RFC 4251's
       wire types, the binary packet protocol with
       `chacha20-poly1305@openssh.com`, `curve25519-sha256`, `ssh-ed25519`
-      host keys, publickey authentication, one channel, and rekeying as a
+      host keys, publickey authentication under five algorithms, one channel,
+      RFC 8308 extension negotiation, and rekeying as a
       responder — server and client both, in 2,900 lines against the ~20,000
       of Go a general implementation takes. `make live-sshd` puts a real
       OpenSSH 9.6 client against our server and `make live-sshloop` runs our
@@ -1982,6 +1987,45 @@ recv` drop box since then.
       quietly shortening large transfers for every service, not just this
       one.
 
+- [x] **RSA and ECDSA authorized keys.** `--ssh-authorized-keys` took
+      ed25519 and skipped everything else, which is a fine answer until
+      someone's `~/.ssh/authorized_keys` is an RSA key from 2014 and the
+      server starts by announcing it has no usable keys. Upstream accepts
+      ed25519, RSA under four algorithm names, ECDSA on three curves,
+      `ssh-dss`, the `sk-*` hardware forms and certificates. This now accepts
+      ed25519, ECDSA on P-256 and P-384, and RSA verified with SHA-256 or
+      SHA-512 — which is every key anyone actually has — and still skips the
+      SHA-1 algorithms, P-521, the hardware forms and certificates.
+
+      Three things about it were not obvious in advance.
+
+      **The key type is not the signature algorithm.** RFC 8332 added
+      `rsa-sha2-256` and `rsa-sha2-512` as ways to *sign* with a key whose
+      blob still says `ssh-rsa`, and `authorized_keys` names the key type.
+      So the question a file asks — "can you verify this?" — has the answer
+      "yes" for `ssh-rsa` and the question a request asks has the answer
+      "no", for the same string. There are two functions because there are
+      two questions; one of them would have skipped every RSA key on earth.
+
+      **A server that says nothing gets no RSA keys.** An OpenSSH client
+      that is not sent RFC 8308's `server-sig-algs` assumes SHA-1 `ssh-rsa`
+      is all a server has, and has refused to use that by default since 8.8
+      — so it never offers the key, and the user sees `Permission denied
+      (publickey)` with a perfectly good key loaded. Nothing in that failure
+      points at the server having been quiet. `make live-sshkeys` asserts the
+      algorithm OpenSSH actually signed with, and deleting the EXT_INFO send
+      makes it fail exactly that way.
+
+      **A round trip proves less than it looks.** Everything here is format:
+      two names that must differ, a signature two length prefixes deep, a
+      message rebuilt field by field. A test that signs with the library
+      that verifies agrees with itself about any of that it gets wrong. So
+      `tools/gen-sshauth-vectors.py` takes keys from `ssh-keygen` and
+      signatures from `openssl`, and the vectors are checked in — and
+      because new keys and randomised ECDSA make them irreproducible, the
+      level 1 check regenerates them and runs the test rather than diffing,
+      which is the mistake bug 19 was.
+
 - [x] **`ls`, in-process.** Upstream's `ls` is the one file command it does
       not shell out for, so ours does not either: an SSH client and an SFTP
       client over our own tunnel, printing what upstream prints. `make
@@ -1990,10 +2034,11 @@ recv` drop box since then.
 **Phases 1 through 5 are done**, apart from the browser build, which
 Cosmopolitan cannot target, and TLS 1.3, which is blocked on Mbed TLS's X.509
 parser rather than on effort. Of upstream's surface, what is left is one
-difference that is a choice rather than a gap: authorized keys must be
-ed25519, because that is the only signature this SSH server verifies, so
-other lines are skipped and counted rather than silently kept. See
-[PLAN.md](PLAN.md) for the detail.
+difference that is a choice rather than a gap: an authorized key must be
+ed25519, ECDSA on P-256 or P-384, or RSA signed with SHA-2 — not the SHA-1
+algorithms, the hardware-token forms, P-521 or certificates, all of which
+upstream takes. Those lines are skipped and counted rather than silently
+kept. See [PLAN.md](PLAN.md) for the detail.
 
 ## Licence
 

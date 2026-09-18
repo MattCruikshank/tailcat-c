@@ -87,7 +87,7 @@ static bool next_token(const char **p, char *out, size_t cap)
 	return true;
 }
 
-int tc_authkeys_parse_line(const char *line, uint8_t out[32])
+int tc_authkeys_parse_line(const char *line, tc_ssh_pubkey *out)
 {
 	if (line == NULL || out == NULL)
 		return TC_ERR_INVAL;
@@ -112,52 +112,58 @@ int tc_authkeys_parse_line(const char *line, uint8_t out[32])
 		      "grant more than the line asks for");
 		return TC_ERR_INVAL;
 	}
-	if (strcmp(algo, "ssh-ed25519") != 0) {
-		FAILF("%s keys cannot be verified by this server; only ed25519",
-		      algo);
+	/* The token is a key type -- `ssh-rsa`, not `rsa-sha2-256`. Which
+	 * signature algorithm gets used over it is negotiated per connection and
+	 * is not written down here. */
+	const char *type = tc_ssh_auth_key_type(algo);
+	if (!tc_ssh_auth_can_verify_key_type(type)) {
+		/* Asked of the verifier rather than decided here, so the two lists
+		 * cannot drift apart into a key this accepts and that cannot
+		 * check. */
+		FAILF("%s keys cannot be verified by this server", algo);
 		return TC_ERR_UNSUPPORTED;
 	}
 
 	char b64[1024];
 	if (!next_token(&p, b64, sizeof b64)) {
-		FAILF("ssh-ed25519 with no key after it");
+		FAILF("%s with no key after it", algo);
 		return TC_ERR_INVAL;
 	}
 
-	uint8_t blob[128];
+	uint8_t blob[TC_SSH_MAX_KEYBLOB];
 	size_t blob_len = 0;
 	if (mbedtls_base64_decode(blob, sizeof blob, &blob_len,
 	                          (const unsigned char *)b64,
 	                          strlen(b64)) != 0) {
-		FAILF("the key is not valid base64");
+		/* Either not base64 or a key larger than we hold. An RSA-8192 key
+		 * lands here, and refusing it is right: it could be stored and
+		 * never matched, since the offered key would not fit either. */
+		FAILF("the key is not valid base64, or is too large");
 		return TC_ERR_INVAL;
 	}
 
-	/* The blob repeats the algorithm inside itself, and the two must agree:
-	 * a line that says ssh-ed25519 while carrying an RSA blob is either
-	 * corrupt or an attempt to get a key past a check that only read the
-	 * first token. OpenSSH requires the same agreement. */
+	/* The blob repeats the type inside itself, and the two must agree: a
+	 * line that says ssh-ed25519 while carrying an RSA blob is either corrupt
+	 * or an attempt to get a key past a check that only read the first token.
+	 * OpenSSH requires the same agreement. */
 	tc_ssh_rbuf r;
 	tc_ssh_rbuf_init(&r, blob, blob_len);
-	if (!tc_ssh_get_string_eq(&r, "ssh-ed25519")) {
-		FAILF("the line says ssh-ed25519 but the key does not");
-		return TC_ERR_INVAL;
-	}
-	size_t klen = 0;
-	const uint8_t *k = tc_ssh_get_string(&r, 32, &klen);
-	if (k == NULL || klen != 32 || !tc_ssh_rbuf_ok(&r)) {
-		FAILF("the key is not 32 bytes");
-		return TC_ERR_INVAL;
-	}
-	/* Trailing bytes inside the blob mean it is not the structure it claims
-	 * to be, whatever else it may decode to. */
-	if (tc_ssh_rbuf_remaining(&r) != 0) {
-		FAILF("the key has %zu bytes after it",
-		      tc_ssh_rbuf_remaining(&r));
+	if (!tc_ssh_get_string_eq(&r, type)) {
+		FAILF("the line says %s but the key does not", algo);
 		return TC_ERR_INVAL;
 	}
 
-	memcpy(out, k, 32);
+	memcpy(out->blob, blob, blob_len);
+	out->len = blob_len;
+
+	/* And the rest of the blob has to be a key of that type, ending where it
+	 * says it ends. A stored blob is compared byte for byte and echoed back
+	 * in PK_OK, so bytes nobody read would be bytes nobody ever reads. */
+	if (!tc_ssh_pubkey_wellformed(type, out)) {
+		memset(out, 0, sizeof *out);
+		FAILF("the %s key is malformed", algo);
+		return TC_ERR_INVAL;
+	}
 	return TC_OK;
 }
 
@@ -182,8 +188,9 @@ int tc_authkeys_add_text(tc_authkeys *ks, const char *text)
 		memcpy(line, p, n);
 		line[n] = '\0';
 
-		uint8_t key[32];
-		int rc = tc_authkeys_parse_line(line, key);
+		tc_ssh_pubkey key;
+		memset(&key, 0, sizeof key);
+		int rc = tc_authkeys_parse_line(line, &key);
 		if (rc == TC_ERR_UNSUPPORTED) {
 			ks->skipped++;
 		} else if (rc == TC_OK) {
@@ -196,13 +203,14 @@ int tc_authkeys_add_text(tc_authkeys *ks, const char *text)
 			 * must not take two slots. */
 			bool dup = false;
 			for (size_t i = 0; i < ks->count; i++) {
-				if (memcmp(ks->key[i], key, 32) == 0) {
+				if (ks->key[i].len == key.len &&
+				    memcmp(ks->key[i].blob, key.blob, key.len) == 0) {
 					dup = true;
 					break;
 				}
 			}
 			if (!dup)
-				memcpy(ks->key[ks->count++], key, 32);
+				ks->key[ks->count++] = key;
 		} else if (rc != TC_ERR_NOTFOUND) {
 			/* Prefix the line number: "bad key" against a forty-line file
 			 * is not a diagnostic anyone can act on. */

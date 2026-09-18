@@ -15,11 +15,13 @@ other than effort: WebAssembly, on a toolchain that does not exist for
 Cosmopolitan, and TLS 1.3, on an Ed25519 certificate Mbed TLS cannot parse.
 
 What is left of upstream's surface is two differences that are choices rather
-than gaps: authorized keys must be ed25519, because that is the only signature
-this SSH server verifies, and Windows sessions run on pipes because
-Cosmopolitan has no pseudo-terminals there. (`authorized_keys` options being
-refused was listed here as a third, until reading upstream's source showed it
-makes the same choice for the same reason.)
+than gaps: an authorized key must be ed25519, ECDSA on P-256 or P-384, or RSA
+verified with SHA-256 or SHA-512 — upstream additionally takes `ssh-rsa` and
+`ssh-dss`, which sign with SHA-1, the `sk-*` hardware forms, P-521 and
+OpenSSH certificates — and Windows sessions run on pipes because Cosmopolitan
+has no pseudo-terminals there. (`authorized_keys` options being refused was
+listed here as a third, until reading upstream's source showed it makes the
+same choice for the same reason.)
 
 **The largest open risk is not a feature.** Four of the six platforms this
 binary claims -- macOS, FreeBSD, OpenBSD, NetBSD -- have never run it. Bugs 46
@@ -1318,9 +1320,9 @@ These are already in the README's TODO list and do not depend on any feature.
   checks locally in three tiers; see the README. Hosted CI was rejected
   deliberately -- the live tests dial Tailscale's production relays, and that
   is not something to automate on every push.
-- ~~**aarch64**~~: done. `make test-aarch64` runs all 36 test binaries on
-  real aarch64 instructions under qemu-user, and they pass -- 9,979
-  assertions, first attempt. Both halves of every fat binary now execute
+- ~~**aarch64**~~: done. `make test-aarch64` runs all 40 test binaries on
+  real aarch64 instructions under qemu-user, and they pass -- 11,490
+  assertions, and it passed the first time it was run. Both halves of every fat binary now execute
   their own instructions, where for most of this project's life one half had
   been compiled and never invoked. `make test-unsigned-char` remains as the
   cheap check that needs no emulator. Above this: qemu-system, which would

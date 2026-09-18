@@ -348,6 +348,26 @@ if [ "$LEVEL" -eq 1 ]; then
 			exit 1
 		fi'
 
+	# tests/sshauth_vectors.h is the one generated file that is NOT checked by
+	# regenerating and diffing. It cannot be: every run makes new keys, and
+	# ECDSA signatures are randomized, so a diff would fail every time and
+	# the check would be worse than nothing -- that is bug 19 exactly.
+	#
+	# What is worth checking is the property the file exists for: that fresh
+	# output from ssh-keygen and openssl still verifies. So this regenerates
+	# into the tree, runs the test against the new vectors, and puts the
+	# committed ones back. A break here means the generator or the verifier
+	# moved, which a diff would have told us in a much more confusing way.
+	stage --need ssh-keygen "vectors regenerated from ssh-keygen still verify" '
+		cp tests/sshauth_vectors.h /tmp/sshauth_vectors.before &&
+		python3 tools/gen-sshauth-vectors.py &&
+		rc=0 &&
+		{ make build/cosmo/test_sshauth >/dev/null 2>&1 &&
+		  ./build/cosmo/test_sshauth; } || rc=$? &&
+		cp /tmp/sshauth_vectors.before tests/sshauth_vectors.h &&
+		make build/cosmo/test_sshauth >/dev/null 2>&1 &&
+		exit $rc'
+
 	# src/usage_text.c is doc/usage.md turned into a C string literal, and is
 	# committed so that a build needs no Python. That makes it possible to
 	# edit the prose and ship the old text, which nothing else would notice:
@@ -395,6 +415,8 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: --allow admits and refuses" "make live-allow"
 	stage "live: a saved key through both implementations" "make live-genkey"
 	stage --need ssh "live: real OpenSSH against our SSH server" "make live-sshd"
+	stage --need ssh "live: every authorized-key algorithm, negotiated" \
+		"make live-sshkeys"
 	stage --need sftp "live: scp and sftp against the write-only drop box" "make live-dropbox"
 	stage --need sftp "live: a tree into the recursive drop box" "make live-dropbox-tree"
 	stage --need sftp "live: scp and sftp against a served directory" "make live-files"

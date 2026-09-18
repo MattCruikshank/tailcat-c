@@ -83,10 +83,10 @@ typedef struct {
 	 * the point of pinning and not a bug to work around. */
 	const uint8_t *host_seed; /* 32 bytes */
 
-	/* Keys allowed in, packed end to end at 32 bytes each. An empty list
-	 * denies everyone; see tc/sshauth.h for why that is not the same
-	 * convention --allow follows. */
-	const uint8_t *authorized;
+	/* Keys allowed in, as SSH wire-format blobs. An empty list denies
+	 * everyone; see tc/sshauth.h for why that is not the same convention
+	 * --allow follows. */
+	const tc_ssh_pubkey *authorized;
 	size_t num_authorized;
 
 	/* Let anyone in who reached this far, because something below this

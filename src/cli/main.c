@@ -192,8 +192,8 @@ static void usage(FILE *f)
 	        "                        names and can tell a directory "
 	        "exists\n"
 	        "      --ssh-authorized-keys SPEC[,SPEC...]\n"
-	        "                        for serve ssh: a file, a literal "
-	        "ssh-ed25519 key,\n"
+	        "                        for serve ssh: a file, a literal public "
+	        "key,\n"
 	        "                        or user@github. Comma-separated, and "
 	        "repeatable.\n"
 	        "      --skip-dns-safety-check\n"
@@ -2197,9 +2197,12 @@ static void ssh_banner(const tc_authkeys *keys, const char *forced,
 		fprintf(stderr, "# serving a shell to %zu authorized key%s\n", n,
 		        n == 1 ? "" : "s");
 		if (skipped > 0)
+			/* Naming what *is* accepted, not what was refused: whoever
+			 * reads this is holding a key and wants to know whether to go
+			 * and make a different one. */
 			fprintf(stderr,
-			        "# %zu key%s skipped: only ed25519 can be verified "
-			        "here\n",
+			        "# %zu key%s skipped: ed25519, ECDSA P-256/P-384 and "
+			        "RSA with SHA-2 can be verified here\n",
 			        skipped, skipped == 1 ? " was" : "s were");
 	}
 	if (forced != NULL)
@@ -2300,7 +2303,7 @@ static void run_recv_session(serve_state *st, serve_client *sc,
 		 * still the outer gate, but a shell is not a drop box -- whoever
 		 * gets one can do anything this account can, so the address alone
 		 * is not enough and upstream does not make it enough either. */
-		opts.authorized = st->ssh_keys.key[0];
+		opts.authorized = st->ssh_keys.key;
 		opts.num_authorized = st->ssh_keys.count;
 	} else {
 		/* The tunnel is the authentication. See tc/sshserver.h: reaching
@@ -6746,8 +6749,9 @@ int main(int argc, char **argv)
 				        "tailcat-c: --ssh-authorized-keys produced no "
 				        "usable keys");
 				if (ssh_keys.skipped > 0)
-					fprintf(stderr, " (%zu were skipped: only ed25519 keys "
-					                "can be verified here)",
+					fprintf(stderr,
+					        " (%zu were skipped: ed25519, ECDSA P-256/P-384 "
+					        "and RSA with SHA-2 can be verified here)",
 					        ssh_keys.skipped);
 				fprintf(stderr, "\n");
 				return 2;
