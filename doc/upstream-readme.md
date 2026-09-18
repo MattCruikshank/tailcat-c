@@ -31,7 +31,11 @@ to collect. The prompt was a question worth asking of any document like it:
 
 The second walk found **two more bugs and eleven differences**, and the first
 bug is the one that justifies the whole exercise: an interop failure against
-the real Go binary, in a direction nothing here tests.
+the real Go binary, in a direction nothing here tested.
+
+All thirteen are now fixed, and closing the last of them turned up four more
+bugs — 45 through 48 — three of which were the same mistake in one function.
+They are in [README's bug list](../README.md#bugs-this-verification-has-actually-caught).
 
 
 ## What the second walk found
@@ -99,30 +103,45 @@ timestamps and ssh's `-p` is the port, so scanning an scp command line with
 ssh's table swallows the first operand — the file being copied.
 
 
-## Differences the second walk found
+## Differences the second walk found — all now closed
 
-None of these are bugs. They are things a reader following upstream's
-documentation would find do not work here.
+None of these were bugs. They were things a reader following upstream's
+documentation would have found did not work here. All eleven are implemented.
 
-| Upstream's instruction | Here |
-|---|---|
-| `serve --ssh-authorized-keys=a,b ssh` | ❌ comma-separated sources: we read the whole string as one path. Ours is repeatable instead — `--ssh-authorized-keys a --ssh-authorized-keys b` |
-| `serve files` (bare) | ❌ upstream serves the current directory read-only; we refuse and ask for `--files` |
-| `serve --files=/pub:rw` (no service word) | ❌ upstream: "giving `--files` implies the 'files' service"; we refuse |
-| a forced command sees `$SSH_ORIGINAL_COMMAND` | ❌ not set; we log the client's request and drop it |
-| `ssh`/`no-auth-ssh` also serve SFTP | ❌ we refuse the `sftp` subsystem on a shell server |
-| `--serve=<list>` as a root flag | ❌ missing; only the `serve` subcommand |
-| `--json` (`{"listenAddr": …}` on stdout) | ❌ missing |
-| `--listen` for `socks` | ⚠️ we call it `--bind`, which upstream uses for `forward` |
-| `genkey --embed-derp-map` | ❌ missing |
-| `TAILCAT_DERPMAP_URL` environment variable | ❌ not read; `--derpmap-url` works |
-| `genkey --region=list` | ⚠️ works, but we require `--key` first |
+| Upstream's instruction | Was | Now |
+|---|---|---|
+| `serve --ssh-authorized-keys=a,b ssh` | read the whole string as one path | ✅ comma-separated, and still repeatable |
+| `serve files` (bare) | refused, asked for `--files` | ✅ serves the current directory read-only |
+| `serve --files=/pub:rw` (no service word) | refused | ✅ `--files` implies the service |
+| a forced command sees `$SSH_ORIGINAL_COMMAND` | logged and dropped | ✅ set |
+| `ssh`/`no-auth-ssh` also serve SFTP | subsystem refused | ✅ served, with the shell's own reach |
+| `--serve=<list>` as a root flag | missing | ✅ rewritten into the subcommand |
+| `--json` (`{"listenAddr": …}` on stdout) | missing | ✅ |
+| `--listen` for `socks` | only `--bind`, no port | ✅ both spellings, and it takes a port |
+| `genkey --embed-derp-map` | missing | ✅ and the key file learned embedded regions |
+| `TAILCAT_DERPMAP_URL` | not read | ✅ the default for `--derpmap-url` |
+| `genkey --region=list` | demanded `--key` first | ✅ it is a question, not a key |
 
-Flags, counted: upstream has 24 and so do we, and they are not the same 24. We
-lack `embed-derp-map`, `json`, `listen` and `serve`; we add `help`,
-`insecure`, `no-psk` (our older spelling of `--psk=false`) and `relay`.
+Two of them were more than a flag.
 
-One thing that looks like a difference and is not: upstream's README writes
+**SFTP on a shell server** needed a deliberate hole in the fence,
+`tc_rootdir_open_unconfined`. Confining file transfer while handing out
+arbitrary command execution protects nothing — the client can run `cat` — and
+refusing symlinks would break most real paths, a filesystem being full of
+them. It is a separate constructor so the two cannot be confused, and a forced
+command is excluded: it replaces everything, so there is no shell whose access
+to match.
+
+**`--embed-derp-map`** needed the key file to carry embedded regions in both
+directions, and finding that out turned up bug 45. Generating with either
+binary and serving with the other now produces byte-identical addresses, both
+ways.
+
+Flags, counted: upstream has 24 and so do we, and they are now the same 24 in
+everything upstream defines. We add four of our own: `help`, `insecure`,
+`no-psk` (our older spelling of `--psk=false`) and `relay`.
+
+One thing that looked like a difference and was not: upstream's README writes
 `--ssh-authorized-keys=~/.ssh/authorized_keys`, and a shell does not expand
 `~` after an `=`. Upstream's own usage text writes `"$HOME/.ssh/..."`
 instead. The literal tilde fails for upstream too.

@@ -4,6 +4,14 @@
 tailcat and tailcat-c are often described as "like tsnet", so it is worth
 saying exactly how much of it is here, measured rather than felt.
 
+> **The ratios below predate phases 5.6 through 6.7** — the four `serve`
+> services, the recursive drop box, and the second README walk. The measured
+> line counts have been updated; the percentages derived from them have not,
+> because the method behind them is not recorded here and guessing at it would
+> produce a number that looks more authoritative than it is. The direction is
+> known: the numerator grew by about 4,800 lines of C and 2,300 of tests, and
+> the denominator did not move.
+
 Short version: **about 13% of tsnet by line, about 25–30% by feature, and
 about half by difficulty** — because the parts that are done are the parts
 with the worst difficulty-per-line, and the parts that are missing are mostly
@@ -60,8 +68,10 @@ objects: **172,866 lines**. `tsnet.go` itself is 2,395 of them, which is the
 same trick tailcat plays — 8,884 lines of Go standing on a data plane it does
 not own.
 
-The numerator is tailcat-c: **26,829 lines of C and 5,721 of headers**, with
-20,286 lines of tests alongside.
+The numerator is tailcat-c: **37,366 lines of C and headers**, with 22,627
+lines of tests alongside. (At the time this document was first written those
+were 26,829 and 5,721, with 20,286 of tests; the growth is the SSH and SFTP
+services and their tests.)
 
 ## By feature
 

@@ -221,7 +221,7 @@ direct peer-to-peer paths.
 | non-ed25519 authorized keys (RSA, ECDSA) | ❌ skipped, and said so | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
-| macOS, FreeBSD, OpenBSD, NetBSD | built, untested — see [BSD-plan.md](BSD-plan.md) | ✅ (macOS) |
+| macOS, FreeBSD, OpenBSD, NetBSD | **built, never run** — see [BSD-plan.md](BSD-plan.md) | ✅ (macOS) |
 | aarch64 | ✅ all 36 test binaries pass on real aarch64 instructions (qemu-user) | ✅ |
 | Browser (WebAssembly) | ❌ | ✅ |
 | Persistent keys on disk | ✅ | ✅ |
@@ -233,26 +233,20 @@ forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and all four
 `serve` services — `ssh`, `no-auth-ssh`, `exec` and `files` — on an SSH and
 SFTP server of our own.
 
-What is left is the **browser build**, which Cosmopolitan cannot target —
-and a list of smaller differences that is longer than this section claimed
-until somebody asked whether we had really walked upstream's README again
-after adding the `serve` services. We had not.
-[The second walk](doc/upstream-readme.md) found two bugs and eleven
-differences: four missing flags (`--serve`, `--json`, `--listen`,
-`genkey --embed-derp-map`), `--ssh-authorized-keys` taking a comma-separated
-list rather than being repeated, `serve files` defaulting to the current
-directory, `$SSH_ORIGINAL_COMMAND`, SFTP on a shell server, and
-`TAILCAT_DERPMAP_URL`.
+What is left of upstream's surface is the **browser build**, which
+Cosmopolitan cannot target, and one difference that is a choice rather than a
+gap: authorized keys must be ed25519, because that is the only signature this
+server verifies. An RSA line would be a key that could never authenticate, so
+those are skipped and counted rather than silently kept.
 
-It also found two bugs, both now fixed: **the real `tailcat ls` could not
-talk to our `recv` or `serve files` server** — ours demanded a publickey it
-then did not check, and upstream's client offers only `none` — and **`cp -r`
-was broken**, which is a command in our own usage document. Bugs 43 and 44.
-
-Authorized keys must be ed25519, because that is the only signature this
-server verifies — an RSA key in the list would be one that can never
-authenticate, so those lines are skipped and counted rather than silently
-kept.
+Getting to that point took asking an awkward question. The walkthrough of
+upstream's README had been kept up to date *by hand* as features landed —
+real evidence, from unit and live tests, but not the evidence that document
+exists to collect. Asked whether we had actually walked it again,
+[the honest answer was no](doc/upstream-readme.md). Walking it properly found
+eleven differences and two bugs; closing those turned up four more. All are
+fixed, and bugs 43 through 48 below are the interesting half of this
+project's recent history.
 
 ## Build
 

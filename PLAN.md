@@ -21,6 +21,14 @@ Cosmopolitan has no pseudo-terminals there. (`authorized_keys` options being
 refused was listed here as a third, until reading upstream's source showed it
 makes the same choice for the same reason.)
 
+**The largest open risk is not a feature.** Four of the six platforms this
+binary claims -- macOS, FreeBSD, OpenBSD, NetBSD -- have never run it. Bugs 46
+and 48 are what that costs: the same mistake on two platforms, one caught only
+because Windows happens to be reachable from the machine this is written on,
+the other sitting in macOS where nobody could look. [BSD-plan.md](BSD-plan.md)
+is a plan for reaching one of them under qemu, and is honest that it does not
+reach macOS, which is where the bug actually was.
+
 An earlier version of this paragraph listed `serve ssh` as a deliberate
 omission, on the reasoning that a drop box which can run commands is not a
 drop box. That reasoning was sound about `recv` and wrong about the project:
@@ -1057,12 +1065,17 @@ pings us in 5.61ms over a direct path. The rule that saved it is the same one
 bugs 7 and 8 taught: when an interop test fails, suspect the scaffolding
 first.
 
-### 6.2 What the walk showed is missing ⏸ · not started
+### 6.2 What the first walk showed is missing ✅ · five of six done
 
 None of these is hard. They are listed because the walk is the only thing
 that found them: each is a feature the table called done, or did not mention
 at all, and a user following upstream's documentation meets them immediately.
-In rough order of what they cost:
+In rough order of what they cost.
+
+Five are done. The one left is item 3, reaching a third address from the pipe
+form, and `forward` does the same job with one more argument. The *second*
+walk (6.7) found eleven more of these, which is the more interesting fact
+about this list: it was never the complete set, only the set one walk found.
 
 1. ~~**`socks <addr> <cmd>` without `--`**~~: done. The argument after the
    address is a port if it reads as one and the start of a command if it
@@ -1393,6 +1406,73 @@ the Go implementation, a second stricter toolchain, and simulated networks
 where the clock is an argument — with one addition worth carrying forward:
 **mutation testing**, which found that six of ten assertions about path
 discovery were not actually being made.
+
+### 6.7 Walking upstream's README a second time ✅ · ~900 lines
+
+The first walk (6.1) found three bugs and produced
+[doc/upstream-readme.md](doc/upstream-readme.md). Then four `serve` services
+and two file modes were implemented, and their rows were added to that
+document **by hand, from implementation knowledge**. Real evidence -- unit
+tests, live tests -- but not the evidence that document exists to collect. Its
+own stated purpose is the harsher question: *what does a person following
+upstream's documentation actually see?*
+
+Asked whether we had really walked it again, the answer was no. The rows said
+✅ and nobody had typed them.
+
+**Walking it properly found eleven differences and two bugs, and closing those
+found four more bugs.** In the order they matter:
+
+**Bug 43** is the one that justifies the exercise. Our SSH server demanded a
+publickey it then did not check; upstream's `ls` offers only `none`. So the
+real `tailcat ls` could not talk to our `recv` or `serve files` at all -- an
+interop failure with the reference implementation, confirmed by building it
+and pointing it at us.
+
+The *shape* of the gap is the reusable part. `live-ls` pointed our client at
+their server; `live-recv-serve` and `live-dropbox` pointed `scp` at ours. Two
+tests, each covering one side of a square, and nothing covered their SFTP
+client against our SFTP server -- the corner that was broken. No amount of
+testing against ourselves would have reached it. `make live-ls` now runs both
+directions.
+
+**Bugs 46, 47 and 48** were three bugs in one 20-line function, all the same
+mistake: asking a question about the machine in a way that only works on the
+machine it was written on. `#ifdef __APPLE__` and `#ifdef __linux__` are both
+undefined under cosmocc, so one branch sent macOS keys to the wrong directory
+and another left `/proc/self/exe` dead on Linux; `getenv("AppData")` missed
+Windows's `APPDATA` and sent every Windows key to the wrong directory too.
+
+What makes those worth recording is that **tc/browser.h already wrote the rule
+down and `tc_host_os()` already existed to follow it**. The paragraph
+explaining the principle sits two files from the code contradicting it.
+Knowing the rule, documenting it, and building the helper were not enough;
+only going looking found where it had not been applied.
+
+**Bug 45** was mis-serving upstream's `--embed-derp-map` key files before this
+program could write one, and became visible only once it could -- because
+then there were two addresses to compare.
+
+**Bug 44** was `cp -r`, broken in a command *our own usage document*
+recommends. Bug 32 fixed that shape for `ssh` and bug 40 fixed `ssh`'s
+scanning again; `cp` got neither. Twice now this project has shipped a broken
+command its own documentation tells people to run, and both times a walk of
+that documentation is what found it.
+
+The eleven differences are listed in the walk document. Two needed more than a
+flag: SFTP on a shell server wanted a deliberate unconfined path
+(`tc_rootdir_open_unconfined`), because confining file transfer while handing
+out a shell protects nothing; and `--embed-derp-map` needed the key file to
+carry embedded regions in both directions.
+
+**The lesson, stated for the next time.** Every finding in this phase came
+from putting the code somewhere it had not been -- the real binary pointed at
+ours, a command typed out of our own README, a macro's actual expansion in the
+compiler we ship with. None came from reading the code, and none were
+reachable by testing ourselves against ourselves. A document that records
+*having tested* is worth keeping honest, because the moment it starts
+recording *belief* it stops being evidence and nobody can tell from the
+inside.
 
 ### What to do next
 
