@@ -824,6 +824,12 @@ transfers for *every* service since the SSH server was written. `recv` and
 lose. It took a service that sends a lot to make it visible, which is an
 argument for the breadth of a test suite rather than its depth.
 
+`make live-ssh-serve` then did it over a real relay and found three more:
+bug 40 (`ssh -i key <addr>` could not find its address, which had been true
+since the `ssh` wrapper was written), bug 41 (mine, bug 39's fix hanging the
+tunnel), and bug 42 -- bug 39 again, one layer down, in our own TCP. That last
+one had been shortening large transfers for `recv` and `ls` all along.
+
 Still not implemented: upstream's **recursive drop box** (`--files <dir>:wo+`),
 which is the one mode that lets a sender create directories. 5.5 records what
 that trades away, and none of it has changed.

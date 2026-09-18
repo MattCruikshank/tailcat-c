@@ -2284,8 +2284,31 @@ static void run_recv_session(serve_state *st, serve_client *sc,
 
 	if (rc != TC_OK && rc != TC_ERR_CLOSED && rc != TC_ERR_DONE)
 		vlogf("recv: session ended: %s", tc_strerror(rc));
-	if (conn_alive(&io))
-		tc_tcp_mux_close(sc->mux, conn, now_ms());
+
+	if (conn_alive(&io)) {
+		/* FIN, then wait for what is still in flight to be acknowledged,
+		 * and only then drop it.
+		 *
+		 * tc_tcp_mux_close aborts -- it is our RST -- so closing here with
+		 * bytes still queued threw them away. That is bug 42, and it is the
+		 * same shape as bug 39 one layer down: the last of a transfer is
+		 * exactly what a connection torn down in a hurry loses, and the
+		 * result looks like a successful transfer that is simply short.
+		 *
+		 * The wait is bounded, because a peer that has stopped
+		 * acknowledging must not hold the serve loop open. Five seconds is
+		 * far longer than a local round trip and far shorter than anyone
+		 * waits for a prompt. */
+		(void)tc_tcp_shutdown_write(conn, now_ms());
+		uint64_t until = now_ms() + 5000;
+		while (now_ms() < until && conn_alive(&io) &&
+		       tc_tcp_send_unacked(conn) > 0) {
+			if (serve_pump_once(st, until) != 0)
+				break;
+		}
+		if (conn_alive(&io))
+			tc_tcp_mux_close(sc->mux, conn, now_ms());
+	}
 }
 
 /* serve_pump_once runs one turn of the serve loop: relay reads, timers,
@@ -5159,15 +5182,18 @@ static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
 		return 1;
 	}
 
-	/* The address is the first argument for ssh. For cp it is embedded in
-	 * whichever operands look like <addr>:path. */
+	/* For ssh the address is the first argument that is not a flag or a
+	 * flag's value. For cp it is embedded in whichever operands look like
+	 * <addr>:path. */
 	const char *addr = NULL;
+	size_t di = 0;
 	if (!is_cp) {
-		if (nargs < 1) {
+		di = tc_ssh_dest_index(args, nargs);
+		if (di >= nargs) {
 			fprintf(stderr, "tailcat-c: ssh needs an address\n");
 			return 2;
 		}
-		addr = args[0];
+		addr = args[di];
 	} else {
 		for (size_t i = 0; i < nargs && addr == NULL; i++) {
 			const char *colon = strchr(args[i], ':');
@@ -5250,12 +5276,26 @@ static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
 		} else {
 			(void)snprintf(operands[nops], sizeof operands[0], "%s", dest);
 		}
+		/* Flags the user put *before* the destination are ssh's own, and
+		 * have to stay in front of the "--" or ssh will read them as part of
+		 * the remote command. Ours go first, so a user who says `-o
+		 * StrictHostKeyChecking=yes` overrides what we set rather than
+		 * being overridden by it: ssh takes the first value it is given for
+		 * an option, so later ones lose -- which is why the fixed block
+		 * above is emitted first and these follow it.
+		 *
+		 * That is worth stating plainly, because it means a user *cannot*
+		 * turn our host key checking back on this way. They should not want
+		 * to -- the destination is a synthetic name nobody has a key for --
+		 * but it is a real constraint and not an accident. */
+		for (size_t i = 0; i < di && n < 60; i++)
+			argv[n++] = (char *)(uintptr_t)args[i];
 		argv[n++] = (char *)(uintptr_t) "--";
 		argv[n++] = operands[nops];
 		nops++;
 		/* Anything after the address goes to ssh untouched: a remote command,
 		 * more flags, whatever the user meant. */
-		for (size_t i = 1; i < nargs && n < 60; i++)
+		for (size_t i = di + 1; i < nargs && n < 60; i++)
 			argv[n++] = (char *)(uintptr_t)args[i];
 	} else {
 		argv[n++] = (char *)(uintptr_t) "--";
@@ -6517,8 +6557,17 @@ int main(int argc, char **argv)
 		if (!port_arg(ssh_port, &pnum))
 			return 2;
 
+		/* The same scan cmd_ssh_or_cp does, so the two agree on which
+		 * argument is the address. They have to: this one resolves it and
+		 * probes it, and that must be the argument the ProxyCommand ends up
+		 * dialling. */
+		size_t di = tc_ssh_dest_index(&args[1], nargs - 1);
+		if (di >= nargs - 1) {
+			fprintf(stderr, "tailcat-c: ssh needs an address\n");
+			return 2;
+		}
 		bool from_dns = false;
-		const char *dst = dest_arg(args[1], &from_dns);
+		const char *dst = dest_arg(args[1 + di], &from_dns);
 		if (dst == NULL)
 			return 1;
 		if (from_dns && !skip_dns_check) {
@@ -6537,11 +6586,14 @@ int main(int argc, char **argv)
 				        "nodekey:...`, or require SSH keys,\n"
 				        "  or pass --skip-dns-safety-check if it really is "
 				        "meant to be open to everyone.\n",
-				        args[1]);
+				        args[1 + di]);
 				return 1;
 			}
 		}
-		args[1] = dst;
+		/* The resolved address replaces the argument it came from, so the
+		 * ProxyCommand dials what the probe above just checked rather than
+		 * resolving the name a second time and possibly differently. */
+		args[1 + di] = dst;
 		return cmd_ssh_or_cp(false, argv[0], &args[1], nargs - 1, ssh_port,
 		                     insecure, derpmap_url);
 	}

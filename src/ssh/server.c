@@ -1007,7 +1007,7 @@ int tc_ssh_server_run(const tc_ssh_server_opts *opts)
 	 * Bounded both ways: a peer that answers something else a few times, or
 	 * never answers at all, must not keep this session alive. The read
 	 * failing is the ordinary case -- it means the peer closed first. */
-	for (int i = 0; i < 64 && !s->peer_closed; i++) {
+	for (int i = 0; i < 64 && opts->wait_for_close && !s->peer_closed; i++) {
 		size_t n = 0;
 		if (recv_packet(s, &n) != TC_OK)
 			break;

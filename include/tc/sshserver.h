@@ -116,6 +116,24 @@ typedef struct {
 	bool allow_shell;
 	bool allow_pty;
 
+	/* Wait for the peer's CHANNEL_CLOSE before returning.
+	 *
+	 * Set this when the transport is a kernel socket the caller will
+	 * close(): closing one that still has unread bytes on it makes the
+	 * kernel send RST rather than FIN, and an RST discards whatever output
+	 * has not left the send buffer. A client sends CHANNEL_WINDOW_ADJUST
+	 * continuously while it reads, so at the end of a large transfer there
+	 * is almost always something unread. That was bug 39, and it had been
+	 * silently shortening large transfers.
+	 *
+	 * Do *not* set it when the transport closes cleanly by itself, as the
+	 * userspace TCP here does. The read callbacks on that path have no
+	 * deadline, a peer can vanish without ever sending CHANNEL_CLOSE -- an
+	 * ssh whose ProxyCommand is killed underneath it does exactly that --
+	 * and the wait then never ends. That was bug 41, which is this comment's
+	 * reason for existing. */
+	bool wait_for_close;
+
 	tc_ssh_read_fn read;
 	tc_ssh_write_fn write;
 	void *io_ctx;

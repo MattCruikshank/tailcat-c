@@ -1281,6 +1281,59 @@ is only handed to something that actually calls `read`. A loop that waited for
 POLLIN therefore never learned the session was over, and hung with the child
 long since gone.
 
+**40. `ssh -i key <addr>` could not find its address.** *(Phase 5.6, found by
+`make live-ssh-serve` needing to offer an identity file.)* `tailcat-c ssh`
+read argument zero as the destination, so any flag in front of it — `-i`,
+`-o`, `-l`, `-p` — was taken for the address and refused with "-i is neither a
+tailcat address nor a DNS name". `cp` next door had always scanned its
+operands for the one that looked like an address; `ssh` never did, because the
+first argument usually *is* one.
+
+It survived the whole of the README walkthrough because every example there
+puts the address first, which is what a README does. The scanner now walks
+OpenSSH's own flag letters and lives in `shquote.c` with 26 tests, because
+"which argument is the destination" is exactly the kind of pure logic that
+should not have been buried in a 6,700-line `main.c` where nothing could
+reach it.
+
+**41. Bug 39's fix hung the tunnel.** *(Mine, same afternoon, found by the
+second session of `make live-ssh-serve`.)* Waiting for the peer's
+CHANNEL_CLOSE is right for a kernel socket and wrong for this tunnel: the read
+callback there has no deadline, and an `ssh` whose ProxyCommand is killed when
+it exits can leave without ever sending one. The wait then never ended, and
+since the server takes one SSH session at a time, *every* later session was
+refused — a server that worked once and then silently stopped.
+
+`recv` never showed it, which is the interesting part. A drop box session ends
+when the client closes the channel, so `peer_closed` was already set and the
+wait was skipped. A shell session ends when the client sends EOF, which is not
+the same thing. Two services, the same wind-down, and only one of them reached
+the new code.
+
+The wait is now the caller's decision, because only the caller knows what its
+transport does on close.
+
+**42. Our own TCP threw away the end of every large transfer.**
+*(Phase 5.6, found by `make live-ssh-serve` asking for 50000 lines and getting
+45541.)* Bug 39 one layer down, and the same sentence describes it:
+`tc_tcp_mux_close` **aborts** the connection — its own doc comment says
+"aborts one connection and drops it immediately" — so anything still in the
+send buffer when a session ended went nowhere.
+
+Two things make this one worth the space. The first is that **it was never the
+shell's bug**: `recv` and `ls` had carried it since the SSH server was
+written, and it took a service that finishes with tens of kilobytes still
+moving to make it visible, because the last thing a drop box sends is a
+nine-byte STATUS that is acknowledged long before the session ends. The second
+is that **the same mistake was waiting at two layers**, made independently,
+months apart, and both times it produced a transfer that looked entirely
+successful and was simply short. Neither was reachable by a test that did not
+send a lot of data and then count how much arrived.
+
+The fix is the ordinary one — FIN, wait for the send buffer to drain, bounded,
+then drop — and the bound matters as much as the wait: a peer that has stopped
+acknowledging must not hold the serve loop open.
+
 The pattern is hard to miss: **four of the first six came from running the
 same code through a second, stricter environment**, and the two crypto bugs
 came from comparing against a reference implementation rather than against my
@@ -1292,6 +1345,14 @@ Bugs 7 and 8 are worth separating out, because they are the opposite failure:
 cases with a symptom that pointed squarely at the implementation. When an
 interop test fails, the scaffolding deserves as much suspicion as the code
 under test.
+
+Bugs 39 and 42 are worth reading together, because they are the same mistake
+at two layers of the same stack, made months apart, and both were found by one
+test that sent a lot of data and counted what arrived. Closing a connection
+that still has bytes on it discards them — in the kernel's TCP and in ours —
+and the symptom in both cases was a transfer that reported success and was
+simply short. Nothing about either was visible to a test of what the code
+*does*; only to a test of how much of it came out the other end.
 
 Multi-client serving repeated that lesson three times in one sitting, and all
 three looked like the server hanging: a bare `wait` that also waited on the

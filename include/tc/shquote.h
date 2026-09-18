@@ -53,4 +53,25 @@ int tc_proxycmd_join(char *out, size_t cap, const char *const *args, size_t n,
  * stops reusing the right connection. out needs 26 bytes. */
 int tc_ssh_dest_host(char *out, size_t cap, const char *addr);
 
+/* tc_ssh_dest_index finds the destination among ssh's arguments.
+ *
+ * `ssh -i key -o Foo=bar host cmd` puts the destination fourth. Reading
+ * argument zero as the address -- which is what this program did until a live
+ * test tried to pass an identity file -- turns an ordinary invocation into
+ * "-i is neither a tailcat address nor a DNS name".
+ *
+ * The flag letters are OpenSSH's own, split into those that take a value and
+ * those that do not, because a value may be attached (`-i key` or `-ikey`)
+ * and getting that wrong either skips the destination or eats it. Clustered
+ * booleans work too: `-vvv`, `-tt`.
+ *
+ * An unknown flag is assumed to be boolean, which is the safe way round. A
+ * value-taking flag this does not know about would make it read that value as
+ * the destination and refuse with a message naming it -- wrong, but legible.
+ * The other way round it would silently treat the real destination as a flag's
+ * argument and dial whatever came next.
+ *
+ * Returns n when there is no destination at all. */
+size_t tc_ssh_dest_index(const char *const *args, size_t n);
+
 #endif /* TC_SHQUOTE_H_ */

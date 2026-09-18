@@ -162,6 +162,79 @@ static void test_dest_host(void)
 	TCT_EQ_INT(tc_ssh_dest_host(a, sizeof a, NULL), TC_ERR_NOSPACE);
 }
 
+/* ---- finding the destination among ssh's arguments --------------------- */
+
+/* Each case is an argument vector and the index the destination should be
+ * found at, written the way it would be typed. The destination is always
+ * spelled "HOST" so a wrong answer names what was picked instead. */
+static void at(size_t want, const char *const *args, size_t n,
+               const char *why)
+{
+	tct_checks++;
+	size_t got = tc_ssh_dest_index(args, n);
+	if (got != want) {
+		const char *picked = got < n ? args[got] : "(none)";
+		TCT_FAILF("%s: picked [%zu] \"%s\", wanted [%zu] \"%s\"", why, got,
+		          picked, want, want < n ? args[want] : "(none)");
+	}
+}
+
+#define AT(want, why, ...)                                                    \
+	do {                                                                      \
+		static const char *const a_[] = { __VA_ARGS__ };                      \
+		at((want), a_, sizeof a_ / sizeof a_[0], (why));                      \
+	} while (0)
+
+static void test_dest_index(void)
+{
+	TCT_CASE("the ordinary shapes");
+	AT(0, "just a host", "HOST");
+	AT(0, "a host and a command", "HOST", "uptime");
+	AT(0, "a command that looks like a flag", "HOST", "-l");
+	AT(0, "a user@host", "user@HOST");
+
+	TCT_CASE("flags before the destination");
+	AT(1, "a boolean", "-v", "HOST");
+	AT(3, "several booleans", "-v", "-4", "-C", "HOST");
+	AT(1, "clustered booleans", "-vvv", "HOST");
+	AT(1, "-tt, the one everyone types", "-tt", "HOST");
+	AT(2, "a separated value", "-i", "key", "HOST");
+	AT(1, "an attached value", "-ikey", "HOST");
+	AT(2, "-o with a value", "-o", "Foo=bar", "HOST");
+	AT(4, "two options", "-o", "A=1", "-o", "B=2", "HOST");
+	AT(2, "-p with a port", "-p", "2222", "HOST");
+	AT(1, "-p2222 attached", "-p2222", "HOST");
+	AT(2, "-l with a user", "-l", "alice", "HOST");
+	AT(5, "the lot", "-v", "-i", "key", "-o", "Foo=bar", "HOST", "uptime");
+
+	TCT_CASE("a value attached to a cluster");
+	/* -vi key: the v is boolean, the i takes the next argument. Getting the
+	 * cluster wrong here reads "key" as the destination. */
+	AT(2, "a boolean then a value flag", "-vi", "key", "HOST");
+	/* -vikey: the value is attached to the cluster, so nothing is skipped. */
+	AT(1, "a boolean then an attached value", "-vikey", "HOST");
+
+	TCT_CASE("the edges");
+	AT(0, "a bare dash is not a flag", "-", "HOST");
+	AT(1, "after a --", "--", "HOST");
+	AT(0, "nothing at all", "HOST");
+	{
+		static const char *const none[] = { "-v" };
+		at(1, none, 1, "a flag and no destination");
+		static const char *const dangling[] = { "-i" };
+		at(1, dangling, 1, "a value flag with nothing after it");
+		at(0, NULL, 0, "no arguments");
+	}
+
+	TCT_CASE("an unknown flag is assumed boolean");
+	/* The safe way round. If it really took a value we pick that value as
+	 * the destination and refuse with a message naming it -- wrong, but
+	 * legible. The other way round we would silently dial whatever followed
+	 * the real destination. */
+	AT(1, "an unknown letter", "-Z", "HOST");
+	AT(1, "a future long option", "-Zzz", "HOST");
+}
+
 int main(void)
 {
 	test_posix_basic();
@@ -169,5 +242,6 @@ int main(void)
 	test_windows();
 	test_bounds();
 	test_dest_host();
+	test_dest_index();
 	return tct_report("shquote");
 }

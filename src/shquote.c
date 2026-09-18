@@ -149,3 +149,29 @@ int tc_ssh_dest_host(char *out, size_t cap, const char *addr)
 	out[off] = '\0';
 	return TC_OK;
 }
+
+size_t tc_ssh_dest_index(const char *const *args, size_t n)
+{
+	/* OpenSSH 9.x, from ssh(1)'s SYNOPSIS: the options that take a value. */
+	static const char kTakesValue[] = "BbcDEeFIiJLlmOoPpQRSWw";
+	if (args == NULL)
+		return n;
+	for (size_t i = 0; i < n; i++) {
+		const char *a = args[i];
+		if (a == NULL)
+			return n;
+		if (a[0] != '-' || a[1] == '\0')
+			return i; /* a bare "-" is not a flag, and neither is a name */
+		if (strcmp(a, "--") == 0)
+			return i + 1 < n ? i + 1 : n;
+		for (size_t k = 1; a[k] != '\0'; k++) {
+			if (strchr(kTakesValue, a[k]) == NULL)
+				continue; /* boolean; keep reading the cluster */
+			if (a[k + 1] != '\0')
+				break; /* the value is attached: -ikey, -p22 */
+			i++;       /* the value is the next argument */
+			break;
+		}
+	}
+	return n;
+}

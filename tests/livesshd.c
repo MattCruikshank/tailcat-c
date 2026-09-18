@@ -310,6 +310,9 @@ int main(int argc, char **argv)
 	/* A shell and a terminal, only in shell mode. Off otherwise, so the
 	 * drop box and the file server refuse them exactly as the real server
 	 * does. */
+	/* A kernel socket, closed by this process, so the wind-down has to wait
+	 * for the peer -- see tc/sshserver.h and bug 39. */
+	opts.wait_for_close = true;
 	opts.allow_shell = g_shell;
 	opts.allow_pty = g_shell;
 
