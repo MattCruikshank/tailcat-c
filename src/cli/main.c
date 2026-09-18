@@ -29,6 +29,7 @@
 #include "tc/browser.h"
 #include "tc/dnsaddr.h"
 #include "tc/dropbox.h"
+#include "tc/fileserv.h"
 #include "tc/duration.h"
 #include "tc/sshclient.h"
 #include "tc/crypto.h"
@@ -1403,6 +1404,15 @@ typedef struct {
 	uint64_t last_seen_ms;
 } serve_client;
 
+/* What `--files <dir>:<mode>` allows. Read-only is the default because
+ * `--files /srv files` with no suffix is what someone types to hand out a
+ * directory, and handing out write access by accident is not recoverable. */
+typedef enum {
+	TC_FILES_RO = 0,
+	TC_FILES_RW,
+	TC_FILES_WO, /* the drop box: write only, and the server names the file */
+} files_mode;
+
 typedef struct {
 	serve_client c[TC_SERVE_MAX_CLIENTS];
 	tc_derp_client *derp;
@@ -1434,7 +1444,12 @@ typedef struct {
 
 	/* Set by `recv <dir>`: where uploads land, and the host identity the SSH
 	 * server presents. NULL means this is an ordinary `serve`. */
-	const char *recv_dir;
+	const char *files_dir;
+	/* What may be done in it. Upstream spells these as a suffix on the
+	 * directory -- `--files /srv:rw` -- and `recv <dir>` is exactly
+	 * `--files <dir>:wo files`, so the two share one field rather than
+	 * having a `recv_dir` beside a `files_dir` that could disagree. */
+	files_mode mode;
 	/* `serve exec -- cmd`: the command to run for each connection, NULL when
 	 * the service is not in use. */
 	const char *const *exec_argv;
@@ -1460,7 +1475,7 @@ typedef struct {
 static bool port_is_served(void *ctx, uint16_t port)
 {
 	const serve_state *st = (const serve_state *)ctx;
-	if (st->recv_dir != NULL && port == 22)
+	if (st->files_dir != NULL && port == 22)
 		return true;
 	/* The exec service answers everywhere, because it is not a service on a
 	 * port: it is what this server does. Upstream's own example connects to
@@ -1996,18 +2011,48 @@ static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 	(void)type;
 	(void)arg;
 
-	tc_dropbox db;
-	int rc = tc_dropbox_open(&db, st->recv_dir);
-	if (rc != TC_OK) {
-		fprintf(stderr, "tailcat-c: %s is not a usable directory\n",
-		        st->recv_dir);
+	if (st->mode == TC_FILES_WO) {
+		tc_dropbox db;
+		int rc = tc_dropbox_open(&db, st->files_dir);
+		if (rc != TC_OK) {
+			fprintf(stderr, "tailcat-c: %s is not a usable directory\n",
+			        st->files_dir);
+			return rc;
+		}
+		rc = tc_dropbox_serve(&db, s);
+		if (db.files > 0)
+			fprintf(stderr, "received %u file%s, %llu bytes\n", db.files,
+			        db.files == 1 ? "" : "s", (unsigned long long)db.bytes);
 		return rc;
 	}
-	rc = tc_dropbox_serve(&db, s);
-	if (db.files > 0)
-		fprintf(stderr, "received %u file%s, %llu bytes\n", db.files,
-		        db.files == 1 ? "" : "s", (unsigned long long)db.bytes);
-	return rc;
+
+	/* Read-only or read-write: a served directory, where the client names
+	 * the paths. A different policy behind the same framing loop -- see
+	 * tc/fileserv.h for the fence around it. */
+	static tc_fileserv fs;
+	int rc = tc_fileserv_open(&fs, st->files_dir, st->mode == TC_FILES_RW);
+	if (rc != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s is not a usable directory\n",
+		        st->files_dir);
+		return rc;
+	}
+	return tc_fileserv_serve(&fs, s);
+}
+
+/* dir_is_usable checks a directory the user named on the command line.
+ *
+ * It must already exist. Creating it would mean guessing where the user
+ * meant, and a typo would silently make a drop box nobody is watching, or
+ * share an empty directory while the real one sat untouched. */
+static bool dir_is_usable(const char *dir)
+{
+	struct stat dirst;
+	if (dir == NULL || stat(dir, &dirst) != 0 || !S_ISDIR(dirst.st_mode)) {
+		fprintf(stderr, "tailcat-c: %s is not a directory\n",
+		        dir != NULL ? dir : "(none)");
+		return false;
+	}
+	return true;
 }
 
 /* run_recv_session serves one SSH connection from the tunnel. */
@@ -2113,7 +2158,7 @@ static int serve_pump_once(serve_state *st, uint64_t deadline)
 				 * tunnel address, which is where `cp` and `scp` look for
 				 * one. Everything else on our address is still a local
 				 * service, so `recv` and `serve <ports>` compose. */
-				if (st->recv_dir != NULL && port == 22 &&
+				if (st->files_dir != NULL && port == 22 &&
 				    memcmp(want, ours, TC_IPV6_ADDR_LEN) == 0) {
 					if (st->in_ssh) {
 						vlogf("recv: already serving a session; refusing");
@@ -5053,8 +5098,8 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
                      bool insecure, unsigned timeout_s,
                      const char *derpmap_url, const char *key_spec,
                      bool full_address, bool exit_node,
-                     const tc_allowlist *allow, const char *recv_dir,
-                     const char *const *exec_argv)
+                     const tc_allowlist *allow, const char *files_dir,
+                     files_mode mode, const char *const *exec_argv)
 {
 	/* A saved identity if one exists, otherwise a fresh one. This is the
 	 * whole point of `genkey`: without it a server's address changes on
@@ -5226,9 +5271,10 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 		memcpy(st.psk, ci.preshared_key, sizeof st.psk);
 		st.ports = ports;
 		st.exit_node = exit_node;
-		st.recv_dir = recv_dir;
+		st.files_dir = files_dir;
+		st.mode = mode;
 		st.exec_argv = exec_argv;
-		if (recv_dir != NULL) {
+		if (files_dir != NULL) {
 			/* The SSH host key is derived from the tunnel identity rather
 			 * than generated, so it is the same on every run for as long as
 			 * the address is. A host key that changed per run would make
@@ -5242,10 +5288,25 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 			tc_blake2s(st.ssh_host_seed, sizeof st.ssh_host_seed,
 			           "tailcat-c ssh host key v1", 25, me.private_key,
 			           sizeof me.private_key);
-			fprintf(stderr, "# receiving files into %s\n", recv_dir);
-			fprintf(stderr, "# the sender chooses nothing: names are ours, "
-			                "nothing is overwritten, nothing can be read "
-			                "back\n");
+			if (mode == TC_FILES_WO) {
+				fprintf(stderr, "# receiving files into %s\n", files_dir);
+				fprintf(stderr,
+				        "# the sender chooses nothing: names are ours, "
+				        "nothing is overwritten, nothing can be read "
+				        "back\n");
+			} else if (mode == TC_FILES_RW) {
+				fprintf(stderr, "# serving %s read-write over SFTP\n",
+				        files_dir);
+				fprintf(stderr,
+				        "# anyone with this address may read, replace and "
+				        "create files below that directory\n");
+			} else {
+				fprintf(stderr, "# serving %s read-only over SFTP\n",
+				        files_dir);
+				fprintf(stderr,
+				        "# anyone with this address may read anything below "
+				        "that directory\n");
+			}
 		}
 		if (allow != NULL)
 			st.allow = *allow;
@@ -5539,6 +5600,10 @@ int main(int argc, char **argv)
 	bool open_browser = false;
 	bool until_direct = false;
 	bool skip_dns_check = false;
+	/* `--files <dir>[:ro|:rw|:wo]`. The directory alone does nothing until
+	 * `files` appears in a serve list, which is upstream's arrangement. */
+	const char *files_dir = NULL;
+	files_mode files_mode_arg = TC_FILES_RO;
 	/* The server port ssh and cp reach through the tunnel. */
 	const char *ssh_port = "22";
 	/* An empty --key means "the saved default if there is one", which is how
@@ -5722,6 +5787,40 @@ int main(int argc, char **argv)
 			gk_psk = !BOOL_VAL(true);
 		} else if (strcmp(a, "--fixed-region") == 0) {
 			gk_fixed_region = BOOL_VAL(true);
+		} else if (strcmp(a, "--files") == 0) {
+			/* Upstream's spelling, suffix and all: `--files /srv/pub:rw`.
+			 * The directory is remembered here and only takes effect when
+			 * `files` appears in the service list, which is how upstream
+			 * works -- naming a directory is not the same as serving it. */
+			NEED_VAL();
+			files_dir = val;
+			const char *colon = strrchr(val, ':');
+			if (colon != NULL) {
+				if (strcmp(colon, ":rw") == 0)
+					files_mode_arg = TC_FILES_RW;
+				else if (strcmp(colon, ":wo") == 0)
+					files_mode_arg = TC_FILES_WO;
+				else if (strcmp(colon, ":ro") == 0)
+					files_mode_arg = TC_FILES_RO;
+				else
+					colon = NULL; /* part of the path, such as a drive letter */
+				if (colon != NULL) {
+					/* The suffix is not part of the directory name. Copied
+					 * out rather than truncated in place: `val` points into
+					 * argv, and a program that rewrites its own arguments is
+					 * one whose `ps` output lies. */
+					static char trimmed[512];
+					size_t dlen = (size_t)(colon - val);
+					if (dlen >= sizeof trimmed) {
+						fprintf(stderr,
+						        "tailcat-c: --files path is too long\n");
+						return 2;
+					}
+					memcpy(trimmed, val, dlen);
+					trimmed[dlen] = '\0';
+					files_dir = trimmed;
+				}
+			}
 		} else if (strcmp(a, "--bind") == 0) {
 			NEED_VAL();
 			bind_addr = val;
@@ -5776,6 +5875,16 @@ int main(int argc, char **argv)
 #undef BOOL_VAL
 	}
 
+	/* --files means something only to `serve ... files`. Anywhere else it
+	 * would be accepted and ignored, which is how someone ends up believing
+	 * a server is sharing a directory it has never opened. Checked here
+	 * rather than in each command, because "each command" is where one of
+	 * them gets forgotten. */
+	if (files_dir != NULL && (nargs == 0 || strcmp(args[0], "serve") != 0)) {
+		fprintf(stderr, "tailcat-c: --files belongs to `serve ... files`\n");
+		return 2;
+	}
+
 	if (nargs == 0) {
 		/* A bare invocation is a server, as upstream's is: it prints an
 		 * address, waits for one connection, and pipes it to stdout.
@@ -5793,7 +5902,8 @@ int main(int argc, char **argv)
 		if (timeout_s == 0)
 			timeout_s = 60;
 		return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
-		                 key_spec, full_address, false, &allow, NULL, NULL);
+		                 key_spec, full_address, false, &allow, NULL,
+		                 TC_FILES_RO, NULL);
 	}
 	/* Outside the port server, a deadline of zero would mean "give up at
 	 * once", which nobody asks for by typing --timeout 0. */
@@ -5837,16 +5947,23 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(args[0], "serve") == 0) {
 		if (nargs == 1) {
+			if (files_dir != NULL) {
+				fprintf(stderr,
+				        "tailcat-c: --files names a directory but the "
+				        "service list does not include \"files\"\n");
+				return 2;
+			}
 			if (timeout_s == 0)
 				timeout_s = 60; /* the one-shot pipe needs a deadline */
 			return cmd_serve(relay, NULL, insecure, timeout_s, derpmap_url,
 			                 key_spec, full_address, false, &allow, NULL,
-			                 NULL);
+			                 TC_FILES_RO, NULL);
 		}
 
 		static tc_portset ports;
 		tc_portset_clear(&ports);
 		bool exit_node = false;
+		bool want_files = false;
 		const char *const *exec_argv = NULL;
 		for (size_t i = 1; i < nargs; i++) {
 			tc_portset_service svc = TC_PORTSET_SVC_NONE;
@@ -5857,6 +5974,20 @@ int main(int argc, char **argv)
 				 * because it makes this machine a proxy for everything it
 				 * can reach. */
 				exit_node = true;
+				continue;
+			}
+			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_FILES) {
+				/* SFTP over SSH on port 22 of the tunnel address, which is
+				 * where scp and sftp look for one. `--files` says which
+				 * directory and in which mode; without it there is nothing
+				 * to serve. */
+				if (files_dir == NULL) {
+					fprintf(stderr,
+					        "tailcat-c: serve files needs a directory: "
+					        "tailcat-c serve --files /srv/pub files\n");
+					return 2;
+				}
+				want_files = true;
 				continue;
 			}
 			if (rc == TC_ERR_UNSUPPORTED && svc == TC_PORTSET_SVC_EXEC) {
@@ -5888,9 +6019,22 @@ int main(int argc, char **argv)
 				return 2;
 			}
 		}
+		if (files_dir != NULL && !want_files) {
+			/* A named directory that nothing serves is almost certainly a
+			 * forgotten word rather than a deliberate no-op, and the silent
+			 * version of this is a server whose operator believes it is
+			 * sharing files. */
+			fprintf(stderr,
+			        "tailcat-c: --files names a directory but the service "
+			        "list does not include \"files\"\n");
+			return 2;
+		}
+		if (want_files && !dir_is_usable(files_dir))
+			return 2;
 		return cmd_serve(relay, &ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url,
-		                 key_spec, full_address, exit_node, &allow, NULL,
+		                 key_spec, full_address, exit_node, &allow,
+		                 want_files ? files_dir : NULL, files_mode_arg,
 		                 exec_argv);
 	}
 	if (strcmp(args[0], "readme") == 0) {
@@ -5914,14 +6058,8 @@ int main(int argc, char **argv)
 			fprintf(stderr, "tailcat-c: recv needs a directory\n");
 			return 2;
 		}
-		/* The directory must already exist. Creating it would mean guessing
-		 * where the user meant, and a typo would silently make a drop box
-		 * nobody is watching. */
-		struct stat dirst;
-		if (stat(args[1], &dirst) != 0 || !S_ISDIR(dirst.st_mode)) {
-			fprintf(stderr, "tailcat-c: %s is not a directory\n", args[1]);
+		if (!dir_is_usable(args[1]))
 			return 2;
-		}
 		/* An empty port set: `recv` serves SSH on port 22 of the tunnel and
 		 * nothing else. A client asking for any other port gets a reset,
 		 * which is what it should get -- there is no local service here. */
@@ -5929,7 +6067,8 @@ int main(int argc, char **argv)
 		tc_portset_clear(&no_ports);
 		return cmd_serve(relay, &no_ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url, key_spec,
-		                 full_address, false, &allow, args[1], NULL);
+		                 full_address, false, &allow, args[1], TC_FILES_WO,
+		                 NULL);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

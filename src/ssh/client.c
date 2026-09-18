@@ -564,8 +564,10 @@ int tc_ssh_client_write(tc_ssh_client *c, const void *data, size_t len)
 		size_t chunk = len;
 		if (chunk > c->ch.remote_window)
 			chunk = c->ch.remote_window;
-		if (chunk > c->ch.remote_max_packet)
-			chunk = c->ch.remote_max_packet;
+		/* See the same cap in server.c: the builder's header has to fit in
+		 * front of the chunk, and remote_max_packet does not leave room. */
+		if (chunk > c->ch.remote_max_packet - TC_SSH_CHANNEL_DATA_OVERHEAD)
+			chunk = c->ch.remote_max_packet - TC_SSH_CHANNEL_DATA_OVERHEAD;
 
 		uint8_t msg[TC_SSH_MAX_PAYLOAD];
 		size_t msg_len = 0;

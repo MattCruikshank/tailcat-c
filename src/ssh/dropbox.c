@@ -5,6 +5,8 @@
 
 #include "tc/dropbox.h"
 
+#include "tc/sftpserve.h"
+
 #include <stdlib.h>
 
 #include <errno.h>
@@ -369,90 +371,21 @@ int tc_dropbox_handle(tc_dropbox *db, const tc_sftp_request *req, uint8_t *out,
 	}
 }
 
+/* The signature tc_sftp_serve wants. */
+static int dropbox_handle_cb(void *ctx, const tc_sftp_request *req,
+                             uint8_t *out, size_t cap, size_t *out_len)
+{
+	return tc_dropbox_handle((tc_dropbox *)ctx, req, out, cap, out_len);
+}
+
 int tc_dropbox_serve(tc_dropbox *db, tc_ssh_server *s)
 {
 	if (db == NULL || s == NULL)
 		return TC_ERR_INVAL;
-
-	/* Heap rather than stack: nearly 120KB between the two, and this may run
-	 * on a thread or inside an event loop whose stack is not ours to spend. */
-	uint8_t *buf = malloc(TC_SFTP_MAX_PACKET * 2);
-	uint8_t *reply = malloc(TC_SFTP_MAX_PACKET);
-	if (buf == NULL || reply == NULL) {
-		free(buf);
-		free(reply);
-		return TC_ERR_NOSPACE;
-	}
-	size_t have = 0;
-	int rc = TC_OK;
-
-	for (;;) {
-		/* Everything already buffered, before reading more: a single read may
-		 * have brought several packets. */
-		bool stop = false;
-		for (;;) {
-			size_t total = 0;
-			int lr = tc_sftp_packet_len(buf, have, &total);
-			if (lr == TC_ERR_AGAIN)
-				break; /* not even a length yet */
-			if (lr != TC_OK) {
-				rc = lr;
-				stop = true;
-				break;
-			}
-			if (have < total)
-				break; /* length known, body still arriving */
-
-			tc_sftp_request req;
-			size_t reply_len = 0;
-			rc = tc_sftp_parse(&req, buf, total);
-			if (rc == TC_OK)
-				rc = tc_dropbox_handle(db, &req, reply, TC_SFTP_MAX_PACKET,
-				                       &reply_len);
-			if (rc != TC_OK) {
-				stop = true;
-				break;
-			}
-			rc = tc_ssh_server_write(s, reply, reply_len);
-			if (rc != TC_OK) {
-				stop = true;
-				break;
-			}
-
-			memmove(buf, buf + total, have - total);
-			have -= total;
-		}
-		if (stop)
-			break;
-
-		if (have == TC_SFTP_MAX_PACKET * 2) {
-			/* Unreachable: tc_sftp_packet_len caps a packet at half this, so
-			 * a full buffer means the accounting above is wrong rather than
-			 * that a client is large. */
-			rc = TC_ERR_TOOMANY;
-			break;
-		}
-
-		size_t got = 0;
-		rc = tc_ssh_server_read(s, buf + have, TC_SFTP_MAX_PACKET * 2 - have,
-		                        &got);
-		if (rc == TC_ERR_DONE || rc == TC_ERR_CLOSED) {
-			rc = TC_OK;
-			break;
-		}
-		if (rc != TC_OK)
-			break;
-		have += got;
-	}
-
+	/* The loop lives in tc/sftpserve.h now, because the file server needs
+	 * the same one and two framing implementations are two chances to get a
+	 * length check subtly different. */
+	int rc = tc_sftp_serve(s, dropbox_handle_cb, db);
 	tc_dropbox_close(db);
-	free(buf);
-	free(reply);
-
-	/* Without this a client reports a failure for a transfer that worked: it
-	 * reads the subsystem's exit status, and a channel that closes without
-	 * one looks like a server that died part way through. */
-	if (rc == TC_OK)
-		(void)tc_ssh_server_exit(s, 0);
 	return rc;
 }

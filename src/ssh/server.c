@@ -581,8 +581,12 @@ int tc_ssh_server_write(tc_ssh_server *s, const void *data, size_t len)
 		size_t chunk = len;
 		if (chunk > s->ch.remote_window)
 			chunk = s->ch.remote_window;
-		if (chunk > s->ch.remote_max_packet)
-			chunk = s->ch.remote_max_packet;
+		/* Room for the header the builder puts in front of the data. A
+		 * chunk of exactly remote_max_packet would be nine bytes too long
+		 * for the buffer it is built into, and sending slightly less than
+		 * the peer allows is always legal. */
+		if (chunk > s->ch.remote_max_packet - TC_SSH_CHANNEL_DATA_OVERHEAD)
+			chunk = s->ch.remote_max_packet - TC_SSH_CHANNEL_DATA_OVERHEAD;
 
 		uint8_t msg[TC_SSH_MAX_PAYLOAD];
 		size_t msg_len = 0;

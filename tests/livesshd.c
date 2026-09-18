@@ -15,13 +15,20 @@
  * the client prints what we wrote and exits zero. If any one of them is
  * wrong, it does not.
  *
- * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex> [dropbox-dir]
+ * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex>
+ *                 [<dir> [ro|rw|wo]]
+ *
+ * The mode picks the policy the directory is served under: `wo` is the drop
+ * box, `ro` and `rw` the file server. It defaults to `wo` so the older
+ * four-argument form -- which live-dropbox.sh uses -- still means what it
+ * did.
  *
  * With a directory, the `sftp` subsystem is served as a write-only drop box
  * and real `sftp` and `scp` become the clients.
  */
 
 #include "tc/dropbox.h"
+#include "tc/fileserv.h"
 #include "tc/sshserver.h"
 
 #include <arpa/inet.h>
@@ -100,23 +107,37 @@ static int sock_write(void *ctx, const uint8_t *buf, size_t len)
  * Deliberately not an echo: the client must see bytes that could only have
  * come from a server that got this far, so the script can tell "the channel
  * worked" from "the client printed its own input back at itself". */
-static const char *g_dropbox_dir;
+static const char *g_dir;
+/* 0 = drop box, 1 = read-only, 2 = read-write. */
+static int g_mode;
 
 /* serve_sftp opens the drop box and hands it to the shared serving loop.
  * The framing lives in tc_dropbox_serve so the CLI and this test run the
  * same code rather than two copies of the same loop. */
 static int serve_sftp(tc_ssh_server *s)
 {
-	tc_dropbox db;
-	int rc = tc_dropbox_open(&db, g_dropbox_dir);
-	if (rc != TC_OK) {
-		fprintf(stderr, "livesshd: drop box %s unusable\n", g_dropbox_dir);
+	if (g_mode == 0) {
+		tc_dropbox db;
+		int rc = tc_dropbox_open(&db, g_dir);
+		if (rc != TC_OK) {
+			fprintf(stderr, "livesshd: drop box %s unusable\n", g_dir);
+			return rc;
+		}
+		rc = tc_dropbox_serve(&db, s);
+		fprintf(stderr, "livesshd: drop box received %u files, %llu bytes\n",
+		        db.files, (unsigned long long)db.bytes);
 		return rc;
 	}
-	rc = tc_dropbox_serve(&db, s);
-	fprintf(stderr, "livesshd: drop box received %u files, %llu bytes\n",
-	        db.files, (unsigned long long)db.bytes);
-	return rc;
+
+	static tc_fileserv fs;
+	int rc = tc_fileserv_open(&fs, g_dir, g_mode == 2);
+	if (rc != TC_OK) {
+		fprintf(stderr, "livesshd: directory %s unusable\n", g_dir);
+		return rc;
+	}
+	fprintf(stderr, "livesshd: serving %s %s\n", g_dir,
+	        g_mode == 2 ? "read-write" : "read-only");
+	return tc_fileserv_serve(&fs, s);
 }
 
 static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
@@ -128,7 +149,7 @@ static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 	 * which is what lets live-sshloop exercise the client's channel and data
 	 * paths without needing a file server at the other end. */
 	if (type == TC_SSH_REQ_SUBSYSTEM && strcmp(arg, "sftp") == 0 &&
-	    g_dropbox_dir != NULL) {
+	    g_dir != NULL) {
 		int srv = serve_sftp(s);
 		if (srv != TC_OK)
 			fprintf(stderr, "livesshd: sftp failed: %s\n", tc_strerror(srv));
@@ -173,13 +194,25 @@ static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 
 int main(int argc, char **argv)
 {
-	if (argc != 4 && argc != 5) {
+	if (argc < 4 || argc > 6) {
 		fprintf(stderr, "usage: livesshd <port> <host-seed-hex> "
-		                "<authorized-hex> [dropbox-dir]\n");
+		                "<authorized-hex> [<dir> [ro|rw|wo]]\n");
 		return 2;
 	}
-	if (argc == 5)
-		g_dropbox_dir = argv[4];
+	if (argc >= 5)
+		g_dir = argv[4];
+	if (argc == 6) {
+		if (strcmp(argv[5], "ro") == 0)
+			g_mode = 1;
+		else if (strcmp(argv[5], "rw") == 0)
+			g_mode = 2;
+		else if (strcmp(argv[5], "wo") == 0)
+			g_mode = 0;
+		else {
+			fprintf(stderr, "livesshd: mode must be ro, rw or wo\n");
+			return 2;
+		}
+	}
 	int port = atoi(argv[1]);
 	uint8_t seed[32], authorized[32];
 	if (unhex(argv[2], seed, sizeof seed) != 0 ||

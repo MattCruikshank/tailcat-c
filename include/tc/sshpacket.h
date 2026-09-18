@@ -70,6 +70,12 @@
  * OpenSSH allows 256KB; there is nothing to gain here from matching it. */
 #define TC_SSH_MAX_PAYLOAD 32768
 
+/* What CHANNEL_DATA costs in front of the bytes it carries: the message type,
+ * the recipient channel, and the string length. A sender that fills a buffer
+ * to remote_max_packet and then asks for the message to be built has
+ * overflowed it by exactly this much, which is how bug 38 happened. */
+#define TC_SSH_CHANNEL_DATA_OVERHEAD 9
+
 /* The largest whole packet on the wire, which is what a read buffer must
  * hold: length field, the encrypted region, and the tag. */
 #define TC_SSH_MAX_PACKET                                                     \
