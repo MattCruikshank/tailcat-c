@@ -151,6 +151,8 @@ seemed better than keeping the paragraph.
 | `tailcat-c serve exec -- /usr/bin/fortune` | ✅ a command per connection |
 | `tailcat-c serve --files ~/pub files` | ✅ read-only over SFTP |
 | `tailcat-c serve --files ~/pub:rw files` | ✅ read-write |
+| `tailcat-c serve --files ~/inbox:wo+ files` | ✅ recursive drop box |
+| `tailcat-c recv --accept-dirs ~/inbox` | ✅ the same mode, upstream's spelling |
 | `tailcat-c serve --ssh-authorized-keys ~/.ssh/authorized_keys ssh` | ✅ |
 | `tailcat-c serve --ssh-authorized-keys alice@github ssh` | ✅ fetches, and says so |
 | `tailcat-c serve --ssh-authorized-keys <f> ssh -- /usr/bin/backup` | ✅ forced command |
@@ -164,11 +166,13 @@ silent:
   authenticate. Those lines are skipped and *counted*, and the startup line
   says how many — a file that was entirely RSA produces no keys, which is
   fatal rather than a server nobody can log into.
-- **`authorized_keys` options are refused, not ignored.** `command="..."`,
-  `from="..."`, `no-pty` and the rest are restrictions, and a server that
-  read the key while dropping the restriction would grant strictly more than
-  the file says, silently, for as long as it runs. `serve ssh -- cmd` is the
-  forced-command feature, spelled where it cannot be lost.
+- **`authorized_keys` options are refused, not ignored** — which turns out
+  not to be a difference at all. Upstream refuses them too, and says why in
+  almost the same words: "rejecting them avoids silently granting broader
+  access than their author intended". This entry claimed the decision as ours
+  until reading upstream's source for something else found it already there.
+  `serve ssh -- cmd` is the forced-command feature, spelled where it cannot
+  be lost.
 - **No pseudo-terminals on Windows.** Cosmopolitan's `forkpty` is ENOSYS
   there, so sessions run on pipes and the server says so at startup. Clients
   print "PTY allocation request failed" and carry on, which is what OpenSSH
@@ -235,12 +239,10 @@ walkthrough. PLAN.md 6.2 has what each would cost.
 |---|---|---|
 | a *self-hosted* relay in a saved key | `genkey --region=derp.example.com` | `serve --relay host` |
 | a third address from the pipe | `ssh -p 10.0.0.1:22 <addr>` | `forward <addr> 2222:10.0.0.1:22` |
-| a recursive drop box | `--files <dir>:wo+` | `--files <dir>:wo` (flat) |
 
-The four `serve` services were on this list when the walk was written and are
-not any more. What is left is the recursive drop box, the one file mode that
-lets a sender create directories — PLAN 5.5 records what that trades away —
-plus the two address forms above. None of it is large.
+The four `serve` services were on this list when the walk was written, and so
+was the recursive drop box. None of them are now: what is left is the two
+address forms above, and neither is large.
 
 One thing the walk changed rather than recorded: `-p 10.0.0.1:22` and the
 pipe form's port argument used to accept that string and connect to port

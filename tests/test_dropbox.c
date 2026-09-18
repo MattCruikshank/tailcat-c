@@ -483,6 +483,362 @@ static void test_init_is_required(void)
 	tc_dropbox_close(&db);
 }
 
+/* ---- the recursive mode ------------------------------------------------ */
+
+/* `:wo+` trades away two things on purpose -- a sender may choose names, and
+ * may discover that a *directory* exists -- and nothing else. These tests are
+ * mostly about the "nothing else": every other refusal in this file has to
+ * still hold when directories are allowed, because the tempting way to
+ * implement this mode is to relax the checks rather than add a second path.
+ */
+
+/* The recursive drop box, and the directory *above* it.
+ *
+ * The escape tests check that "../escaped.txt" did not land outside the drop
+ * box, so "outside" has to be somewhere this test owns. Pointing it at /tmp
+ * meant sharing it with the whole machine: a mutation run that genuinely
+ * broke the fence left /tmp/escaped.txt behind, and the next clean run failed
+ * on a breach that no longer existed. The reverse is worse -- a stray tidy-up
+ * would have made a real breach look clean. */
+static char g_rparent[256];
+static char g_rdir[320];
+
+static void init_rbox(tc_dropbox *db)
+{
+	TCT_EQ_INT(tc_dropbox_open_recursive(db, g_rdir), TC_OK);
+	tc_sftp_request req;
+	memset(&req, 0, sizeof req);
+	req.type = TC_SFTP_INIT;
+	req.version = 3;
+	uint8_t reply[256];
+	size_t n = 0;
+	TCT_EQ_INT(tc_dropbox_handle(db, &req, reply, sizeof reply, &n), TC_OK);
+	TCT_EQ_INT(reply[4], TC_SFTP_VERSION_MSG);
+}
+
+/* one runs a single request of `type` naming `path` and reports the status,
+ * or -1 when the reply was not a status. */
+static int one(tc_dropbox *db, uint8_t type, const char *path)
+{
+	tc_sftp_request req;
+	memset(&req, 0, sizeof req);
+	req.type = type;
+	req.id = 1;
+	if (path != NULL)
+		snprintf(req.path, sizeof req.path, "%s", path);
+	uint8_t reply[1024];
+	size_t n = 0;
+	return ask(db, &req, reply, sizeof reply, &n);
+}
+
+/* upload creates a file at `path` and writes `text` to it, returning the
+ * status of the OPEN. */
+static int upload(tc_dropbox *db, const char *path, const char *text)
+{
+	tc_sftp_request req;
+	memset(&req, 0, sizeof req);
+	req.type = TC_SFTP_OPEN;
+	req.id = 1;
+	req.pflags = TC_SFTP_FXF_WRITE | TC_SFTP_FXF_CREAT;
+	snprintf(req.path, sizeof req.path, "%s", path);
+	uint8_t reply[1024];
+	size_t n = 0;
+	if (tc_dropbox_handle(db, &req, reply, sizeof reply, &n) != TC_OK)
+		return -2;
+	if (reply[4] != TC_SFTP_HANDLE) {
+		if (n >= 13 && reply[4] == TC_SFTP_STATUS)
+			return (int)((uint32_t)reply[9] << 24 | (uint32_t)reply[10] << 16 |
+			             (uint32_t)reply[11] << 8 | reply[12]);
+		return -1;
+	}
+	uint8_t h[TC_SFTP_HANDLE_LEN];
+	memcpy(h, reply + 13, sizeof h);
+
+	if (text != NULL && text[0] != '\0') {
+		memset(&req, 0, sizeof req);
+		req.type = TC_SFTP_WRITE;
+		req.id = 2;
+		memcpy(req.handle, h, sizeof h);
+		req.has_handle = true;
+		req.data = (const uint8_t *)text;
+		req.data_len = strlen(text);
+		(void)ask(db, &req, reply, sizeof reply, &n);
+	}
+	memset(&req, 0, sizeof req);
+	req.type = TC_SFTP_CLOSE;
+	req.id = 3;
+	memcpy(req.handle, h, sizeof h);
+	req.has_handle = true;
+	(void)ask(db, &req, reply, sizeof reply, &n);
+	return TC_SFTP_FX_OK;
+}
+
+/* exists reports whether the path is really there, on the filesystem, which
+ * is the only answer worth checking: what the client was told is a separate
+ * question and several tests below check the two disagree on purpose. */
+static bool exists(const char *rel)
+{
+	char full[600];
+	snprintf(full, sizeof full, "%s/%s", g_rdir, rel);
+	struct stat st;
+	return stat(full, &st) == 0;
+}
+
+static void test_recursive_accepts_a_tree(void)
+{
+	TCT_CASE("a directory tree arrives");
+	tc_dropbox db;
+	init_rbox(&db);
+
+	TCT_EQ_INT(one(&db, TC_SFTP_MKDIR, "photos"), TC_SFTP_FX_OK);
+	TCT_TRUE(exists("photos"));
+	TCT_EQ_INT(one(&db, TC_SFTP_MKDIR, "photos/2024"), TC_SFTP_FX_OK);
+	TCT_TRUE(exists("photos/2024"));
+
+	TCT_EQ_INT(upload(&db, "photos/2024/a.jpg", "AAA"), TC_SFTP_FX_OK);
+	TCT_TRUE(exists("photos/2024/a.jpg"));
+
+	/* The requested name is kept when it is free. That is the whole reason
+	 * the mode exists: a tree whose names were rewritten is not the tree
+	 * that was sent. */
+	TCT_EQ_INT(upload(&db, "photos/2024/b.jpg", "BBB"), TC_SFTP_FX_OK);
+	TCT_TRUE(exists("photos/2024/b.jpg"));
+
+	tc_dropbox_close(&db);
+}
+
+static void test_recursive_still_never_overwrites(void)
+{
+	TCT_CASE("a collision takes a new name, never the old file");
+	tc_dropbox db;
+	init_rbox(&db);
+
+	TCT_EQ_INT(upload(&db, "dup.txt", "FIRST"), TC_SFTP_FX_OK);
+	TCT_EQ_INT(upload(&db, "dup.txt", "SECOND"), TC_SFTP_FX_OK);
+
+	char full[600];
+	snprintf(full, sizeof full, "%s/dup.txt", g_rdir);
+	char buf[32] = { 0 };
+	FILE *f = fopen(full, "rb");
+	TCT_TRUE(f != NULL);
+	if (f != NULL) {
+		(void)!fread(buf, 1, sizeof buf - 1, f);
+		(void)fclose(f);
+	}
+	TCT_EQ_STR(buf, "FIRST");
+	TCT_TRUE(exists("dup.txt.1")); /* the second went somewhere else */
+
+	tc_dropbox_close(&db);
+}
+
+static void test_recursive_cannot_escape(void)
+{
+	TCT_CASE("the fence holds for paths with directories in them");
+	tc_dropbox db;
+	init_rbox(&db);
+
+	/* Each of these would land outside the drop box if the path were taken
+	 * at face value. The file must not appear anywhere. */
+	static const char *const escapes[] = {
+		"../escaped.txt",
+		"../../escaped.txt",
+		"photos/../../escaped.txt",
+		"/../escaped.txt",
+		"..",
+		"/",
+		".",
+	};
+	for (size_t i = 0; i < sizeof escapes / sizeof escapes[0]; i++) {
+		tct_checks++;
+		int rc = upload(&db, escapes[i], "X");
+		if (rc == TC_SFTP_FX_OK)
+			TCT_FAILF("accepted an upload to \"%s\"", escapes[i]);
+	}
+	TCT_TRUE(!exists("../escaped.txt"));
+
+	TCT_CASE("and for mkdir");
+	static const char *const mkescapes[] = {
+		"../escaped", "../../escaped", "photos/../../escaped", "..", "/", ".",
+	};
+	for (size_t i = 0; i < sizeof mkescapes / sizeof mkescapes[0]; i++) {
+		tct_checks++;
+		if (one(&db, TC_SFTP_MKDIR, mkescapes[i]) == TC_SFTP_FX_OK)
+			TCT_FAILF("made a directory at \"%s\"", mkescapes[i]);
+	}
+	TCT_TRUE(!exists("../escaped"));
+
+	tc_dropbox_close(&db);
+}
+
+static void test_recursive_refuses_dangerous_names(void)
+{
+	TCT_CASE("unsafe names are refused, not rewritten");
+	tc_dropbox db;
+	init_rbox(&db);
+
+	/* The flat mode sanitises a name into something storable. This mode has
+	 * to keep the name it was given, so it refuses instead -- rewriting a
+	 * directory would put the rest of the upload somewhere the client never
+	 * asked for, and silently. The set refused is the same one, which is
+	 * what matters: one name means one thing on every platform we ship to. */
+	static const char *const bad[] = {
+		"nul", "con", "com1", "lpt1", "NUL.txt", "trailing.",
+		"trailing ", "ctrl\x01name",
+	};
+	for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+		tct_checks++;
+		if (upload(&db, bad[i], "X") == TC_SFTP_FX_OK)
+			TCT_FAILF("accepted a file named \"%s\"", bad[i]);
+		tct_checks++;
+		if (one(&db, TC_SFTP_MKDIR, bad[i]) == TC_SFTP_FX_OK)
+			TCT_FAILF("made a directory named \"%s\"", bad[i]);
+	}
+
+	/* Including deep in a path, where it is easier to miss. */
+	TCT_EQ_INT(one(&db, TC_SFTP_MKDIR, "ok"), TC_SFTP_FX_OK);
+	tct_checks++;
+	if (upload(&db, "ok/nul", "X") == TC_SFTP_FX_OK)
+		TCT_FAILF("accepted ok/nul");
+
+	tc_dropbox_close(&db);
+}
+
+static void test_recursive_still_refuses_everything_else(void)
+{
+	TCT_CASE("the mode trades names and directories, and nothing else");
+	tc_dropbox db;
+	init_rbox(&db);
+	TCT_EQ_INT(upload(&db, "readable.txt", "SECRET"), TC_SFTP_FX_OK);
+
+	/* MKDIR has moved out of this list and everything else stays in it. A
+	 * recursive drop box is still not a file server. */
+	static const uint8_t forbidden[] = {
+		TC_SFTP_READ,  TC_SFTP_OPENDIR, TC_SFTP_READDIR,  TC_SFTP_REMOVE,
+		TC_SFTP_RMDIR, TC_SFTP_RENAME,  TC_SFTP_SYMLINK,  TC_SFTP_READLINK,
+	};
+	for (size_t i = 0; i < sizeof forbidden / sizeof forbidden[0]; i++) {
+		tct_checks++;
+		if (one(&db, forbidden[i], "readable.txt") !=
+		    TC_SFTP_FX_PERMISSION_DENIED)
+			TCT_FAILF("request type %u was not refused", forbidden[i]);
+	}
+
+	/* And an open for reading, which is the direct way to ask. */
+	tc_sftp_request req;
+	memset(&req, 0, sizeof req);
+	req.type = TC_SFTP_OPEN;
+	req.id = 9;
+	req.pflags = TC_SFTP_FXF_READ;
+	snprintf(req.path, sizeof req.path, "readable.txt");
+	uint8_t reply[512];
+	size_t n = 0;
+	TCT_EQ_INT(ask(&db, &req, reply, sizeof reply, &n),
+	           TC_SFTP_FX_PERMISSION_DENIED);
+
+	tc_dropbox_close(&db);
+}
+
+static void test_recursive_stat_tells_the_truth_about_directories(void)
+{
+	TCT_CASE("stat: directories yes, other people's files no");
+	tc_dropbox db;
+	init_rbox(&db);
+
+	/* A file and a directory that were here before this session, put there
+	 * by the server rather than through the protocol. */
+	char full[600];
+	snprintf(full, sizeof full, "%s/preexisting.txt", g_rdir);
+	FILE *f = fopen(full, "w");
+	TCT_TRUE(f != NULL);
+	if (f != NULL) {
+		fputs("not yours", f);
+		(void)fclose(f);
+	}
+	snprintf(full, sizeof full, "%s/preexisting-dir", g_rdir);
+	(void)mkdir(full, 0700);
+
+	/* The documented cost of this mode: a directory is visible, because a
+	 * recursive upload has to resolve its destination. */
+	tct_checks++;
+	if (one(&db, TC_SFTP_STAT, "preexisting-dir") == TC_SFTP_FX_NO_SUCH_FILE)
+		TCT_FAILF("a directory was invisible, so a tree cannot be uploaded "
+		          "into it");
+
+	/* And the part that is *not* traded away: a file somebody else put here
+	 * stays invisible, exactly as in the flat mode. */
+	TCT_EQ_INT(one(&db, TC_SFTP_STAT, "preexisting.txt"),
+	           TC_SFTP_FX_NO_SUCH_FILE);
+	TCT_EQ_INT(one(&db, TC_SFTP_LSTAT, "preexisting.txt"),
+	           TC_SFTP_FX_NO_SUCH_FILE);
+	TCT_EQ_INT(one(&db, TC_SFTP_STAT, "never-existed.txt"),
+	           TC_SFTP_FX_NO_SUCH_FILE);
+
+	/* A file this session uploaded is visible, which reveals nothing the
+	 * sender did not send, and scp asks. */
+	TCT_EQ_INT(upload(&db, "mine.txt", "hello"), TC_SFTP_FX_OK);
+	tct_checks++;
+	if (one(&db, TC_SFTP_STAT, "mine.txt") == TC_SFTP_FX_NO_SUCH_FILE)
+		TCT_FAILF("a file this session uploaded was invisible to it");
+
+	/* The root is always there. */
+	tct_checks++;
+	if (one(&db, TC_SFTP_STAT, ".") == TC_SFTP_FX_NO_SUCH_FILE)
+		TCT_FAILF("the drop box itself was invisible");
+
+	tc_dropbox_close(&db);
+}
+
+static void test_recursive_memory_is_bounded(void)
+{
+	TCT_CASE("what this session created is remembered, but not for ever");
+	tc_dropbox db;
+	init_rbox(&db);
+
+	char name[64];
+	for (int i = 0; i < TC_DROPBOX_REMEMBERED + 4; i++) {
+		snprintf(name, sizeof name, "many-%d.txt", i);
+		TCT_EQ_INT(upload(&db, name, "x"), TC_SFTP_FX_OK);
+	}
+
+	/* The most recent is still known... */
+	snprintf(name, sizeof name, "many-%d.txt", TC_DROPBOX_REMEMBERED + 3);
+	tct_checks++;
+	if (one(&db, TC_SFTP_STAT, name) == TC_SFTP_FX_NO_SUCH_FILE)
+		TCT_FAILF("the newest upload was forgotten immediately");
+
+	/* ...and the oldest has fallen out, which answers "no such file" -- the
+	 * safe direction, and the same answer the flat mode gives about
+	 * everything. The bound exists because the list is attacker-driven. */
+	TCT_EQ_INT(one(&db, TC_SFTP_STAT, "many-0.txt"),
+	           TC_SFTP_FX_NO_SUCH_FILE);
+	TCT_TRUE(exists("many-0.txt")); /* it is there; it is just not admitted */
+
+	tc_dropbox_close(&db);
+}
+
+static void test_flat_mode_is_unchanged(void)
+{
+	TCT_CASE("the flat mode did not acquire directories");
+	tc_dropbox db;
+	init_box(&db);
+
+	/* The same requests the recursive mode now accepts. None of them may
+	 * work here: this is the check that the second mode was added beside the
+	 * first rather than by loosening it. */
+	TCT_EQ_INT(one(&db, TC_SFTP_MKDIR, "sub"), TC_SFTP_FX_PERMISSION_DENIED);
+
+	/* A path with directories in it still reduces to its final component,
+	 * which is what makes traversal impossible here rather than merely
+	 * checked for. */
+	TCT_EQ_INT(upload(&db, "a/b/c.txt", "X"), TC_SFTP_FX_OK);
+	char full[600];
+	snprintf(full, sizeof full, "%s/c.txt", g_dir);
+	struct stat st;
+	TCT_EQ_INT(stat(full, &st), 0);
+
+	tc_dropbox_close(&db);
+}
+
 int main(void)
 {
 	if (!make_tmpdir()) {
@@ -497,6 +853,27 @@ int main(void)
 	test_handles();
 	test_write_bounds();
 	test_init_is_required();
+	test_flat_mode_is_unchanged();
+
+	snprintf(g_rparent, sizeof g_rparent, "/tmp/tc_dropbox_r_XXXXXX");
+	if (mkdtemp(g_rparent) == NULL) {
+		fprintf(stderr, "test_dropbox: no temp directory for the recursive "
+		                "cases\n");
+		return 1;
+	}
+	snprintf(g_rdir, sizeof g_rdir, "%s/box", g_rparent);
+	if (mkdir(g_rdir, 0700) != 0) {
+		fprintf(stderr, "test_dropbox: could not make the recursive box\n");
+		return 1;
+	}
+	test_recursive_accepts_a_tree();
+	test_recursive_still_never_overwrites();
+	test_recursive_cannot_escape();
+	test_recursive_refuses_dangerous_names();
+	test_recursive_still_refuses_everything_else();
+	test_recursive_stat_tells_the_truth_about_directories();
+	test_recursive_memory_is_bounded();
+
 	(void)rmdir(g_dir);
 	return tct_report("dropbox");
 }

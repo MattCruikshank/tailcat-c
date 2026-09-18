@@ -75,6 +75,20 @@ of it and a symlink is refused rather than followed, so a link inside the
 directory pointing anywhere else is not served. `recv <dir>` is the same
 command with the third mode, `--files <dir>:wo files`.
 
+To receive a whole directory tree -- what `cp -r` sends:
+
+    tailcat-c recv --accept-dirs ~/inbox
+    tailcat-c serve --files ~/inbox:wo+ files
+
+**That mode trades away part of the guarantee above, on purpose.** Senders
+keep their own file names, because a tree whose names were rewritten is not
+the tree that was sent; and directories have to be stat-able for a recursive
+upload to find its destination, so a sender can discover that a directory
+already exists -- one guess at a time. What it keeps: nothing is overwritten,
+nothing can be read back or listed, nothing escapes the directory, and a file
+somebody else put there stays invisible. The server says all of this when it
+starts.
+
 Copy files, using the system `scp`:
 
     tailcat-c cp report.pdf <tc-addr>:
@@ -102,9 +116,10 @@ to start if it cannot. Only ed25519 keys can be verified here; others in a
 file are skipped, and a file with none left is an error rather than a server
 nobody can log into.
 
-Key options are refused, not ignored. A line like `command="/usr/bin/backup"
-ssh-ed25519 AAAA...` restricts that key, and reading the key while dropping
-the restriction would grant more than the file says.
+Key options are refused, not ignored -- as upstream refuses them, for the
+same reason. A line like `command="/usr/bin/backup" ssh-ed25519 AAAA...`
+restricts that key, and reading the key while dropping the restriction would
+grant more than the file says. Use `serve ssh -- cmd` for a forced command.
 
 To run one fixed command instead of a shell:
 
@@ -225,7 +240,8 @@ check that NAT traversal works.
 
     --key NAME          saved identity to use, or "new" for an ephemeral one
     --allow KEYS        comma-separated client nodekey: list, or "none"
-    --files DIR[:MODE]  directory for `serve files`; MODE is ro, rw or wo
+    --files DIR[:MODE]  directory for `serve files`; MODE is ro, rw, wo or wo+
+    --accept-dirs       for `recv`: accept directory trees (same as :wo+)
     --ssh-authorized-keys SPEC
                         for `serve ssh`: a file, a literal key, or
                         user@github. May be given more than once.

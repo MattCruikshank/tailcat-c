@@ -36,17 +36,45 @@
  *     connection, because a client that is told "permission denied" reports
  *     something useful and one that is hung up on reports a network error.
  *
- * ---- what this deliberately does not do ---------------------------------
+ * ---- the recursive mode, and what it costs -------------------------------
  *
- * No directories, so no recursive upload. Upstream offers that as `:wo+` and
- * documents that it trades away the guarantee above -- once a sender can
- * create directories, it can choose names again. If it is ever added here it
- * should be a separate mode with the trade stated, not a relaxation of this
- * one.
+ * `--files <dir>:wo+`, or `recv --accept-dirs`, accepts a directory tree --
+ * what `cp -r` sends. It is a *second mode*, not a relaxation of the first,
+ * and it is off unless asked for, because it gives up part of the guarantee
+ * above and there is no way to have both.
+ *
+ * What it gives up, stated plainly:
+ *
+ *   - **A sender can choose names.** An upload keeps the name it asked for
+ *     when that name is free, and only falls back to a server-chosen one on
+ *     a collision. A tree cannot be reassembled otherwise: the whole point
+ *     of `cp -r` is that the names on the far side match.
+ *   - **A sender can learn that some paths exist.** Directories have to be
+ *     stat-able for a recursive upload to resolve its destinations, so a
+ *     sender can discover which directory names are already here -- one
+ *     guess at a time. It still cannot list them, and it still cannot learn
+ *     anything about *files*.
+ *
+ * What it keeps:
+ *
+ *   - Nothing can be read back, listed, renamed, deleted or linked.
+ *   - Nothing is overwritten. The create is O_EXCL, so "this name is free"
+ *     and "take it" are one operation with nothing in between.
+ *   - Everything stays inside the directory. Paths are resolved by
+ *     tc/rootdir.h, so `..` cannot climb out and a symlink is refused rather
+ *     than followed -- including one the sender just created, because it
+ *     cannot create one.
+ *   - A sender still learns nothing about files it did not put there: a stat
+ *     of a file is "no such file" whether or not it exists, exactly as in
+ *     the flat mode.
+ *
+ * Upstream documents the same trade for the same mode, which is the reason
+ * to offer it in the same shape rather than invent a safer-looking one.
  */
 #ifndef TC_DROPBOX_H_
 #define TC_DROPBOX_H_
 
+#include "tc/rootdir.h"
 #include "tc/sftp.h"
 #include "tc/sshserver.h"
 
@@ -59,9 +87,34 @@
 #define TC_DROPBOX_MAX_FILE (1024ull * 1024ull * 1024ull)
 #endif
 
+/* How many of this session's own uploads are remembered, for the stat that
+ * some clients do straight after writing a file.
+ *
+ * Bounded because it is attacker-driven, and it degrades in the safe
+ * direction: past the bound the oldest is forgotten, and a stat of it answers
+ * "no such file" -- which is what the flat mode says about everything. A
+ * client that cannot stat a file it uploaded ten files ago is not a client
+ * anyone has. */
+#define TC_DROPBOX_REMEMBERED 32
+
+/* The longest remembered path. Shorter than an SFTP path may be, because
+ * tc_dropbox is a stack local in both callers and the full length would be
+ * 32KB of it. A path too long to remember is simply not remembered, which
+ * costs a stat of it the "no such file" that everything else gets. */
+#define TC_DROPBOX_REMEMBERED_PATH 256
+
 typedef struct {
-	char dir[512];
+	tc_rootdir root;
 	bool init_seen;
+	/* The recursive mode. See the header comment for what it trades. */
+	bool recursive;
+
+	/* Paths this session created, as the client named them. Only these are
+	 * visible to a stat; everything else is "no such file" whether or not it
+	 * is there. */
+	char mine[TC_DROPBOX_REMEMBERED][TC_DROPBOX_REMEMBERED_PATH];
+	size_t nmine;
+	size_t mine_next;
 
 	/* One open file at a time. A drop box has no use for more, and a limit
 	 * of one is a limit that cannot be exhausted. */
@@ -76,8 +129,16 @@ typedef struct {
 	uint64_t bytes;
 } tc_dropbox;
 
-/* tc_dropbox_open prepares a drop box over an existing directory. */
+/* tc_dropbox_open prepares a flat, write-only drop box over an existing
+ * directory. */
 int tc_dropbox_open(tc_dropbox *db, const char *dir);
+
+/* tc_dropbox_open_recursive prepares the recursive mode instead.
+ *
+ * A separate entry point rather than a boolean on the one above, so that
+ * every caller of the flat mode says which it wants by name and no existing
+ * one can acquire directories by having a field default the wrong way. */
+int tc_dropbox_open_recursive(tc_dropbox *db, const char *dir);
 
 /* tc_dropbox_handle answers one SFTP request, writing the reply packet.
  *

@@ -157,7 +157,11 @@ static void usage(FILE *f)
 	        "  tailcat-c version\n"
 	        "  tailcat-c readme                        usage, with "
 	        "examples\n"
-	        "\n"
+	        "\n");
+	/* A second call rather than one long literal: C99 only guarantees
+	 * 4095 characters in a string literal and this text is past it. The
+	 * seam is where the commands end and the flags begin. */
+	fprintf(f,
 	        "flags:\n"
 	        "  -v, --verbose         report progress on stderr\n"
 	        "      --insecure        skip TLS verification of the relay\n"
@@ -169,7 +173,11 @@ static void usage(FILE *f)
 	        "for serve, or \"none\"\n"
 	        "      --files DIR[:MODE]\n"
 	        "                        for serve files: the directory, and ro "
-	        "(default), rw or wo\n"
+	        "(default), rw, wo or wo+\n"
+	        "      --accept-dirs     for recv: take directory trees. Senders "
+	        "then keep their own\n"
+	        "                        names and can tell a directory "
+	        "exists\n"
 	        "      --ssh-authorized-keys SPEC\n"
 	        "                        for serve ssh: a file, a literal "
 	        "ssh-ed25519 key,\n"
@@ -1427,7 +1435,8 @@ typedef struct {
 typedef enum {
 	TC_FILES_RO = 0,
 	TC_FILES_RW,
-	TC_FILES_WO, /* the drop box: write only, and the server names the file */
+	TC_FILES_WO,      /* the drop box: write only, the server names the file */
+	TC_FILES_WO_PLUS, /* the same, but it accepts a directory tree */
 } files_mode;
 
 typedef struct {
@@ -2078,9 +2087,11 @@ static int recv_on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
 		return rc;
 	}
 
-	if (st->mode == TC_FILES_WO) {
+	if (st->mode == TC_FILES_WO || st->mode == TC_FILES_WO_PLUS) {
 		tc_dropbox db;
-		int rc = tc_dropbox_open(&db, st->files_dir);
+		int rc = st->mode == TC_FILES_WO_PLUS
+		             ? tc_dropbox_open_recursive(&db, st->files_dir)
+		             : tc_dropbox_open(&db, st->files_dir);
 		if (rc != TC_OK) {
 			fprintf(stderr, "tailcat-c: %s is not a usable directory\n",
 			        st->files_dir);
@@ -5568,6 +5579,19 @@ static int cmd_serve(const char *relay_host, const tc_portset *ports,
 				        "# the sender chooses nothing: names are ours, "
 				        "nothing is overwritten, nothing can be read "
 				        "back\n");
+			} else if (mode == TC_FILES_WO_PLUS) {
+				fprintf(stderr, "# receiving directory trees into %s\n",
+				        files_dir);
+				/* Said at startup because it is the difference between this
+				 * and the flat mode, and because someone who typed
+				 * --accept-dirs to make `cp -r` work deserves to be told
+				 * what it cost. */
+				fprintf(stderr,
+				        "# senders keep their own file names here, and can "
+				        "tell whether a directory already exists\n");
+				fprintf(stderr,
+				        "# still: nothing is overwritten, nothing can be "
+				        "read back or listed\n");
 			} else if (mode == TC_FILES_RW) {
 				fprintf(stderr, "# serving %s read-write over SFTP\n",
 				        files_dir);
@@ -5872,6 +5896,9 @@ int main(int argc, char **argv)
 	 * server through it -- so it has to be asked for. */
 	const char *bind_addr = "127.0.0.1";
 	bool open_browser = false;
+	/* `recv --accept-dirs`: the recursive drop box. See tc/dropbox.h for what
+	 * it trades away. */
+	bool accept_dirs = false;
 	bool until_direct = false;
 	bool skip_dns_check = false;
 	/* `--files <dir>[:ro|:rw|:wo]`. The directory alone does nothing until
@@ -6098,6 +6125,8 @@ int main(int argc, char **argv)
 					files_mode_arg = TC_FILES_RW;
 				else if (strcmp(colon, ":wo") == 0)
 					files_mode_arg = TC_FILES_WO;
+				else if (strcmp(colon, ":wo+") == 0)
+					files_mode_arg = TC_FILES_WO_PLUS;
 				else if (strcmp(colon, ":ro") == 0)
 					files_mode_arg = TC_FILES_RO;
 				else
@@ -6122,6 +6151,13 @@ int main(int argc, char **argv)
 		} else if (strcmp(a, "--bind") == 0) {
 			NEED_VAL();
 			bind_addr = val;
+		} else if (strcmp(a, "--accept-dirs") == 0) {
+			/* Upstream's spelling for `recv`. It is the same thing as
+			 * `--files <dir>:wo+`, and upstream describes the trade in the
+			 * flag's own help text rather than leaving it to the manual,
+			 * which is the right instinct: this is the flag that gives part
+			 * of the guarantee away. */
+			accept_dirs = BOOL_VAL(true);
 		} else if (strcmp(a, "--open-browser") == 0) {
 			open_browser = BOOL_VAL(true);
 		} else if (strcmp(a, "--until-direct") == 0) {
@@ -6180,6 +6216,13 @@ int main(int argc, char **argv)
 	 * them gets forgotten. */
 	if (files_dir != NULL && (nargs == 0 || strcmp(args[0], "serve") != 0)) {
 		fprintf(stderr, "tailcat-c: --files belongs to `serve ... files`\n");
+		return 2;
+	}
+	if (accept_dirs &&
+	    (nargs == 0 || strcmp(args[0], "recv") != 0)) {
+		fprintf(stderr,
+		        "tailcat-c: --accept-dirs belongs to `recv`; for `serve` the "
+		        "same mode is --files <dir>:wo+\n");
 		return 2;
 	}
 	if (nkeyspecs > 0 && (nargs == 0 || strcmp(args[0], "serve") != 0)) {
@@ -6428,8 +6471,9 @@ int main(int argc, char **argv)
 		tc_portset_clear(&no_ports);
 		return cmd_serve(relay, &no_ports, insecure,
 		                 timeout_given ? timeout_s : 0, derpmap_url, key_spec,
-		                 full_address, false, &allow, args[1], TC_FILES_WO,
-		                 NULL, false, false, NULL, NULL);
+		                 full_address, false, &allow, args[1],
+		                 accept_dirs ? TC_FILES_WO_PLUS : TC_FILES_WO, NULL,
+		                 false, false, NULL, NULL);
 	}
 	if (strcmp(args[0], "forward") == 0) {
 		if (nargs < 3) {

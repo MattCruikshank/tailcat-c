@@ -205,6 +205,7 @@ LIB_SRCS := \
 	src/ssh/server.c \
 	src/ssh/sftp.c \
 	src/ssh/sftpserve.c \
+	src/ssh/rootdir.c \
 	src/ssh/fileserv.c \
 	src/ssh/dropbox.c \
 	src/ssh/client.c
@@ -216,7 +217,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-files live-shell live-ssh-serve live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-dropbox-tree live-files live-shell live-ssh-serve live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 # doc/usage.md is the source for src/usage_text.c, which is committed so that
@@ -488,6 +489,9 @@ live-sshd: $(BUILD)/livesshd
 # the client printed.
 live-dropbox: $(BUILD)/livesshd
 	BUILD=$(BUILD) sh scripts/live-dropbox.sh
+
+live-dropbox-tree: $(BUILD)/livesshd
+	BUILD=$(BUILD) sh scripts/live-dropbox-tree.sh
 
 live-files: $(BUILD)/livesshd
 	BUILD=$(BUILD) sh scripts/live-files.sh

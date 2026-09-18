@@ -197,7 +197,8 @@ direct peer-to-peer paths.
 | `ls` (SFTP remote listing) | ✅ (in-process SFTP client) | ✅ |
 | SSH *server* (`serve ssh`) | ✅ shell, pty, exec, forced command | ✅ |
 | `serve no-auth-ssh` | ✅ with upstream's warnings | ✅ |
-| `serve files` (`--files <dir>[:ro\|:rw\|:wo]`) | ✅ read, list, stat, write | ✅ |
+| `serve files` (`--files <dir>[:ro\|:rw\|:wo\|:wo+]`) | ✅ read, list, stat, write, drop box, tree drop box | ✅ |
+| `recv --accept-dirs` (recursive drop box) | ✅ | ✅ |
 | `--ssh-authorized-keys` (file, literal key, `user@github`) | ✅ ed25519 only | ✅ |
 | `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
 | `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
@@ -217,9 +218,7 @@ direct peer-to-peer paths.
 | `genkey --fixed-region` | ✅ | ✅ |
 | `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
 | reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
-| upstream's recursive drop box (`:wo+`) | ❌ | ✅ |
 | non-ed25519 authorized keys (RSA, ECDSA) | ❌ skipped, and said so | ✅ |
-| `authorized_keys` options (`command=`, `from=`) | ❌ refused, never ignored | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
 | macOS, FreeBSD, OpenBSD, NetBSD | built, untested | ✅ (macOS) |
@@ -1842,7 +1841,8 @@ recv` drop box since then.
       `--ssh-authorized-keys` takes upstream's three forms: a file, a literal
       key, and `user@github`. Key options are refused rather than ignored,
       because `command="..."` is a restriction and reading the key without it
-      grants more than the file says.
+      grants more than the file says -- which is upstream's reasoning too,
+      found in its source while implementing something else.
 
       `make live-shell` drives all of it with a real OpenSSH client, and it
       is what found the two truncation bugs described in [the bug
@@ -1857,11 +1857,11 @@ recv` drop box since then.
 
 **Phases 1 through 5 are done**, apart from the browser build, which
 Cosmopolitan cannot target, and TLS 1.3, which is blocked on Mbed TLS's X.509
-parser rather than on effort. What is left of upstream's surface is
-upstream's recursive drop box (`:wo+`), and three differences that are
-choices rather than gaps: authorized keys must be ed25519, `authorized_keys`
-options are refused rather than honoured, and `serve no-auth-ssh` warns
-before it prints the address. See [PLAN.md](PLAN.md) for the detail.
+parser rather than on effort. Of upstream's surface, what is left is one
+difference that is a choice rather than a gap: authorized keys must be
+ed25519, because that is the only signature this SSH server verifies, so
+other lines are skipped and counted rather than silently kept. See
+[PLAN.md](PLAN.md) for the detail.
 
 ## Licence
 

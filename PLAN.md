@@ -14,12 +14,12 @@ against a real OpenSSH.
 other than effort: WebAssembly, on a toolchain that does not exist for
 Cosmopolitan, and TLS 1.3, on an Ed25519 certificate Mbed TLS cannot parse.
 
-What is left of upstream's surface is upstream's *recursive* drop box
-(`--files <dir>:wo+`), recorded in 5.5 with the reasoning, and three
-differences that are choices rather than gaps: authorized keys must be
-ed25519, `authorized_keys` options are refused rather than honoured, and
-Windows sessions run on pipes because Cosmopolitan has no pseudo-terminals
-there.
+What is left of upstream's surface is two differences that are choices rather
+than gaps: authorized keys must be ed25519, because that is the only signature
+this SSH server verifies, and Windows sessions run on pipes because
+Cosmopolitan has no pseudo-terminals there. (`authorized_keys` options being
+refused was listed here as a third, until reading upstream's source showed it
+makes the same choice for the same reason.)
 
 An earlier version of this paragraph listed `serve ssh` as a deliberate
 omission, on the reasoning that a drop box which can run commands is not a
@@ -691,11 +691,14 @@ refusing a read-open -- is not, because `sftp` gives up at the stat and never
 reaches the open. Two independent barriers, one tested at each level, and
 that is recorded in the script rather than left to look like a gap.
 
-**Still flat only.** No directories, so no recursive upload. Upstream offers
+**Flat only, here.** No directories, so no recursive upload. Upstream offers
 that as `:wo+` and documents that it trades the guarantee away -- once a
 sender can create directories it can choose names again. If it is added it
 should be a separate mode with the trade stated, not a relaxation of this
 one.
+
+*(It was added, in 5.11, and that last sentence turned out to be the entire
+design. This entry is left as written.)*
 
 This is where the "writes attacker-named files" hazard lives. Upstream's flat
 write-only mode is the design to copy rather than improve on: the server
@@ -830,11 +833,62 @@ since the `ssh` wrapper was written), bug 41 (mine, bug 39's fix hanging the
 tunnel), and bug 42 -- bug 39 again, one layer down, in our own TCP. That last
 one had been shortening large transfers for `recv` and `ls` all along.
 
-Still not implemented: upstream's **recursive drop box** (`--files <dir>:wo+`),
-which is the one mode that lets a sender create directories. 5.5 records what
-that trades away, and none of it has changed.
+### 5.11 The recursive drop box ✅ · ~260 lines, plus 330 of tests
 
-### 5.7 WebAssembly build · blocked on the toolchain
+`--files <dir>:wo+`, and `recv --accept-dirs` for the same thing under
+upstream's other spelling. The last piece of upstream's surface.
+
+5.5 said this, and it is worth quoting because it turned out to be the whole
+design: *"If it is added it should be a separate mode with the trade stated,
+not a relaxation of this one."* That is exactly what the implementation had to
+resist, because relaxing the flat mode's checks is the shortest route and
+produces something that passes every happy-path test.
+
+**What it trades**, in upstream's words and ours: a sender keeps its own file
+names -- a tree whose names were rewritten is not the tree that was sent --
+and directories become stat-able, because a recursive upload has to resolve
+its destination. So a sender can discover that a directory exists, one guess
+at a time.
+
+**What it keeps**, which is the part worth testing: nothing is overwritten
+(the create is O_EXCL, so "this name is free" and "take it" are one operation),
+nothing can be read, listed, renamed, deleted or linked, nothing escapes the
+directory, and a *file* somebody else put there stays invisible. The flat
+mode's guarantee about files survives whole; only directories were traded.
+
+The fence moved to **tc/rootdir.h** on the way. `serve files` already had the
+component walk with `openat(O_NOFOLLOW)`, and the recursive drop box needs the
+identical guarantee for paths it creates, so it is one file now rather than
+two copies -- the same argument as tc/sftpserve.h. `tc_fileserv_resolve`
+stayed as a one-line wrapper on purpose: test_fileserv.c's 118 checks then run
+against the moved code *unchanged*, which is the evidence the move was
+faithful rather than a rewrite with the same name. It also gained
+`tc_rootdir_parent`, which is the form creating something needs -- one walk
+that yields the parent descriptor and the final name, rather than resolving
+the whole path, discovering it is absent, and walking a second time over a
+tree that may have changed in between.
+
+Two smaller decisions:
+
+- **Unsafe names are refused rather than sanitised.** The flat mode rewrites
+  `nul` or `trailing.` into something storable, because it is choosing the
+  name anyway. This mode has to keep the name it is given, and rewriting a
+  *directory* would silently put the rest of an upload somewhere the client
+  never asked for. The set refused is identical, which is what matters: one
+  name means one thing on every platform this ships to.
+- **Only this session's own uploads are stat-able**, in a bounded ring of 32.
+  The list is attacker-driven, so it has a limit, and past it the oldest is
+  forgotten and its stat answers "no such file" -- the safe direction, and
+  the same answer the flat mode gives about everything.
+
+Ten live checks with a real `scp -r` and `sftp`, and four mutations, all
+caught. One of those mutation runs left `/tmp/escaped.txt` behind and the next
+clean run failed on it: the escape tests were checking a directory shared with
+the whole machine, so they could have failed for the wrong reason -- or, worse
+in the other direction, passed because something else tidied up. The drop box
+now sits inside a parent the test owns.
+
+### 5.12 WebAssembly build · blocked on the toolchain
 
 Upstream compiles to WASM for the browser demo. Cosmopolitan does **not**
 target WASM: cosmocc is GCC for x86_64 and aarch64, and there is no clang,
@@ -1303,6 +1357,7 @@ These are already in the README's TODO list and do not depend on any feature.
 | 5.6 — WebAssembly | ? | ⏸ no toolchain |
 | 5.7 — `--allow` list | ~300 | ✅ done |
 | 5.8 — TCP hardening (bugs 20, 21) | ~120 | ✅ done |
+| 5.11 — recursive drop box (`:wo+`) | ~260 | ✅ done |
 | 5.9 — `readme` and `doc/usage.md` | ~175 | ✅ done |
 | 5.10 — `browse` and `--open-browser` | ~700 | ✅ done |
 | 6.1 — walking upstream’s README | ~450 | ✅ done |

@@ -12,25 +12,8 @@
  * ---- confinement --------------------------------------------------------
  *
  * Everything the client names is resolved beneath one root and must stay
- * there. Upstream uses Go's `os.Root`, which refuses to traverse a symlink
- * or a `..` out of the tree at the system-call level. There is no such thing
- * in C, so this walks the path itself:
- *
- *   - The path is split into components. `.` is dropped, `..` pops -- and
- *     pops *before* anything touches the filesystem, so "a/../../etc" is
- *     rejected as a path rather than opened and then regretted.
- *   - Each component is opened with openat(O_NOFOLLOW) from the directory
- *     above it, so a symlink anywhere along the way fails rather than
- *     redirecting. That is the part a realpath() check cannot do: realpath
- *     resolves the link and then compares, which is both a different answer
- *     and a race.
- *   - An absolute path from the client is taken as relative to the root,
- *     because that is what every SFTP client means by "/" when it has been
- *     given a directory.
- *
- * The result is that a client cannot name anything outside the root, cannot
- * follow a link out of it, and cannot win a race by replacing a component
- * between the check and the open -- there is no separate check to race.
+ * there. That is tc/rootdir.h's job, and it is shared with the recursive drop
+ * box, which needs exactly the same guarantee for the paths it creates.
  *
  * ---- read-only means read-only -----------------------------------------
  *
@@ -47,6 +30,7 @@
 #ifndef TC_FILESERV_H_
 #define TC_FILESERV_H_
 
+#include "tc/rootdir.h"
 #include "tc/sftp.h"
 #include "tc/sshserver.h"
 
@@ -67,11 +51,10 @@ typedef struct {
 } tc_fileserv_handle;
 
 typedef struct {
-	int root_fd;
+	tc_rootdir root;
 	bool writable;
 	tc_fileserv_handle h[TC_FILESERV_MAX_HANDLES];
 	uint64_t next_handle;
-	char root[1024];
 } tc_fileserv;
 
 /* tc_fileserv_open holds the served directory open for the session.
@@ -91,13 +74,11 @@ void tc_fileserv_close(tc_fileserv *fs);
 /* tc_fileserv_serve runs a whole session and closes the server afterwards. */
 int tc_fileserv_serve(tc_fileserv *fs, tc_ssh_server *s);
 
-/* tc_fileserv_resolve opens what `path` names, beneath the root, without
- * following a symlink at any step.
+/* tc_fileserv_resolve resolves one client path against this server's root.
  *
- * Exposed for its tests: the confinement is the security property of this
- * file and deserves to be checked directly rather than only through a
- * session. `want_dir` opens it as a directory. Returns a descriptor the
- * caller closes, or -1 with errno set. */
+ * A thin wrapper on tc_rootdir_resolve, kept because the tests for the fence
+ * were written against it and are worth running unchanged: they are what says
+ * the move into tc/rootdir.h did not alter the behaviour. */
 int tc_fileserv_resolve(tc_fileserv *fs, const char *path, bool want_dir,
                         int flags);
 

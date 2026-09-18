@@ -33,18 +33,12 @@ int tc_fileserv_open(tc_fileserv *fs, const char *dir, bool writable)
 	if (fs == NULL || dir == NULL)
 		return TC_ERR_INVAL;
 	memset(fs, 0, sizeof *fs);
-	fs->root_fd = -1;
 	for (size_t i = 0; i < TC_FILESERV_MAX_HANDLES; i++)
 		fs->h[i].fd = -1;
 
-	if ((size_t)snprintf(fs->root, sizeof fs->root, "%s", dir) >=
-	    sizeof fs->root)
-		return TC_ERR_NOSPACE;
-
-	int fd = open(dir, OFLAGS(O_RDONLY | O_DIRECTORY));
-	if (fd < 0)
-		return TC_ERR_INVAL;
-	fs->root_fd = fd;
+	int rc = tc_rootdir_open(&fs->root, dir);
+	if (rc != TC_OK)
+		return rc;
 	fs->writable = writable;
 	fs->next_handle = 1;
 	return TC_OK;
@@ -65,9 +59,7 @@ void tc_fileserv_close(tc_fileserv *fs)
 		fs->h[i].fd = -1;
 		fs->h[i].dir = NULL;
 	}
-	if (fs->root_fd >= 0)
-		(void)close(fs->root_fd);
-	fs->root_fd = -1;
+	tc_rootdir_close(&fs->root);
 }
 
 /* ---- confinement -------------------------------------------------------- */
@@ -75,81 +67,11 @@ void tc_fileserv_close(tc_fileserv *fs)
 int tc_fileserv_resolve(tc_fileserv *fs, const char *path, bool want_dir,
                         int flags)
 {
-	if (fs == NULL || fs->root_fd < 0 || path == NULL) {
+	if (fs == NULL) {
 		errno = EINVAL;
 		return -1;
 	}
-
-	/* The components that survive `.` and `..`, resolved before any of them
-	 * reaches the filesystem. "a/../../etc" is refused as a path; it is
-	 * never opened and then reconsidered. */
-	const char *parts[64];
-	size_t lens[64];
-	size_t n = 0;
-	const char *p = path;
-	while (*p != '\0') {
-		while (*p == '/')
-			p++;
-		if (*p == '\0')
-			break;
-		const char *start = p;
-		while (*p != '\0' && *p != '/')
-			p++;
-		size_t len = (size_t)(p - start);
-		if (len == 1 && start[0] == '.')
-			continue;
-		if (len == 2 && start[0] == '.' && start[1] == '.') {
-			if (n == 0) {
-				/* Above the root. There is nothing there for this client. */
-				errno = EACCES;
-				return -1;
-			}
-			n--;
-			continue;
-		}
-		if (n >= sizeof parts / sizeof parts[0]) {
-			errno = ENAMETOOLONG;
-			return -1;
-		}
-		parts[n] = start;
-		lens[n] = len;
-		n++;
-	}
-
-	int cur = dup(fs->root_fd);
-	if (cur < 0)
-		return -1;
-
-	for (size_t i = 0; i < n; i++) {
-		char name[256];
-		if (lens[i] >= sizeof name) {
-			(void)close(cur);
-			errno = ENAMETOOLONG;
-			return -1;
-		}
-		memcpy(name, parts[i], lens[i]);
-		name[lens[i]] = '\0';
-
-		bool last = (i + 1 == n);
-		/* O_NOFOLLOW at every step, which is the whole confinement: a
-		 * symlink is refused rather than followed, so nothing can redirect
-		 * the walk outside the root. A realpath() check instead would
-		 * resolve the link, compare afterwards, and lose a race to whoever
-		 * can replace a component in between. */
-		int f = last ? OFLAGS((unsigned)flags | O_NOFOLLOW)
-		             : OFLAGS(O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-		if (last && want_dir)
-			f = OFLAGS(O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-		int next = openat(cur, name, f, 0600);
-		(void)close(cur);
-		if (next < 0)
-			return -1;
-		cur = next;
-	}
-
-	if (n == 0 && want_dir)
-		return cur; /* the root itself */
-	return cur;
+	return tc_rootdir_resolve(&fs->root, path, want_dir, flags);
 }
 
 /* ---- replies ------------------------------------------------------------ */

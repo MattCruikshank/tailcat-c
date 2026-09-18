@@ -396,6 +396,7 @@ if [ "$LEVEL" -eq 1 ]; then
 	stage "live: a saved key through both implementations" "make live-genkey"
 	stage --need ssh "live: real OpenSSH against our SSH server" "make live-sshd"
 	stage --need sftp "live: scp and sftp against the write-only drop box" "make live-dropbox"
+	stage --need sftp "live: a tree into the recursive drop box" "make live-dropbox-tree"
 	stage --need sftp "live: scp and sftp against a served directory" "make live-files"
 	stage --need ssh "live: a real shell, pty and all" "make live-shell"
 	stage --need scp "live: recv receiving a real scp over a real relay" "make live-recv-serve"

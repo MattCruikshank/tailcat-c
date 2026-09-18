@@ -16,7 +16,7 @@
  * wrong, it does not.
  *
  * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex>
- *                 [<dir> [ro|rw|wo] | shell]
+ *                 [<dir> [ro|rw|wo|wo+] | shell]
  *
  * The mode picks the policy the directory is served under: `wo` is the drop
  * box, `ro` and `rw` the file server. It defaults to `wo` so the older
@@ -134,7 +134,7 @@ static int sock_write(void *ctx, const uint8_t *buf, size_t len)
  * come from a server that got this far, so the script can tell "the channel
  * worked" from "the client printed its own input back at itself". */
 static const char *g_dir;
-/* 0 = drop box, 1 = read-only, 2 = read-write. */
+/* 0 = drop box, 1 = read-only, 2 = read-write, 3 = recursive drop box. */
 static int g_mode;
 /* Serve a shell rather than a directory. */
 static bool g_shell;
@@ -144,9 +144,10 @@ static bool g_shell;
  * same code rather than two copies of the same loop. */
 static int serve_sftp(tc_ssh_server *s)
 {
-	if (g_mode == 0) {
+	if (g_mode == 0 || g_mode == 3) {
 		tc_dropbox db;
-		int rc = tc_dropbox_open(&db, g_dir);
+		int rc = g_mode == 3 ? tc_dropbox_open_recursive(&db, g_dir)
+		                     : tc_dropbox_open(&db, g_dir);
 		if (rc != TC_OK) {
 			fprintf(stderr, "livesshd: drop box %s unusable\n", g_dir);
 			return rc;
@@ -252,8 +253,10 @@ int main(int argc, char **argv)
 			g_mode = 2;
 		else if (strcmp(argv[5], "wo") == 0)
 			g_mode = 0;
+		else if (strcmp(argv[5], "wo+") == 0)
+			g_mode = 3;
 		else {
-			fprintf(stderr, "livesshd: mode must be ro, rw or wo\n");
+			fprintf(stderr, "livesshd: mode must be ro, rw, wo or wo+\n");
 			return 2;
 		}
 	}
