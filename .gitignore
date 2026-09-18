@@ -5,3 +5,4 @@ build/
 *.a
 *.dbg
 *.com
+dist/
