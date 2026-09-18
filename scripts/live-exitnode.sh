@@ -111,6 +111,39 @@ case "$OUT" in
 	;;
 esac
 
+# ---- and the same destination from the pipe ------------------------------
+#
+# `forward` has always been able to name a third address; the pipe could not,
+# and `ssh -p` therefore could not either, because it is the pipe that its
+# ProxyCommand runs. The syntax is deliberately the mapping's far half, so
+# somebody who has written 19000:127.0.0.1:8080 once can write the tail of it
+# here. This is the same server, still an exit node, reached the other way.
+OUT=$(printf 'hello\n' | timeout 60 "$CLI" -v "$ADDR" "127.0.0.1:$PORT" \
+	2> "$WORK/pipe.log" || true)
+
+echo "pipe got: ${OUT:-<nothing>}"
+case "$OUT" in
+*"reached the third machine"*)
+	echo "ok   the pipe reached a third address through the exit node"
+	;;
+*)
+	echo "FAIL live-exitnode: the pipe did not reach the third address" >&2
+	tail -20 "$WORK/pipe.log" >&2
+	RC=1
+	;;
+esac
+
+# And it said where it was going, in the address the user typed rather than
+# the NAT64 form it travels as.
+if ! grep -q "connecting to 127.0.0.1:$PORT, through the server" \
+	"$WORK/pipe.log"; then
+	echo "FAIL live-exitnode: the pipe did not report the destination" >&2
+	tail -20 "$WORK/pipe.log" >&2
+	RC=1
+else
+	echo "ok   and named the destination as it was typed"
+fi
+
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 

@@ -265,6 +265,11 @@ fi
 # ---- every level: the fat build and the unit tests ----------------------
 stage "cosmocc build + tests (fat APE)" "make test"
 
+# src/cli/main.c is a program, so no unit test links against it. These are the
+# parts of it that can be checked without dialling anything, which is why they
+# run at every level rather than with the live stages.
+stage "command-line checks that need no network" "make cli-offline"
+
 # ---- levels 3 and 1: the second toolchain -------------------------------
 #
 # This is where four of the first six bugs in this project came from. Host

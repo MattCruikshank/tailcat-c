@@ -143,7 +143,12 @@ static void usage(FILE *f)
 	        "command, runs it with\n"
 	        "                                          all_proxy set and "
 	        "exits when it does\n"
-	        "  tailcat-c ssh [-p PORT] [user@]<tc-addr> [cmd...]\n"
+	        "  tailcat-c ssh [-p PORT|IP|IP:PORT] [user@]<tc-addr> "
+	        "[cmd...]\n"
+	        "                                          an IP goes via the "
+	        "server as an\n"
+	        "                                          exit node; a bare one "
+	        "means its 22\n"
 	        "  tailcat-c cp [-r] <src>... <dst>        copy via scp, paths as "
 	        "<tc-addr>:path\n"
 	        "  tailcat-c ping [--until-direct] <tc-address>\n"
@@ -155,8 +160,12 @@ static void usage(FILE *f)
 	        "  tailcat-c parse <tc-address>            describe an address\n"
 	        "  tailcat-c netcheck                      report UDP, NAT and relay\n"
 	        "                                          latency\n"
-	        "  tailcat-c genkey --key <name> [--client] [--region N|code]\n"
-	        "                                          --region auto is the default;\n"
+	        "  tailcat-c genkey --key <name> [--client]\n"
+	        "                   [--region N|code|host,host|auto|list]\n"
+	        "                                          auto is the default; a "
+	        "hostname\n"
+	        "                                          names a relay off the "
+	        "list;\n"
 	        "                                          --fixed-region measures one now\n"
 	        "  tailcat-c printpub                      the client key that "
 	        "would be used\n"
@@ -2852,6 +2861,90 @@ static int list_regions(const char *derpmap_url, bool insecure)
 	return 0;
 }
 
+/* relay_hosts_ok reports whether a --region value is a list of relay
+ * hostnames we are willing to write into a key file, and copies them into
+ * `out` if so.
+ *
+ * Upstream tells this form from a region code by looking for a dot, and so
+ * does this: a region code is "nyc" or "tok" and never has one, a hostname
+ * always does. What upstream does not do is look at the rest, so
+ * `--region=..` writes a key whose address names a relay that cannot exist
+ * and fails at connect time, days later, to somebody who no longer has the
+ * command they ran. A key file is the one thing here meant to outlive the
+ * session that made it, so the check happens while there is still someone to
+ * read the error. */
+static bool relay_hosts_ok(const char *spec, tc_derp_region *out)
+{
+	memset(out, 0, sizeof *out);
+	const char *p = spec;
+	for (;;) {
+		const char *comma = strchr(p, ',');
+		size_t n = (comma != NULL) ? (size_t)(comma - p) : strlen(p);
+		if (n == 0) {
+			fprintf(stderr, "tailcat-c: --region has an empty hostname in "
+			                "it\n");
+			return false;
+		}
+		if (n >= TC_DNS_NAME_MAX) {
+			fprintf(stderr, "tailcat-c: \"%.40s...\" is too long for a "
+			                "hostname\n",
+			        p);
+			return false;
+		}
+		if (out->num_nodes >= TC_ADDR_MAX_NODES) {
+			fprintf(stderr,
+			        "tailcat-c: --region takes at most %d relay hostnames\n",
+			        (int)TC_ADDR_MAX_NODES);
+			return false;
+		}
+		/* A DNS name, loosely: the characters a hostname may contain, a dot
+		 * somewhere inside it, and no label boundary at either end. This is
+		 * not a full RFC 1035 check and does not try to be -- it is here to
+		 * catch a typo or a pasted URL, not to be the authority on names. */
+		bool dotted = false;
+		for (size_t i = 0; i < n; i++) {
+			char c = p[i];
+			bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			          (c >= '0' && c <= '9') || c == '-' || c == '.';
+			if (!ok) {
+				fprintf(stderr,
+				        "tailcat-c: \"%.*s\" is not a hostname; --region "
+				        "takes a region, a code, or relay hostnames\n",
+				        (int)n, p);
+				return false;
+			}
+			if (c == '.') {
+				if (i == 0 || i + 1 == n || p[i - 1] == '.') {
+					fprintf(stderr,
+					        "tailcat-c: \"%.*s\" has an empty label\n",
+					        (int)n, p);
+					return false;
+				}
+				dotted = true;
+			}
+		}
+		if (!dotted || p[0] == '-' || p[n - 1] == '-') {
+			fprintf(stderr, "tailcat-c: \"%.*s\" is not a hostname\n",
+			        (int)n, p);
+			return false;
+		}
+
+		tc_derp_node *node = &out->nodes[out->num_nodes++];
+		memcpy(node->hostname, p, n);
+		node->hostname[n] = '\0';
+		/* Only the hostname, which is all upstream records. Everything
+		 * else -- the name a netcheck uses, the region code, the ports --
+		 * is derived by tc_addr_parse on the far side, so writing our own
+		 * guesses here would be inventing fields the address does not
+		 * carry. */
+
+		if (comma == NULL)
+			break;
+		p = comma + 1;
+	}
+	return true;
+}
+
 static int cmd_genkey(const char *key_spec, bool client, bool force,
                       bool delete_it, bool list, const char *region,
                       bool fixed_region, bool embed_map, bool psk,
@@ -2879,6 +2972,15 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 	}
 	if (embed_map && client) {
 		fprintf(stderr, "tailcat-c: a client key has no region to embed\n");
+		return 2;
+	}
+	/* Refused rather than ignored. A client key has no relay of its own --
+	 * it dials whatever the server's address names -- so --region here is
+	 * someone expecting something the key cannot do, and silently writing a
+	 * key without it would let them find out much later. */
+	if (client && region != NULL && strcmp(region, "auto") != 0) {
+		fprintf(stderr, "tailcat-c: --client keys have no relay region of "
+		                "their own, so --region does not apply\n");
 		return 2;
 	}
 	if (list)
@@ -2924,6 +3026,18 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 
 	int64_t region_id = 0;
 
+	/* Relay hostnames rather than a region from the published map.
+	 *
+	 * This is the form for a relay the map does not list: a private one, one
+	 * being tested, or a DERP server run alongside the service. The key
+	 * carries the hostnames themselves and no region ID, so every address it
+	 * produces is self-contained and neither side ever fetches a DERP map
+	 * for it -- which is also why this branch makes no network call. */
+	static tc_derp_region host_region;
+	bool region_hosts = (region != NULL && strchr(region, '.') != NULL);
+	if (region_hosts && !relay_hosts_ok(region, &host_region))
+		return 2;
+
 	/* --fixed-region and --region name the same field by different means, so
 	 * taking both is an instruction with two answers. */
 	if (fixed_region && region != NULL && strcmp(region, "auto") != 0) {
@@ -2964,7 +3078,8 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 		      best->region_code);
 	}
 
-	if (region != NULL && strcmp(region, "auto") != 0 && !client) {
+	if (region != NULL && strcmp(region, "auto") != 0 && !client &&
+	    !region_hosts) {
 		char *end = NULL;
 		long v = strtol(region, &end, 10);
 		if (end != NULL && *end == '\0' && v > 0 && v < 65536) {
@@ -2995,6 +3110,16 @@ static int cmd_genkey(const char *key_spec, bool client, bool force,
 	if (tc_keyfile_generate(&k, psk, region_id) != TC_OK) {
 		fprintf(stderr, "tailcat-c: %s\n", tc_keyfile_error_string());
 		return 1;
+	}
+
+	if (region_hosts) {
+		/* No region ID beside the nodes: an address carries one or the
+		 * other, and a key that carried both would say the same thing twice
+		 * and disagree the moment the map moved. The same reasoning as
+		 * --embed-derp-map below, for the same reason. */
+		k.pub.regions[0] = host_region;
+		k.pub.num_regions = 1;
+		k.pub.region_id = 0;
 	}
 
 	if (embed_map) {
@@ -4016,8 +4141,26 @@ static int probe_on_ready(void *ctx, tc_ssh_client *c)
  * lets the real connection proceed and report its own errors. This is a
  * safety net, not a gate, and a net that turned a flaky network into a
  * refusal would be worse than no net at all. */
-static bool dns_admits_strangers(const char *addr, bool insecure,
-                                 const char *derpmap_url)
+/* Where a client's connection goes once it is through the tunnel.
+ *
+ * Two cases, and it is worth saying why they are one type. A port is a port
+ * on the server. An `ip:port` is somewhere on the server's network, reached
+ * by asking it to act as an exit node -- a different packet on the wire, and
+ * something the server has to have agreed to. But from the command line it is
+ * the same question in the same argument position, and keeping the two in
+ * separate variables is exactly how `-p` came to mean only the first. */
+typedef struct {
+	uint16_t port; /* the server's port, when dst.ip_len == 0 */
+	/* Already NAT64-wrapped, so the dial site sees one kind of destination
+	 * rather than two. ip_len 0 means the server itself. */
+	tc_endpoint dst;
+	/* What to print: as the user meant it, with IPv4 unwrapped again. A
+	 * message about 64:ff9b::a00:1 would be about an address nobody typed. */
+	char shown[96];
+} dial_target;
+
+static bool dns_admits_strangers(const char *addr, const dial_target *to,
+                                 bool insecure, const char *derpmap_url)
 {
 	static tc_client cl;
 	bool got_in = false;
@@ -4040,8 +4183,17 @@ static bool dns_admits_strangers(const char *addr, bool insecure,
 	uint64_t deadline = now_ms() + 20000;
 	if (client_up(&cl, addr, insecure, derpmap_url, "new", deadline) ==
 	    TC_OK) {
+		/* The same destination the real connection will use, not port 22.
+		 * A probe of somewhere else answers a question nobody asked: with
+		 * `-p 2222` it would report on a server that may not even be
+		 * listening there, and with `-p 10.0.0.1:22` it would probe the
+		 * server's own SSH rather than the machine behind it. */
 		tc_tcp_conn *tcp = NULL;
-		if (tc_tcp_mux_connect(cl.mux, 22, now_ms(), &tcp) == TC_OK) {
+		int prc = (to->dst.ip_len == 16)
+		              ? tc_tcp_mux_connect_to(cl.mux, to->dst.ip,
+		                                      to->dst.port, now_ms(), &tcp)
+		              : tc_tcp_mux_connect(cl.mux, to->port, now_ms(), &tcp);
+		if (prc == TC_OK) {
 			ls_io io;
 			io.cl = &cl;
 			io.conn = tcp;
@@ -4084,7 +4236,115 @@ restore:
 	return got_in;
 }
 
-static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
+/* target_arg reads `<port>` or `<ip>:<port>`.
+ *
+ * The second form needs `serve exit-node` at the far end. A server that was
+ * not started that way answers with a reset, exactly as it would for a closed
+ * port -- so this cannot tell the two apart from here, and does not pretend
+ * to. */
+static bool target_arg(const char *s, dial_target *out)
+{
+	memset(out, 0, sizeof *out);
+	if (s == NULL || *s == '\0') {
+		fprintf(stderr, "tailcat-c: missing port\n");
+		return false;
+	}
+
+	char *end = NULL;
+	unsigned long p = strtoul(s, &end, 10);
+	if (end != s && *end == '\0' && p >= 1 && p <= 65535) {
+		out->port = (uint16_t)p;
+		(void)snprintf(out->shown, sizeof out->shown, "the server's port %u",
+		               (unsigned)out->port);
+		return true;
+	}
+
+	if (strchr(s, ':') == NULL) {
+		fprintf(stderr, "tailcat-c: bad port %s\n", s);
+		return false;
+	}
+
+	tc_endpoint ep;
+	if (tc_fwd_parse_dest(&ep, s) != TC_OK) {
+		fprintf(stderr, "tailcat-c: %s\n", tc_fwd_error_string());
+		return false;
+	}
+	char where[64];
+	if (tc_endpoint_format(where, sizeof where, &ep) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not name that destination\n");
+		return false;
+	}
+	(void)snprintf(out->shown, sizeof out->shown, "%s, through the server",
+	               where);
+	/* Wrapped here rather than at the dial site, for the reason `forward`
+	 * wraps at parse time: the tunnel carries IPv6 only, and doing it once
+	 * means everything downstream sees one kind of address. */
+	if (ep.ip_len == 4) {
+		if (tc_nat64_wrap(&out->dst, &ep) != TC_OK) {
+			fprintf(stderr, "tailcat-c: cannot carry %s over the tunnel\n",
+			        where);
+			return false;
+		}
+	} else {
+		out->dst = ep;
+	}
+	out->port = ep.port;
+	return true;
+}
+
+/* ssh_target_arg reads what `ssh -p` takes: target_arg's two forms, and one
+ * more -- a bare address, meaning port 22 on it. That is upstream's rule and
+ * it is the useful one, since somebody reaching a machine through an exit
+ * node is reaching its SSH port far more often than not.
+ *
+ * It also writes the canonical spelling to `out`, because that string is
+ * handed to a ProxyCommand which parses it again. Canonicalising once here
+ * means the two readings cannot differ, and it is the same argument the DNS
+ * safety probe uses -- so what gets probed is what gets dialled. */
+static bool ssh_target_arg(const char *s, dial_target *t, char *out,
+                           size_t cap)
+{
+	if (s == NULL || *s == '\0') {
+		fprintf(stderr, "tailcat-c: -p needs a port or an address\n");
+		return false;
+	}
+	/* Told apart by shape: a port is digits and nothing else, an IPv4
+	 * literal has dots and no colon, and an IPv6 one is in brackets. */
+	size_t n = strlen(s);
+	bool bare_ip = (strchr(s, '.') != NULL && strchr(s, ':') == NULL) ||
+	               (n >= 2 && s[0] == '[' && s[n - 1] == ']');
+	if (bare_ip) {
+		char withport[128];
+		int w = snprintf(withport, sizeof withport, "%s:22", s);
+		if (w < 0 || (size_t)w >= sizeof withport) {
+			fprintf(stderr, "tailcat-c: -p %.40s... is too long\n", s);
+			return false;
+		}
+		if (!target_arg(withport, t))
+			return false;
+	} else if (!target_arg(s, t)) {
+		return false;
+	}
+
+	if (t->dst.ip_len == 0) {
+		/* Rewritten from the parsed number rather than copied, so "022" and
+		 * "22" become one string before anything else sees them. */
+		(void)snprintf(out, cap, "%u", (unsigned)t->port);
+		return true;
+	}
+	tc_endpoint shown = t->dst, v4;
+	if (tc_nat64_unwrap(&v4, &shown) == TC_OK)
+		shown = v4;
+	char where[64];
+	if (tc_endpoint_format(where, sizeof where, &shown) != TC_OK) {
+		fprintf(stderr, "tailcat-c: could not name that destination\n");
+		return false;
+	}
+	(void)snprintf(out, cap, "%s", where);
+	return true;
+}
+
+static int cmd_pipe(const char *addr_str, const dial_target *to, bool insecure,
                     unsigned timeout_s, const char *derpmap_url,
                     const char *key_spec)
 {
@@ -4095,12 +4355,16 @@ static int cmd_pipe(const char *addr_str, uint16_t port, bool insecure,
 		return 1;
 
 	tc_tcp_conn *tcp = NULL;
-	if (tc_tcp_mux_connect(cl.mux, port, now_ms(), &tcp) != TC_OK) {
+	int drc = (to->dst.ip_len == 16)
+	              ? tc_tcp_mux_connect_to(cl.mux, to->dst.ip, to->dst.port,
+	                                      now_ms(), &tcp)
+	              : tc_tcp_mux_connect(cl.mux, to->port, now_ms(), &tcp);
+	if (drc != TC_OK) {
 		fprintf(stderr, "tailcat-c: could not start the connection\n");
 		client_down(&cl);
 		return 1;
 	}
-	vlogf("connecting to port %u from %u", (unsigned)port,
+	vlogf("connecting to %s from %u", to->shown,
 	      (unsigned)tc_tcp_local_port(tcp));
 
 	int status = run_pipe(&cl.derp, &cl.peer, cl.mux, tcp,
@@ -6013,6 +6277,14 @@ out:
  * The host:port form gets its own message, because "bad port" would be true
  * and useless: the user typed something upstream accepts, and what they need
  * to know is which command does it here. */
+/* port_arg reads a local port: the one --listen binds on this machine.
+ *
+ * A plain number and nothing else. It used to carry a paragraph explaining
+ * that a third address needs `forward` and an exit node, which was the right
+ * thing to say when the pipe refused `ip:port` -- the pipe takes it now, and
+ * `--listen` is a socket on this machine that no exit node is involved in, so
+ * repeating it here would send someone somewhere useless. See target_arg for
+ * the argument that really does name a destination. */
 static bool port_arg(const char *s, uint16_t *out)
 {
 	char *end = NULL;
@@ -6026,18 +6298,7 @@ static bool port_arg(const char *s, uint16_t *out)
 		*out = (uint16_t)p;
 		return true;
 	}
-	if (strchr(s, ':') != NULL) {
-		fprintf(stderr,
-		        "tailcat-c: \"%s\" is a host and port, which this form "
-		        "cannot reach.\n"
-		        "  Going through a server to a third address needs it "
-		        "running as an exit node,\n"
-		        "  and the forward command: tailcat-c forward <tc-addr> "
-		        "<local-port>:%s\n",
-		        s, s);
-		return false;
-	}
-	fprintf(stderr, "tailcat-c: bad port %s\n", s);
+	fprintf(stderr, "tailcat-c: \"%s\" is not a port to listen on\n", s);
 	return false;
 }
 
@@ -6944,10 +7205,15 @@ int main(int argc, char **argv)
 			return 2;
 		}
 		/* Checked here rather than left to the ProxyCommand, where the same
-		 * complaint would arrive buried in ssh's own output. */
-		uint16_t pnum;
-		if (!port_arg(ssh_port, &pnum))
+		 * complaint would arrive buried in ssh's own output. The canonical
+		 * form is what gets passed on, so the child parses the same string
+		 * this just validated. */
+		dial_target sshto;
+		static char ssh_port_canon[80];
+		if (!ssh_target_arg(ssh_port, &sshto, ssh_port_canon,
+		                    sizeof ssh_port_canon))
 			return 2;
+		ssh_port = ssh_port_canon;
 
 		/* The same scan cmd_ssh_or_cp does, so the two agree on which
 		 * argument is the address. They have to: this one resolves it and
@@ -6964,7 +7230,7 @@ int main(int argc, char **argv)
 			return 1;
 		if (from_dns && !skip_dns_check) {
 			vlogf("checking whether a stranger could log in here");
-			if (dns_admits_strangers(dst, insecure, derpmap_url)) {
+			if (dns_admits_strangers(dst, &sshto, insecure, derpmap_url)) {
 				fprintf(stderr,
 				        "tailcat-c: refusing to connect.\n"
 				        "  %s publishes its tailcat address in a DNS TXT "
@@ -6995,11 +7261,16 @@ int main(int argc, char **argv)
 			                "destination\n");
 			return 2;
 		}
-		uint16_t probe;
-		if (!port_arg(ssh_port, &probe))
+		/* `cp` takes the same -p, and for the same reason: scp runs over
+		 * the ssh this proxies, so a file can come from a machine behind an
+		 * exit node as easily as from the server. */
+		dial_target cpto;
+		static char cp_port_canon[80];
+		if (!ssh_target_arg(ssh_port, &cpto, cp_port_canon,
+		                    sizeof cp_port_canon))
 			return 2;
-		return cmd_ssh_or_cp(true, argv[0], &args[1], nargs - 1, ssh_port,
-		                     insecure, derpmap_url);
+		return cmd_ssh_or_cp(true, argv[0], &args[1], nargs - 1,
+		                     cp_port_canon, insecure, derpmap_url);
 	}
 	if (strcmp(args[0], "parse") == 0) {
 		if (nargs < 2) {
@@ -7009,11 +7280,16 @@ int main(int argc, char **argv)
 		return cmd_parse(args[1]);
 	}
 
-	uint16_t port = 1;
-	if (nargs >= 2 && !port_arg(args[1], &port))
+	/* Port 1 with no argument, which is what upstream's bare client mode
+	 * dials: the accept-one-connection server answers on any port. */
+	dial_target to;
+	memset(&to, 0, sizeof to);
+	to.port = 1;
+	(void)snprintf(to.shown, sizeof to.shown, "the server's port 1");
+	if (nargs >= 2 && !target_arg(args[1], &to))
 		return 2;
 	const char *dst = dest_arg(args[0], NULL);
 	if (dst == NULL)
 		return 1;
-	return cmd_pipe(dst, port, insecure, timeout_s, derpmap_url, key_spec);
+	return cmd_pipe(dst, &to, insecure, timeout_s, derpmap_url, key_spec);
 }

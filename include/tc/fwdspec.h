@@ -45,6 +45,20 @@ typedef struct {
  * the last failure. */
 int tc_fwd_parse(tc_fwd_spec *out, const char *spec);
 
+/* tc_fwd_parse_dest reads the far half of a mapping on its own: `<ip>:<port>`,
+ * with an IPv6 address in brackets.
+ *
+ * `tailcat-c <addr> 10.0.0.1:22` and `tailcat-c ssh -p 10.0.0.1:22 <addr>`
+ * both name a destination beyond the server without naming a local port,
+ * so they need this half without the rest. The rules are the same ones the
+ * mapping form uses, deliberately: a user who has written `13306:10.0.0.1:22`
+ * once should not find the tail of it spelled differently here.
+ *
+ * The port is part of the endpoint. No DNS, for the reason above
+ * tc_fwd_parse: a name resolved here would be resolved on the wrong
+ * machine. */
+int tc_fwd_parse_dest(tc_endpoint *out, const char *s);
+
 const char *tc_fwd_error_string(void);
 
 #endif /* TC_FWDSPEC_H_ */

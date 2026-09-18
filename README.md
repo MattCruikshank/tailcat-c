@@ -209,15 +209,14 @@ direct peer-to-peer paths.
 | bare `tailcat` starts a server | ✅ | ✅ |
 | `--flag=value` as well as `--flag value` | ✅ | ✅ |
 | `--timeout` as a duration (`2m`, `1h30m`) | ✅ | ✅ |
-| **Not here** | | |
 | addresses in DNS TXT records | ✅ | ✅ |
 | the DNS safety probe | ✅ | ✅ |
 | `socks` with the address omitted | ✅ | ✅ |
 | a tc-addr as a URL hostname | ✅ | ✅ |
-
 | `genkey --fixed-region` | ✅ | ✅ |
-| `genkey --region=<relay-hostname>` | ❌ (`--relay` does it for `serve`) | ✅ |
-| reaching a third address from the pipe or `ssh -p` | ❌ (`forward` does it) | ✅ (`-p ip:port`) |
+| `genkey --region=<relay-hostname>` | ✅ (comma-separated, no relay-list fetch) | ✅ |
+| a third address from the pipe or `ssh -p` | ✅ (`ip:port`, IPv6 in brackets) | ✅ |
+| **Not here** | | |
 | `ssh-rsa` (SHA-1), `ssh-dss`, `sk-*`, P-521, certificates | ❌ skipped, and said so | ✅ |
 | **Platforms** | | |
 | Linux, Windows | ✅ tested | ✅ |
@@ -2025,6 +2024,48 @@ recv` drop box since then.
       because new keys and randomised ECDSA make them irreproducible, the
       level 1 check regenerates them and runs the test rather than diffing,
       which is the mistake bug 19 was.
+
+- [x] **The last two command-line gaps.** `genkey --region=<hostname>` and a
+      third address from the pipe and from `ssh -p`. Both were listed as
+      choices rather than gaps, and neither really was: the first is how you
+      point a key at a relay the published list does not have, and the second
+      is the only way to reach a machine behind an exit node without setting
+      up a local listener first.
+
+      `--region` already took a number, a code and a name substring. Upstream
+      tells a hostname from those by looking for a dot, and so does this; what
+      it does not do is look at the rest, so `--region=..` writes a key whose
+      address names a relay that cannot exist and fails days later for
+      somebody who no longer has the command they ran. A key file is the one
+      thing here meant to outlive the session that made it, so the hostnames
+      are checked while there is still someone to read the error. The form
+      needs no relay list at either end, which makes it the only `genkey` that
+      touches no network — and therefore the first thing that could be checked
+      offline.
+
+      That turned into `make cli-offline`, which is new and overdue:
+      `src/cli/main.c` is a program, so no unit test links against it, and
+      until now every check of its arguments was a live one that ran at level
+      1. It runs at every level and covers both features, including what `-p`
+      hands to the ProxyCommand — a stub `ssh` on `PATH` prints it, so the
+      canonical form is asserted rather than assumed.
+
+      The third address is one type rather than two variables:
+
+          typedef struct {
+              uint16_t port;    /* the server's port, when dst is unset */
+              tc_endpoint dst;  /* somewhere beyond it, needing an exit node */
+              char shown[96];
+          } dial_target;
+
+      Keeping those apart is exactly how `-p` came to mean only the first.
+      Making them one turned up a bug next door: the DNS safety probe, which
+      logs in as a stranger before connecting to a DNS-named server, dialled
+      port 22 no matter what `-p` said. With `-p 2222` it reported on a server
+      that might not be listening there at all, and with `-p 10.0.0.1:22` it
+      would have probed the server's own SSH rather than the machine behind
+      it — answering a question nobody asked, in the one place whose whole job
+      is to answer this one.
 
 - [x] **`ls`, in-process.** Upstream's `ls` is the one file command it does
       not shell out for, so ours does not either: an SSH client and an SFTP

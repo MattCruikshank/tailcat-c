@@ -105,6 +105,36 @@ static int parse_dest(const char *host, const char *last_colon, const char *end,
 	return TC_OK;
 }
 
+int tc_fwd_parse_dest(tc_endpoint *out, const char *s)
+{
+	if (out == NULL || s == NULL)
+		return TC_ERR_INVAL;
+	g_err[0] = '\0';
+	memset(out, 0, sizeof *out);
+
+	const char *end = s + strlen(s);
+	/* The last colon, because an IPv6 literal is full of them and only the
+	 * final one separates the port. The brackets are what make that
+	 * unambiguous, and parse_dest insists on them. */
+	const char *last = NULL;
+	for (const char *q = s; q < end; q++) {
+		if (*q == ':')
+			last = q;
+	}
+	if (last == NULL) {
+		FAILF("expected an address and a port, as 10.0.0.1:22");
+		return TC_ERR_INVAL;
+	}
+
+	tc_fwd_spec tmp;
+	memset(&tmp, 0, sizeof tmp);
+	int rc = parse_dest(s, last, end, &tmp);
+	if (rc != TC_OK)
+		return rc;
+	*out = tmp.dst;
+	return TC_OK;
+}
+
 int tc_fwd_parse(tc_fwd_spec *out, const char *spec)
 {
 	if (out == NULL || spec == NULL)

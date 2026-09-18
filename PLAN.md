@@ -1067,17 +1067,16 @@ pings us in 5.61ms over a direct path. The rule that saved it is the same one
 bugs 7 and 8 taught: when an interop test fails, suspect the scaffolding
 first.
 
-### 6.2 What the first walk showed is missing ✅ · five of six done
+### 6.2 What the first walk showed is missing ✅ · all six done
 
 None of these is hard. They are listed because the walk is the only thing
 that found them: each is a feature the table called done, or did not mention
 at all, and a user following upstream's documentation meets them immediately.
 In rough order of what they cost.
 
-Five are done. The one left is item 3, reaching a third address from the pipe
-form, and `forward` does the same job with one more argument. The *second*
-walk (6.7) found eleven more of these, which is the more interesting fact
-about this list: it was never the complete set, only the set one walk found.
+All six are done. The *second* walk (6.7) found eleven more of these, which
+is the more interesting fact about this list: it was never the complete set,
+only the set one walk found.
 
 1. ~~**`socks <addr> <cmd>` without `--`**~~: done. The argument after the
    address is a port if it reads as one and the start of a command if it
@@ -1128,16 +1127,31 @@ about this list: it was never the complete set, only the set one walk found.
    `ping`'s default deadline is now ten seconds, upstream's, rather than the
    generic sixty this program gives everything else. A reachability check is
    a question you are waiting on.
-3. **Reaching a third address from the pipe form and `ssh -p ip:port`.**
-   `forward` parses `local:ip:port` and `serve exit-node` serves it, so both
-   ends exist; what is missing is accepting the syntax in two more places and
-   routing through `tc_nat64_wrap` as `forward` does. Both refuse it by name
-   today rather than connecting somewhere else -- see bug 34 for why that
-   sentence had to be written.
+3. ~~**Reaching a third address from the pipe form and `ssh -p ip:port`**~~:
+   done. Both ends already existed -- `forward` parses `local:ip:port`,
+   `serve exit-node` serves it -- so the work was accepting the syntax in two
+   more places, which turned out to mean introducing the type that had been
+   missing. A destination is a port on the server *or* an address beyond it,
+   and holding those in two variables is precisely how `-p` came to mean only
+   the first; `dial_target` makes them one value with one parser, and the far
+   half of a `forward` mapping is parsed by literally the same function, so
+   the two spellings cannot drift.
+
+   It found a bug next door. The DNS safety probe -- which logs in as a
+   stranger before connecting to a DNS-named server -- dialled port 22
+   regardless of `-p`. With `-p 2222` that reported on a server which might
+   not be listening there; with `-p 10.0.0.1:22` it would have probed the
+   server's own SSH rather than the machine behind it. A check whose entire
+   job is to answer one question was answering a different one.
 4. ~~**`genkey --fixed-region`**~~: done, 6.5 -- and it found that saved
-   regions were not honoured at all. **`genkey --region=<relay-hostname>`**
-   is still open: `--relay` does it for one `serve`, and what is missing is
-   recording a self-hosted relay's hostname in a saved key.
+   regions were not honoured at all. ~~**`genkey --region=<relay-hostname>`**~~
+   is done too: a comma-separated list of hostnames goes into the key as a
+   region with no ID, exactly as upstream writes it, and `serve` already
+   honoured that shape because `--embed-derp-map` produces it. The form
+   fetches no relay list at either end, which makes it the only `genkey` that
+   touches no network -- and so the first argument handling here that could be
+   checked offline. `make cli-offline` is that check, and it now covers both
+   this and item 3.
 5. ~~**`socks` recognising a tailcat address as a URL hostname**~~: done,
    6.6, and with it the "many servers" difference the feature table had
    carried since phase 3.

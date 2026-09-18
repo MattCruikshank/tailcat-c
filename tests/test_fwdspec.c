@@ -154,11 +154,70 @@ static void test_rejects(void)
 	TCT_EQ_INT(tc_fwd_parse(&f, NULL), TC_ERR_INVAL);
 }
 
+/* A destination on its own, which `tailcat-c <addr> 10.0.0.1:22` and
+ * `ssh -p 10.0.0.1:22` both take. */
+static void test_bare_destination(void)
+{
+	TCT_CASE("an IPv4 destination and its port");
+	tc_endpoint ep;
+	TCT_EQ_INT(tc_fwd_parse_dest(&ep, "10.0.0.1:22"), TC_OK);
+	TCT_EQ_INT((int)ep.ip_len, 4);
+	TCT_EQ_INT((int)ep.port, 22);
+	char s[80];
+	TCT_EQ_INT(tc_endpoint_format(s, sizeof s, &ep), TC_OK);
+	TCT_EQ_STR(s, "10.0.0.1:22");
+
+	TCT_CASE("an IPv6 destination, in brackets");
+	TCT_EQ_INT(tc_fwd_parse_dest(&ep, "[2001:db8::1]:443"), TC_OK);
+	TCT_EQ_INT((int)ep.ip_len, 16);
+	TCT_EQ_INT((int)ep.port, 443);
+	TCT_EQ_INT(tc_endpoint_format(s, sizeof s, &ep), TC_OK);
+	TCT_EQ_STR(s, "[2001:db8::1]:443");
+
+	TCT_CASE("it is the same parser the mapping form uses");
+	/* Not a separate one that agrees today: `13306:10.0.0.1:22` and
+	 * `10.0.0.1:22` must mean the same destination, or a user who learned
+	 * one spelling gets a surprise from the other. */
+	tc_fwd_spec f;
+	TCT_EQ_INT(tc_fwd_parse(&f, "13306:[2001:db8::1]:443"), TC_OK);
+	TCT_TRUE(tc_endpoint_equal(&f.dst, &ep));
+
+	TCT_CASE("destinations that are not destinations");
+	static const char *const bad[] = {
+		"",                  /* nothing */
+		"22",                /* a port with no address is not this form */
+		"10.0.0.1",          /* an address with no port */
+		"10.0.0.1:",         /* a colon and no port */
+		":22",               /* a port and no address */
+		"10.0.0.1:0",        /* port 0 is not a port */
+		"10.0.0.1:65536",    /* above the range */
+		"2001:db8::1:443",   /* IPv6 without brackets: no unambiguous read */
+		"[2001:db8::1]",     /* brackets, but no port */
+		"[10.0.0.1]:22",     /* brackets around something that is not IPv6 */
+		"example.com:22",    /* a name: it would resolve on the wrong host */
+		"10.0.0.1:ssh",      /* a service name is not a port number */
+		"10.0.0.300:22",     /* not an address */
+	};
+	for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+		if (tc_fwd_parse_dest(&ep, bad[i]) == TC_OK)
+			TCT_FAILF("accepted \"%s\" as a destination", bad[i]);
+		tct_checks++;
+		if (tc_fwd_error_string()[0] == '\0')
+			TCT_FAILF("no diagnostic for \"%s\"", bad[i]);
+		tct_checks++;
+	}
+
+	TCT_CASE("null arguments are refused");
+	TCT_EQ_INT(tc_fwd_parse_dest(NULL, "10.0.0.1:22"), TC_ERR_INVAL);
+	TCT_EQ_INT(tc_fwd_parse_dest(&ep, NULL), TC_ERR_INVAL);
+}
+
 int main(void)
 {
 	test_single_port();
 	test_two_ports();
 	test_exit_node_form();
+	test_bare_destination();
 	test_rejects();
 	return tct_report("fwdspec");
 }

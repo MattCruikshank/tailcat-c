@@ -28,6 +28,12 @@ packets, and moves to a direct peer-to-peer path when one can be proved.
 Pipe stdin to a server and its output back:
 
     tailcat-c <tc-addr> [port]
+    tailcat-c <tc-addr> 10.0.0.1:22       # via an exit node
+
+The second form reaches a machine on the server's network rather than the
+server itself, which needs `serve exit-node` at the far end. An IPv6
+destination goes in brackets, as `[2001:db8::1]:443`. It is the far half of a
+`forward` mapping, spelled the same way.
 
 Serve one connection and write it to stdout, then exit:
 
@@ -156,6 +162,13 @@ Run a command on a server, using the system `ssh`:
 
     tailcat-c ssh <tc-addr> uptime
     tailcat-c ssh -p 2222 user@<tc-addr>
+    tailcat-c ssh -p 10.0.0.1 <tc-addr>          # via an exit node, port 22
+    tailcat-c ssh -p 10.0.0.1:2222 <tc-addr>     # or another port on it
+
+`-p` takes a port on the server, or an address on the server's network to
+reach through it -- which needs `serve exit-node` there. A bare address means
+its port 22. `cp` takes the same flag, so a file can come from a machine
+behind an exit node too.
 
 Forward a local port through the tunnel:
 
@@ -205,8 +218,20 @@ it useless in a script or a service file.
 
     tailcat-c genkey --key default
     tailcat-c genkey --key default --fixed-region   # pin the nearest relay
+    tailcat-c genkey --key default --region tok     # or name one
+    tailcat-c genkey --region list                  # what there is to name
     tailcat-c serve --key default
     tailcat-c printpub --key default
+
+`--region` also takes relay hostnames, comma-separated, for a relay the
+published list does not have in it -- a private one, or one being tested:
+
+    tailcat-c genkey --key default --region derp1.example.com
+    tailcat-c genkey --key default --region derp1.example.com,derp2.example.com
+
+A key made that way carries the hostnames rather than a region number, so
+every address it prints is self-contained and neither end ever fetches the
+relay list. It is the only genkey form that needs no network.
 
 Restrict who may connect, by client node key:
 
@@ -285,8 +310,8 @@ Flags take either spelling: --key default or --key=default.
 
 After `ssh` and `cp`, everything is handed to the real ssh and scp, so their
 flags are theirs: `tailcat-c ssh <tc-addr> ls -la` and `tailcat-c cp -r dir/
-<tc-addr>:` do what they look like. The exception is -p, which names a port
-on the tailcat server.
+<tc-addr>:` do what they look like. The exception is -p, which names a port on
+the tailcat server, or an `ip:port` to reach through it.
 
 
 ## What to be careful about

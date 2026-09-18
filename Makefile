@@ -217,7 +217,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshkeys live-sshloop live-dropbox live-dropbox-tree live-files live-shell live-ssh-serve live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshkeys live-sshloop cli-offline live-dropbox live-dropbox-tree live-files live-shell live-ssh-serve live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 # doc/usage.md is the source for src/usage_text.c, which is committed so that
@@ -338,6 +338,12 @@ interop: $(BUILD)/crosscheck
 
 parse-interop: $(CLI)
 	CLI=$(CLI) sh scripts/parse-interop.sh
+
+# The command line's own checks that need no network. Cheap enough to run at
+# every diagnostic level, and the only automated coverage src/cli/main.c has:
+# it is a program, so the unit tests cannot link against it.
+cli-offline: $(CLI)
+	CLI=$(CLI) sh scripts/cli-offline.sh
 
 # Live interoperability check against a real DERP relay. Kept out of `make
 # test` on purpose: that has to pass offline and must not depend on someone

@@ -35,6 +35,59 @@ static const char kClientKey[] =
 	"\t}\n"
 	"}";
 
+/* Written by: tailcat genkey --key h.private.json --region=derp9.example.com
+ *
+ * The form for a relay the published DERP map does not list. There is no
+ * RegionID anywhere in it -- the hostname *is* the reference -- so a reader
+ * that treated a missing ID as "none configured" would throw the relay away
+ * and go and measure a different one at startup, which is bug 45's shape.
+ *
+ * Note the explicit zeroes and empty strings: Go's encoder writes every
+ * field. Ours elides them, so this also checks that a file with them present
+ * reads the same as one without. */
+static const char kHostRegionKey[] =
+	"{\n"
+	"\t\"Private\": \"privkey:90b628c0a658dbd58133c0d1d9c927d3dc1e0788f49417d9c55de1667de3597c\",\n"
+	"\t\"Public\": {\n"
+	"\t\t\"ServerPublic\": \"nodekey:64435af4fe391b9d6731a9a246b197904a03c7773cdb219cbe82adfcb4fea175\",\n"
+	"\t\t\"ServerDiscoPublic\": \"discokey:3ac2dc87afa3e1574a64ac3a2c72ff48ec616ad0d35399d3ad02894d9466b971\",\n"
+	"\t\t\"PresharedKey\": \"psk:a0821f7c6949a715a8ab831cb7edb05b61acad36cc5a2a24aca64aca64977017\",\n"
+	"\t\t\"Region\": [\n"
+	"\t\t\t{\n"
+	"\t\t\t\t\"RegionID\": 0,\n"
+	"\t\t\t\t\"RegionCode\": \"\",\n"
+	"\t\t\t\t\"RegionName\": \"\",\n"
+	"\t\t\t\t\"Nodes\": [\n"
+	"\t\t\t\t\t{\n"
+	"\t\t\t\t\t\t\"Name\": \"\",\n"
+	"\t\t\t\t\t\t\"RegionID\": 0,\n"
+	"\t\t\t\t\t\t\"HostName\": \"derp9.example.com\"\n"
+	"\t\t\t\t\t}\n"
+	"\t\t\t\t]\n"
+	"\t\t\t}\n"
+	"\t\t]\n"
+	"\t}\n"
+	"}";
+
+static void test_reads_a_custom_relay_key(void)
+{
+	TCT_CASE("a key naming relay hostnames keeps them, and has no region ID");
+	static tc_keyfile k;
+	TCT_EQ_INT(tc_keyfile_parse(&k, kHostRegionKey, sizeof kHostRegionKey - 1),
+	           TC_OK);
+	TCT_TRUE(k.has_private);
+	TCT_EQ_INT((int)k.pub.num_regions, 1);
+	TCT_EQ_INT((int)k.pub.regions[0].num_nodes, 1);
+	TCT_EQ_STR(k.pub.regions[0].nodes[0].hostname, "derp9.example.com");
+
+	/* The absent ID is the load-bearing part. `serve` measures a relay only
+	 * when the key names none at all; if this came back as "no region" it
+	 * would go and pick a different relay and publish an address for a third
+	 * one. */
+	TCT_EQ_INT((int)k.pub.region_id, 0);
+	TCT_EQ_INT((int)k.pub.regions[0].region_id, 0);
+}
+
 static void test_reads_a_real_server_key(void)
 {
 	TCT_CASE("a key written by the real genkey loads");
@@ -218,6 +271,7 @@ static void test_rejects(void)
 int main(void)
 {
 	test_reads_a_real_server_key();
+	test_reads_a_custom_relay_key();
 	test_reads_a_real_client_key();
 	test_round_trips_byte_for_byte();
 	test_generate();
