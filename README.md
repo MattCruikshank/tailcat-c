@@ -233,16 +233,27 @@ forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and all four
 `serve` services — `ssh`, `no-auth-ssh`, `exec` and `files` — on an SSH and
 SFTP server of our own.
 
-What is left is the **browser build**, which Cosmopolitan cannot target.
+What is left is the **browser build**, which Cosmopolitan cannot target —
+and a list of smaller differences that is longer than this section claimed
+until somebody asked whether we had really walked upstream's README again
+after adding the `serve` services. We had not.
+[The second walk](doc/upstream-readme.md) found two bugs and eleven
+differences: four missing flags (`--serve`, `--json`, `--listen`,
+`genkey --embed-derp-map`), `--ssh-authorized-keys` taking a comma-separated
+list rather than being repeated, `serve files` defaulting to the current
+directory, `$SSH_ORIGINAL_COMMAND`, SFTP on a shell server, and
+`TAILCAT_DERPMAP_URL`.
 
-The remaining differences are small and deliberate. Authorized keys must be
-ed25519, because that is the only signature this server verifies — an RSA key
-in the list would be one that can never authenticate, so those lines are
-skipped and counted rather than silently kept. `authorized_keys` options are
-refused outright: `command="..."` is a restriction, and a server that reads
-the key while dropping the restriction has granted more than the file says.
-Upstream's recursive drop box (`:wo+`) is still not implemented; PLAN.md 5.5
-records what it trades away.
+The two bugs are worth naming here because one of them is an interop
+failure. **The real `tailcat ls` cannot talk to our `recv` or `serve files`
+server**: ours demands a publickey that it then does not check, and upstream's
+client offers only `none`. And **`cp -r` is broken**, which is a command in
+our own usage document. Both are recorded as bugs 43 and 44.
+
+Authorized keys must be ed25519, because that is the only signature this
+server verifies — an RSA key in the list would be one that can never
+authenticate, so those lines are skipped and counted rather than silently
+kept.
 
 ## Build
 
