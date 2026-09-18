@@ -150,11 +150,11 @@ int tc_ssh_dest_host(char *out, size_t cap, const char *addr)
 	return TC_OK;
 }
 
-size_t tc_ssh_dest_index(const char *const *args, size_t n)
+size_t tc_flag_scan(const char *const *args, size_t n,
+                    const char *takes_value)
 {
-	/* OpenSSH 9.x, from ssh(1)'s SYNOPSIS: the options that take a value. */
-	static const char kTakesValue[] = "BbcDEeFIiJLlmOoPpQRSWw";
-	if (args == NULL)
+	const char *kTakesValue = takes_value;
+	if (args == NULL || takes_value == NULL)
 		return n;
 	for (size_t i = 0; i < n; i++) {
 		const char *a = args[i];
@@ -174,4 +174,9 @@ size_t tc_ssh_dest_index(const char *const *args, size_t n)
 		}
 	}
 	return n;
+}
+
+size_t tc_ssh_dest_index(const char *const *args, size_t n)
+{
+	return tc_flag_scan(args, n, TC_SSH_VALUE_FLAGS);
 }

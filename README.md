@@ -244,11 +244,10 @@ list rather than being repeated, `serve files` defaulting to the current
 directory, `$SSH_ORIGINAL_COMMAND`, SFTP on a shell server, and
 `TAILCAT_DERPMAP_URL`.
 
-The two bugs are worth naming here because one of them is an interop
-failure. **The real `tailcat ls` cannot talk to our `recv` or `serve files`
-server**: ours demands a publickey that it then does not check, and upstream's
-client offers only `none`. And **`cp -r` is broken**, which is a command in
-our own usage document. Both are recorded as bugs 43 and 44.
+It also found two bugs, both now fixed: **the real `tailcat ls` could not
+talk to our `recv` or `serve files` server** — ours demanded a publickey it
+then did not check, and upstream's client offers only `none` — and **`cp -r`
+was broken**, which is a command in our own usage document. Bugs 43 and 44.
 
 Authorized keys must be ed25519, because that is the only signature this
 server verifies — an RSA key in the list would be one that can never
@@ -1355,6 +1354,56 @@ Bugs 7 and 8 are worth separating out, because they are the opposite failure:
 cases with a symptom that pointed squarely at the implementation. When an
 interop test fails, the scaffolding deserves as much suspicion as the code
 under test.
+
+**43. The real `tailcat ls` could not talk to our file server or drop box.**
+*(Phase 6.7, found by walking upstream's README a second time.)* Our SSH server
+set `any_key_authenticates`, which demands the publickey method with a valid
+signature and refuses `none`. Upstream's server sets `NoClientAuthHandler`
+whenever it has no authorized keys, and its `ls` client sets no `Auth` field at
+all — `none` is the only method it ever offers. So the reference implementation
+could not list our server:
+
+```
+ssh: unable to authenticate, attempted methods [none], no supported methods remain
+```
+
+Demanding a key that is then not checked was also theatre: the server accepts
+*any* key, so requiring one proved only that the client held the private half
+of a key it had invented for the occasion. The tunnel did the authenticating,
+which is what that flag means.
+
+**The shape of the gap is the lesson.** The live suite could not see this,
+and not by accident:
+
+| test | direction | why it passed |
+|---|---|---|
+| `live-ls` | our `ls` → **their** server | theirs accepts `none` |
+| `live-recv-serve` | `scp` → our server | `scp` always offers a key |
+| — | **their `ls` → our server** | **nothing** |
+
+Two tests each covered one side of a square and the empty corner was the
+broken one. A suite can have high coverage of *code* and a hole like this in
+its coverage of *directions*, and no amount of testing against ourselves would
+have found it — only building the other implementation and pointing it at us.
+`make live-ls` now runs both ways, and checks that the drop box still refuses
+them.
+
+**44. `cp -r` was broken, in a command our own documentation recommends.**
+*(Phase 6.7, same walk.)* `cp` emitted `--` and then every argument, so a flag
+in front of the operands landed after the separator: `scp: stat local "-r": No
+such file or directory`.
+
+This is bug 32's shape in the command next door. That walk fixed `ssh` and the
+`serve ssh` work fixed `ssh`'s scanning again as bug 40; `cp` was never given
+either treatment, and `cp -r` is in upstream's README *and* in `doc/usage.md`.
+Twice now this project has shipped a broken command that its own documentation
+tells people to run, and both times a walk of the documentation is what found
+it.
+
+The fix needed a *second* flag table rather than reusing `ssh`'s, which is
+worth knowing: scp's `-p` preserves timestamps and ssh's `-p` is the port, so
+scanning an scp command line with ssh's table swallows the first operand — the
+file being copied. Seven tests pin the distinction.
 
 Bugs 39 and 42 are worth reading together, because they are the same mistake
 at two layers of the same stack, made months apart, and both were found by one

@@ -89,8 +89,9 @@ typedef struct {
 	const uint8_t *authorized;
 	size_t num_authorized;
 
-	/* Accept any key that proves it holds its own private half, because
-	 * something below this layer has already decided who may connect.
+	/* Let anyone in who reached this far, because something below this
+	 * layer has already decided who may connect. The `none` method
+	 * succeeds, and so does any key.
 	 *
 	 * This exists for `recv`, where it is not a weakening but a statement of
 	 * where the authentication is. Reaching the SSH server at all means

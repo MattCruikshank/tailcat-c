@@ -36,7 +36,8 @@ the real Go binary, in a direction nothing here tests.
 
 ## What the second walk found
 
-**Bug 43 — the real `tailcat ls` cannot talk to our file server or drop box.**
+**Bug 43 — the real `tailcat ls` could not talk to our file server or drop
+box.** *(Fixed.)*
 
 ```
 $ tailcat ls <our-serve-files-address>
@@ -70,7 +71,14 @@ Two tests each cover half of a square, and the missing corner is the broken
 one. Demanding a key that is then not checked is also theatre: the server
 accepts *any* key, so requiring one adds nothing and costs interop.
 
-**Bug 44 — `cp -r` is broken.**
+The server now accepts `none` exactly where it would have accepted any key.
+The drop box still refuses to be listed, and `serve ssh` with a key list still
+refuses `none` — the change is to authentication, not to the policies behind
+it, and `make live-ls` now checks all three. That test runs **both**
+directions: ours against theirs, and theirs against ours, which is the corner
+that was missing.
+
+**Bug 44 — `cp -r` was broken.** *(Fixed.)*
 
 ```
 $ tailcat-c cp -r ./tree <addr>:
@@ -84,6 +92,11 @@ found and fixed this shape for `ssh` (bug 32), and the `serve ssh` work fixed
 treatment. `cp -r` appears in upstream's README **and in our own usage
 document**, which makes this the second time this project has shipped a broken
 command that its own documentation recommends.
+
+Fixed by scanning `cp`'s leading flags and emitting them before the `--`. That
+needed a *second* flag table rather than reusing `ssh`'s: scp's `-p` preserves
+timestamps and ssh's `-p` is the port, so scanning an scp command line with
+ssh's table swallows the first operand — the file being copied.
 
 
 ## Differences the second walk found
@@ -136,7 +149,7 @@ instead. The literal tilde fails for upstream too.
 | | | |
 |---|---|---|
 | `tailcat ssh <addr> ls -l` silently dropped the `-l` | Our global `-l` flag (for `ls -l`) was parsed before the subcommand was known, so it swallowed an argument meant for the remote command. The command ran without it and nothing said so. | fixed, bug 32 |
-| `tailcat ssh <addr> ls -la`, `cp -r`, `ssh <addr> sh -c ...` | Rejected outright: `unknown flag -la`. `cp -r` appears in *our own* usage document. | fixed for `ssh`, bug 32 — but see bug 44, which is `cp -r` still broken |
+| `tailcat ssh <addr> ls -la`, `cp -r`, `ssh <addr> sh -c ...` | Rejected outright: `unknown flag -la`. `cp -r` appears in *our own* usage document. | fixed for `ssh`, bug 32; `cp -r` stayed broken until bug 44, two walks later |
 | `--timeout=2m` meant two seconds | Upstream takes a Go duration; we took an integer through `strtoul`, which stops at the first character it does not understand. `--timeout=30s` was right by accident, which is why it survived. | fixed, bug 33 |
 
 

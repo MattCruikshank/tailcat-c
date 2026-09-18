@@ -5309,8 +5309,20 @@ static int cmd_ssh_or_cp(bool is_cp, const char *argv0, const char **args,
 		for (size_t i = di + 1; i < nargs && n < 60; i++)
 			argv[n++] = (char *)(uintptr_t)args[i];
 	} else {
+		/* scp's own flags go in front of the "--", or scp reads them as
+		 * file names: `cp -r dir <addr>:` reported `stat local "-r": No
+		 * such file or directory`, which is bug 44. The same shape as bug
+		 * 32 in `ssh`, in the command next door, fixed a walk later.
+		 *
+		 * scp's table and not ssh's, because `-p` preserves timestamps here
+		 * and is a port there. Scanning an scp command line with ssh's
+		 * table would swallow the first operand after a `-p`. */
+		size_t cflags = tc_flag_scan(args, nargs, TC_SCP_VALUE_FLAGS);
+		for (size_t i = 0; i < cflags && n < 60; i++)
+			argv[n++] = (char *)(uintptr_t)args[i];
+
 		argv[n++] = (char *)(uintptr_t) "--";
-		for (size_t i = 0; i < nargs && n < 60 && nops < 16; i++) {
+		for (size_t i = cflags; i < nargs && n < 60 && nops < 16; i++) {
 			const char *colon = strchr(args[i], ':');
 			if (colon != NULL && strncmp(args[i], "tc", 2) == 0) {
 				/* Rewrite <addr>:path into <short-host>:path, so scp gets a

@@ -1,5 +1,5 @@
 #!/bin/sh
-# `tailcat-c ls` listing a directory served by the real Go tailcat.
+# `ls` in both directions between us and the real Go tailcat.
 #
 # This is the interoperability claim for the client half. live-sshloop runs our
 # client against our server, which proves it works and nothing about whether it
@@ -13,6 +13,13 @@
 # authentication method that upstream's own `ls` uses, a session channel, the
 # sftp subsystem, and an SFTP client that can stat, open, read and page a
 # directory.
+#
+# And then the same thing the other way round, which is the half this file did
+# not have until bug 43. Our `ls` against their server, and `scp` against ours,
+# each cover one side of a square; nothing covered *their* SFTP client against
+# *our* SFTP server, and that corner was broken for as long as it existed. Our
+# server demanded a publickey it then did not check, and upstream's `ls` offers
+# only `none`, so the real binary could not list our file server at all.
 set -eu
 
 CLI="${CLI:-${BUILD:-build/cosmo}/tailcat-c}"
@@ -122,3 +129,97 @@ if ! grep -qx 'charlie.txt' "$WORK/outs"; then
 	exit 1
 fi
 echo "ok   live-ls                 listed a path under the served root"
+
+
+# ---- and now the other way round ---------------------------------------
+#
+# Their client, our server. Everything above this line could pass with our
+# server completely broken, because nothing above this line runs it.
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+SRV_PID=""
+
+echo
+echo "starting tailcat-c as a file server"
+"$CLI" --timeout 120 serve --files "$WORK/files" files \
+	> "$WORK/ours.log" 2>&1 < /dev/null &
+SRV_PID=$!
+
+OURADDR=""
+i=0
+while [ $i -lt 60 ]; do
+	OURADDR=$(sed -n 's/.*address: \(tc[A-Za-z0-9_-]*\).*/\1/p' \
+		"$WORK/ours.log" | head -1)
+	[ -n "$OURADDR" ] && break
+	if ! kill -0 "$SRV_PID" 2>/dev/null; then
+		echo "live-ls: our server exited before printing an address:" >&2
+		cat "$WORK/ours.log" >&2
+		exit 1
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+if [ -z "$OURADDR" ]; then
+	echo "live-ls: our server never printed an address:" >&2
+	cat "$WORK/ours.log" >&2
+	exit 1
+fi
+
+echo
+echo "\$ tailcat ls <our-addr>     # the real Go binary"
+if ! timeout 90 "$UPSTREAM" ls "$OURADDR" > "$WORK/rev" 2> "$WORK/reverr"; then
+	echo "live-ls: FAIL -- the real tailcat could not list our server" >&2
+	cat "$WORK/reverr" >&2
+	cat "$WORK/ours.log" >&2
+	exit 1
+fi
+sed 's/^/    /' "$WORK/rev"
+for want in alpha.txt bravo.bin; do
+	if ! grep -q "$want" "$WORK/rev"; then
+		echo "live-ls: FAIL -- their listing of our server is missing $want" >&2
+		cat "$WORK/rev" >&2
+		exit 1
+	fi
+done
+echo "ok   live-ls                 the real tailcat listed our file server"
+
+# And the drop box must still refuse them, which is the check that the fix for
+# bug 43 relaxed authentication and not the policy behind it.
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+SRV_PID=""
+
+mkdir -p "$WORK/box"
+echo "secret" > "$WORK/box/private.txt"
+"$CLI" --timeout 120 recv "$WORK/box" > "$WORK/box.log" 2>&1 < /dev/null &
+SRV_PID=$!
+BOXADDR=""
+i=0
+while [ $i -lt 60 ]; do
+	BOXADDR=$(sed -n 's/.*address: \(tc[A-Za-z0-9_-]*\).*/\1/p' \
+		"$WORK/box.log" | head -1)
+	[ -n "$BOXADDR" ] && break
+	kill -0 "$SRV_PID" 2>/dev/null || break
+	sleep 1
+	i=$((i + 1))
+done
+if [ -z "$BOXADDR" ]; then
+	echo "live-ls: the drop box never printed an address:" >&2
+	cat "$WORK/box.log" >&2
+	exit 1
+fi
+
+echo
+echo "\$ tailcat ls <our-dropbox>  # must be refused, and leak nothing"
+timeout 90 "$UPSTREAM" ls "$BOXADDR" > "$WORK/boxout" 2>&1 || true
+if grep -q 'private.txt' "$WORK/boxout"; then
+	echo "live-ls: FAIL -- the drop box listed its contents" >&2
+	cat "$WORK/boxout" >&2
+	exit 1
+fi
+if ! grep -qi 'permission denied\|denied' "$WORK/boxout"; then
+	echo "live-ls: FAIL -- the drop box did not refuse the listing:" >&2
+	cat "$WORK/boxout" >&2
+	exit 1
+fi
+echo "ok   live-ls                 the drop box refused them and leaked nothing"

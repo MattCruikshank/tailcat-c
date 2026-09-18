@@ -53,6 +53,29 @@ int tc_proxycmd_join(char *out, size_t cap, const char *const *args, size_t n,
  * stops reusing the right connection. out needs 26 bytes. */
 int tc_ssh_dest_host(char *out, size_t cap, const char *addr);
 
+/* The option letters that take a value, per tool.
+ *
+ * Two tables and not one, because the same letter means different things:
+ * scp's `-P` is the port and its `-p` preserves timestamps, while ssh's `-p`
+ * is the port and it has no `-P`. A scanner using ssh's table on an scp
+ * command line eats the argument after `-p`, which is the first operand.
+ *
+ * From the SYNOPSIS of each manual page, OpenSSH 9.x. */
+#define TC_SSH_VALUE_FLAGS "BbcDEeFIiJLlmOoPpQRSWw"
+#define TC_SCP_VALUE_FLAGS "cDFiJloPSX"
+
+/* tc_flag_scan counts the leading arguments that are options, including any
+ * value an option takes.
+ *
+ * `takes_value` is one of the tables above. A value may be attached or
+ * separate -- `-i key` and `-ikey` and `-vikey` all work -- and clustered
+ * booleans do too, as in `-rv`. An unknown letter is assumed boolean, which
+ * is the safe way round: the failure is then a legible complaint about a flag
+ * rather than a silently mis-split command line.
+ *
+ * Returns n when every argument is an option. */
+size_t tc_flag_scan(const char *const *args, size_t n, const char *takes_value);
+
 /* tc_ssh_dest_index finds the destination among ssh's arguments.
  *
  * `ssh -i key -o Foo=bar host cmd` puts the destination fourth. Reading

@@ -522,6 +522,39 @@ static int do_auth(tc_ssh_server *s)
 		if (rc != TC_OK)
 			return rc;
 
+		/* The `none` method, accepted exactly when any key would have been.
+		 *
+		 * Demanding a signature from a key we then do not check is theatre:
+		 * with any_key_authenticates the only thing proved is that the
+		 * client holds the private half of a key it invented for the
+		 * occasion. The tunnel did the authenticating, which is what that
+		 * flag means.
+		 *
+		 * It is also an interop failure without this. Upstream's server sets
+		 * NoClientAuthHandler whenever it has no authorized keys, and its
+		 * `ls` client sets no Auth field at all -- `none` is the only method
+		 * it ever offers -- so the real `tailcat ls` could not talk to our
+		 * `recv` or `serve files` at all. That was bug 43, found by building
+		 * the real binary and pointing it at ours.
+		 *
+		 * When there *is* a key list, `none` still fails. A shell server
+		 * told to admit three people must not admit everyone. */
+		if (req.method == TC_SSH_AUTH_METHOD_NONE) {
+			if (s->opts->any_key_authenticates) {
+				rc = tc_ssh_auth_success_build(buf, sizeof buf, &buf_len);
+				if (rc != TC_OK)
+					return rc;
+				return send_packet(s, buf, buf_len);
+			}
+			rc = tc_ssh_auth_failure_build(buf, sizeof buf, &buf_len);
+			if (rc != TC_OK)
+				return rc;
+			rc = send_packet(s, buf, buf_len);
+			if (rc != TC_OK)
+				return rc;
+			continue;
+		}
+
 		/* The query form: the client is asking whether this key is worth
 		 * signing with. Answering PK_OK authenticates nobody. */
 		if (req.method == TC_SSH_AUTH_METHOD_PUBLICKEY && !req.has_signature) {

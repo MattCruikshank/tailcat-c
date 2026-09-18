@@ -226,6 +226,53 @@ static void test_dest_index(void)
 		at(0, NULL, 0, "no arguments");
 	}
 
+	TCT_CASE("scp's flags are not ssh's");
+	/* The reason there are two tables. `-p` preserves timestamps for scp and
+	 * is the port for ssh, so scanning an scp command line with ssh's table
+	 * swallows the first operand -- which is the file being copied. */
+	{
+		static const char *const a[] = { "-p", "src", "dst" };
+		tct_checks++;
+		if (tc_flag_scan(a, 3, TC_SCP_VALUE_FLAGS) != 1)
+			TCT_FAILF("scp -p ate an operand");
+		tct_checks++;
+		if (tc_flag_scan(a, 3, TC_SSH_VALUE_FLAGS) != 2)
+			TCT_FAILF("ssh -p did not take its value");
+	}
+	{
+		/* And the other way: scp's -P is the port and takes one. */
+		static const char *const a[] = { "-P", "2222", "src", "dst" };
+		tct_checks++;
+		if (tc_flag_scan(a, 4, TC_SCP_VALUE_FLAGS) != 2)
+			TCT_FAILF("scp -P did not take its port");
+	}
+	{
+		/* The case from bug 44, which shipped broken. */
+		static const char *const a[] = { "-r", "./tree", "tcABC:" };
+		tct_checks++;
+		if (tc_flag_scan(a, 3, TC_SCP_VALUE_FLAGS) != 1)
+			TCT_FAILF("cp -r did not put -r before the operands");
+	}
+	{
+		static const char *const a[] = { "-rv", "./tree", "tcABC:" };
+		tct_checks++;
+		if (tc_flag_scan(a, 3, TC_SCP_VALUE_FLAGS) != 1)
+			TCT_FAILF("clustered scp booleans miscounted");
+	}
+	{
+		static const char *const a[] = { "-i", "key", "-r", "src", "dst" };
+		tct_checks++;
+		if (tc_flag_scan(a, 5, TC_SCP_VALUE_FLAGS) != 3)
+			TCT_FAILF("scp -i key -r miscounted");
+	}
+	{
+		/* No flags at all is the ordinary case, and must not consume one. */
+		static const char *const a[] = { "report.pdf", "tcABC:" };
+		tct_checks++;
+		if (tc_flag_scan(a, 2, TC_SCP_VALUE_FLAGS) != 0)
+			TCT_FAILF("an operand was taken for a flag");
+	}
+
 	TCT_CASE("an unknown flag is assumed boolean");
 	/* The safe way round. If it really took a value we pick that value as
 	 * the destination and refuse with a message naming it -- wrong, but

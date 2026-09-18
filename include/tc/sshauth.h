@@ -2,10 +2,15 @@
  *
  * SSH user authentication (RFC 4252), publickey only.
  *
- * No password, no keyboard-interactive, no host-based, and no "none" that
- * ever succeeds. A drop box reachable through a tunnel has no use for a
- * password prompt, and every method left out is one that cannot be
- * misconfigured into working.
+ * No password, no keyboard-interactive, no host-based. A drop box reachable
+ * through a tunnel has no use for a password prompt, and every method left
+ * out is one that cannot be misconfigured into working.
+ *
+ * This file parses `none` and never judges it: whether it succeeds is the
+ * server's policy, in tc/sshserver.h, where it is tied to the same flag that
+ * says the tunnel already did the authenticating. Keeping the decision there
+ * rather than here is why it could be changed for bug 43 without touching
+ * any of the signature checking below.
  *
  * ---- one function, because two would be a footgun ------------------------
  *
