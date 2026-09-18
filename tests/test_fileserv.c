@@ -82,10 +82,17 @@ static void setup(void)
 	if (g_symlinks) {
 		snprintf(target, sizeof target, "%s/hello.txt", g_root);
 		snprintf(link, sizeof link, "%s/inside.txt", g_root);
-		(void)symlink(target, link);
+		g_symlinks = g_symlinks && symlink(target, link) == 0;
 		snprintf(link, sizeof link, "%s/updir", g_root);
-		(void)symlink(g_outside, link);
+		g_symlinks = g_symlinks && symlink(g_outside, link) == 0;
 	}
+	/* All three, or none of them. The first version set g_symlinks from the
+	 * first symlink and assumed the other two -- and `refuses()` passes when
+	 * a path cannot be opened for *any* reason, including never having been
+	 * created. A link that silently failed to appear would have made the
+	 * check that a symlink into the tree is refused pass while testing
+	 * nothing. gcc's warn_unused_result was pointing at a real hole, not at
+	 * a missing cast. */
 }
 
 /* ---- the fence --------------------------------------------------------- */

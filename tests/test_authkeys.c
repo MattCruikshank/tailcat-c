@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Three distinct keys, as ssh-keygen would write them. */
 #define KEY_A "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ3n0Fh0VCpYRgLnDqFadXAJ" \

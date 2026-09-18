@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Cosmopolitan declares these in <termios.h>; on a host build they come from
