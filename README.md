@@ -107,17 +107,61 @@ table in [PORT.md](PORT.md#features).
 ## Install
 
 There are no packages and no per-platform downloads, because there is nothing
-to choose between: the binary is the same file everywhere.
+to choose between: the same file runs on all six systems.
 
-Build it with [cosmocc](https://github.com/jart/cosmopolitan):
+```sh
+curl -L -O https://github.com/MattCruikshank/tailcat-c/releases/latest/download/tailcat-c.exe
+chmod +x tailcat-c.exe
+./tailcat-c.exe version
+```
+
+**The `-L` is not optional.** GitHub serves release assets through a redirect
+and `curl` will not follow one unless told to, so without it you get a 0-byte
+file and no error at all -- curl has faithfully saved the empty body of a
+`302`. The `.exe` is there so Windows will run it; every other system ignores
+the extension. Each release publishes a `.sha256` beside the binary.
+
+### Three things that will trip you up
+
+**Windows Defender quarantines it.** Not "may": on a stock Windows 11 machine
+it flags the file as `Trojan:Win32/Wacatac.B!ml`, severity 5, and removes it,
+whether it arrived by browser or by `curl`. The `!ml` means a machine-learning
+heuristic rather than a signature match, and the cause is almost certainly the
+[APE](https://justine.lol/ape.html) header -- this file is at once a DOS `MZ`
+executable, a shell script and two architectures' machine code, which is a
+strange thing for a scanner to meet. A false-positive report is
+[filed with Microsoft](https://www.microsoft.com/en-us/wdsi/submission/9369452b-8970-4042-acfe-9ccdaa8fdff3).
+Until that is processed: check the published SHA-256 and judge for yourself,
+or build from source below. Adding an antivirus exclusion for a networking
+tool you just met on the internet is not advice this project is going to give
+you.
+
+**On WSL it fails bafflingly.** WSL registers a binfmt handler for anything
+starting with `MZ` and hands it to Windows, which swallows APE binaries whole.
+Turn that handler off for the running instance:
+
+```sh
+sudo sh -c 'echo -1 > /proc/sys/fs/binfmt_misc/WSLInterop'
+```
+
+`scripts/wslmake.sh` does this properly and exists entirely because of it.
+
+**On macOS, Gatekeeper quarantines it** -- the binary is unsigned and
+unnotarized -- so `xattr -d com.apple.quarantine tailcat-c.exe`. Bear in mind
+macOS is one of the four platforms nobody has ever run this on.
+
+### Build from source
+
+With [cosmocc](https://github.com/jart/cosmopolitan):
 
 ```sh
 $ make
 $ ./build/cosmo/tailcat-c version
 ```
 
-That produces `build/cosmo/tailcat-c`. Copy it to any of the six supported
-systems and run it; on Windows, rename it to `tailcat-c.exe` first.
+That produces `build/cosmo/tailcat-c`, the same fat binary the release ships.
+The build needs no network access, which is the shortest answer to the
+paragraph about Defender above.
 
 `make test` builds and runs the test suite. `make CC=gcc SANITIZE=1 test` does
 the same under the host compiler with AddressSanitizer and
