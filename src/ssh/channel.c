@@ -143,10 +143,48 @@ int tc_ssh_channel_request_parse(tc_ssh_channel_request *out,
 		out->type = TC_SSH_REQ_EXEC;
 		if (!tc_ssh_get_cstring(&r, out->arg, sizeof out->arg))
 			return TC_ERR_INVAL;
+	} else if (strcmp(type, "shell") == 0) {
+		/* No arguments at all: RFC 4254 6.5 has shell carry nothing. */
+		out->type = TC_SSH_REQ_SHELL;
+	} else if (strcmp(type, "pty-req") == 0) {
+		out->type = TC_SSH_REQ_PTY;
+		/* RFC 4254 6.2: TERM, then character and pixel dimensions, then the
+		 * encoded terminal modes -- which are deliberately not read. They
+		 * describe the client's terminal, and the client is the end that
+		 * puts itself into raw mode; applying them to our pty would fight
+		 * it. A TERM too long to fit is truncated to nothing rather than
+		 * refused, because a nameless terminal is a working session with a
+		 * dumb terminal and a refused pty-req is no session at all. */
+		size_t tlen = 0;
+		const uint8_t *term = tc_ssh_get_string(&r, SIZE_MAX, &tlen);
+		if (term != NULL && tlen < sizeof out->pty.term &&
+		    memchr(term, 0, tlen) == NULL)
+			memcpy(out->pty.term, term, tlen);
+		/* Otherwise TERM stays the empty string it was memset to. Read as a
+		 * raw string rather than with get_cstring, because get_cstring
+		 * latches the whole buffer on a name that does not fit and the four
+		 * numbers after it matter more than the name does. */
+		out->pty.cols = tc_ssh_get_u32(&r);
+		out->pty.rows = tc_ssh_get_u32(&r);
+		out->pty.width_px = tc_ssh_get_u32(&r);
+		out->pty.height_px = tc_ssh_get_u32(&r);
+		if (!tc_ssh_rbuf_ok(&r))
+			return TC_ERR_INVAL;
+	} else if (strcmp(type, "window-change") == 0) {
+		/* RFC 4254 6.7: the four numbers and nothing else. It never wants a
+		 * reply, but it is parsed rather than ignored so a resized terminal
+		 * reaches the shell. */
+		out->type = TC_SSH_REQ_WINDOW_CHANGE;
+		out->pty.cols = tc_ssh_get_u32(&r);
+		out->pty.rows = tc_ssh_get_u32(&r);
+		out->pty.width_px = tc_ssh_get_u32(&r);
+		out->pty.height_px = tc_ssh_get_u32(&r);
+		if (!tc_ssh_rbuf_ok(&r))
+			return TC_ERR_INVAL;
 	} else {
-		/* pty-req, env, shell, x11-req, signal, window-change and the rest.
-		 * The arguments are left unread: we are going to refuse, and parsing
-		 * a request in order to decline it only adds surface. */
+		/* env, x11-req, signal, agent forwarding and the rest. The arguments
+		 * are left unread: we are going to refuse, and parsing a request in
+		 * order to decline it only adds surface. */
 		out->type = TC_SSH_REQ_OTHER;
 	}
 	return TC_OK;

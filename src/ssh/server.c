@@ -40,6 +40,25 @@ struct tc_ssh_server {
 
 	tc_ssh_channel ch;
 
+	/* The terminal the client asked for, if it asked for one, and a counter
+	 * the shell pump watches so a resize reaches the pty. See
+	 * tc_ssh_server_pty. */
+	tc_ssh_pty pty;
+	bool has_pty;
+	uint64_t pty_generation;
+
+	/* See tc_ssh_server_set_idle. in_idle is what makes a write from inside
+	 * a pump safe: it turns the window-wait below into TC_ERR_AGAIN rather
+	 * than a nested read. */
+	tc_ssh_idle_fn idle;
+	void *idle_ctx;
+	bool in_idle;
+
+	/* The peer has sent CHANNEL_CLOSE. Distinct from ch.closed, which is
+	 * also set when *we* close, and so cannot answer "is it still worth
+	 * waiting for theirs?". */
+	bool peer_closed;
+
 	/* One packet in flight each way. Sized for the largest packet the
 	 * protocol lets a peer send us, because that is what decode_length may
 	 * legitimately ask for. */
@@ -555,29 +574,15 @@ static int do_auth(tc_ssh_server *s)
 
 /* ---- the session ------------------------------------------------------- */
 
-int tc_ssh_server_write(tc_ssh_server *s, const void *data, size_t len)
+int tc_ssh_server_write_some(tc_ssh_server *s, const void *data, size_t len,
+                             size_t *nwrote)
 {
-	if (s == NULL || (data == NULL && len != 0))
+	if (s == NULL || nwrote == NULL || (data == NULL && len != 0))
 		return TC_ERR_INVAL;
+	*nwrote = 0;
 	const uint8_t *p = (const uint8_t *)data;
 
-	while (len > 0) {
-		/* Wait for window if the peer has not extended it. A server that
-		 * sent anyway would be dropped by OpenSSH as a protocol error. */
-		while (s->ch.remote_window == 0) {
-			size_t n = 0;
-			int rc = recv_packet(s, &n);
-			if (rc != TC_OK)
-				return rc;
-			if (s->payload[0] == TC_SSH_MSG_CHANNEL_WINDOW_ADJUST) {
-				rc = tc_ssh_channel_window_adjust_parse(&s->ch, s->payload, n);
-				if (rc != TC_OK)
-					return rc;
-			} else if (s->payload[0] == TC_SSH_MSG_CHANNEL_CLOSE) {
-				return TC_ERR_CLOSED;
-			}
-		}
-
+	while (len > 0 && s->ch.remote_window > 0) {
 		size_t chunk = len;
 		if (chunk > s->ch.remote_window)
 			chunk = s->ch.remote_window;
@@ -599,6 +604,47 @@ int tc_ssh_server_write(tc_ssh_server *s, const void *data, size_t len)
 			return rc;
 		p += chunk;
 		len -= chunk;
+		*nwrote += chunk;
+	}
+	return TC_OK;
+}
+
+int tc_ssh_server_write(tc_ssh_server *s, const void *data, size_t len)
+{
+	if (s == NULL || (data == NULL && len != 0))
+		return TC_ERR_INVAL;
+	const uint8_t *p = (const uint8_t *)data;
+
+	while (len > 0) {
+		size_t wrote = 0;
+		int rc = tc_ssh_server_write_some(s, p, len, &wrote);
+		if (rc != TC_OK)
+			return rc;
+		p += wrote;
+		len -= wrote;
+		if (len == 0)
+			break;
+
+		/* Wait for window if the peer has not extended it. A server that
+		 * sent anyway would be dropped by OpenSSH as a protocol error. */
+		if (s->in_idle) {
+			/* A pump is running, so we are inside the packet reader already
+			 * and must not read another packet to get a window. The caller
+			 * is told how much went, and keeps the rest. */
+			return TC_ERR_AGAIN;
+		}
+		size_t n = 0;
+		rc = recv_packet(s, &n);
+		if (rc != TC_OK)
+			return rc;
+		if (s->payload[0] == TC_SSH_MSG_CHANNEL_WINDOW_ADJUST) {
+			rc = tc_ssh_channel_window_adjust_parse(&s->ch, s->payload, n);
+			if (rc != TC_OK)
+				return rc;
+		} else if (s->payload[0] == TC_SSH_MSG_CHANNEL_CLOSE) {
+			s->peer_closed = true;
+			return TC_ERR_CLOSED;
+		}
 	}
 	return TC_OK;
 }
@@ -634,21 +680,35 @@ int tc_ssh_server_read(tc_ssh_server *s, void *buf, size_t cap, size_t *nread)
 			s->peer_eof = true;
 			break;
 		case TC_SSH_MSG_CHANNEL_CLOSE:
+			s->peer_closed = true;
 			s->peer_eof = true;
 			s->ch.closed = true;
 			return TC_ERR_DONE;
 		case TC_SSH_MSG_CHANNEL_REQUEST: {
-			/* A request mid-session, such as a window-change. Refused, but
-			 * answered if it wants an answer. */
+			/* A request mid-session. The only one that means anything now
+			 * that the session is running is a window-change; the rest are
+			 * refused, but answered if they want an answer. */
 			tc_ssh_channel_request req;
-			if (tc_ssh_channel_request_parse(&req, &s->ch, s->payload, n) ==
-			        TC_OK &&
-			    req.want_reply) {
+			bool ok = tc_ssh_channel_request_parse(&req, &s->ch, s->payload,
+			                                       n) == TC_OK;
+			bool accept = false;
+			if (ok && req.type == TC_SSH_REQ_WINDOW_CHANGE && s->has_pty) {
+				/* The terminal name is not resent, so only the four numbers
+				 * are taken -- copying the whole struct would blank TERM
+				 * every time someone dragged a window edge. */
+				s->pty.cols = req.pty.cols;
+				s->pty.rows = req.pty.rows;
+				s->pty.width_px = req.pty.width_px;
+				s->pty.height_px = req.pty.height_px;
+				s->pty_generation++;
+				accept = true;
+			}
+			if (ok && req.want_reply) {
 				uint8_t msg[32];
 				size_t msg_len = 0;
 				if (tc_ssh_channel_reply_build(msg, sizeof msg, &msg_len,
 				                               s->ch.remote_id,
-				                               false) == TC_OK)
+				                               accept) == TC_OK)
 					(void)send_packet(s, msg, msg_len);
 			}
 			break;
@@ -784,6 +844,7 @@ static int do_session(tc_ssh_server *s)
 		 * application first and replying afterwards deadlocks against a
 		 * client that waits. */
 		bool accept = false;
+		bool starts = false; /* does accepting this begin the session? */
 		if (req.type == TC_SSH_REQ_SUBSYSTEM || req.type == TC_SSH_REQ_EXEC) {
 			/* Refused rather than truncated. A name that does not fit is not
 			 * a name we serve, and shortening it would make "sftp" and
@@ -791,6 +852,22 @@ static int do_session(tc_ssh_server *s)
 			accept = strlen(req.arg) < sizeof s->ch.subsystem &&
 			         (s->opts->on_accept == NULL ||
 			          s->opts->on_accept(s->opts->app_ctx, req.type, req.arg));
+			starts = accept;
+		} else if (req.type == TC_SSH_REQ_SHELL) {
+			accept = s->opts->allow_shell &&
+			         (s->opts->on_accept == NULL ||
+			          s->opts->on_accept(s->opts->app_ctx, req.type, ""));
+			starts = accept;
+		} else if (req.type == TC_SSH_REQ_PTY) {
+			/* Accepted and remembered, but the session has not begun: the
+			 * client sends pty-req and *then* shell, and answering success
+			 * to the first is what makes it send the second. */
+			accept = s->opts->allow_pty;
+			if (accept) {
+				s->pty = req.pty;
+				s->has_pty = true;
+				s->pty_generation++;
+			}
 		}
 
 		if (req.want_reply) {
@@ -802,8 +879,8 @@ static int do_session(tc_ssh_server *s)
 			if (rc != TC_OK)
 				return rc;
 		}
-		if (!accept)
-			continue; /* pty-req and friends; the real request may follow */
+		if (!starts)
+			continue; /* pty-req, env and friends; the real one may follow */
 
 		s->ch.started = true;
 		memcpy(s->ch.subsystem, req.arg, strlen(req.arg) + 1);
@@ -815,6 +892,38 @@ static int do_session(tc_ssh_server *s)
 		}
 		return TC_OK;
 	}
+}
+
+void tc_ssh_server_set_idle(tc_ssh_server *s, tc_ssh_idle_fn fn, void *ctx)
+{
+	if (s == NULL)
+		return;
+	s->idle = fn;
+	s->idle_ctx = ctx;
+}
+
+int tc_ssh_server_idle(tc_ssh_server *s)
+{
+	if (s == NULL || s->idle == NULL)
+		return TC_OK;
+	if (s->in_idle)
+		return TC_OK; /* a pump that reaches back round is not an error */
+	s->in_idle = true;
+	int rc = s->idle(s->idle_ctx, s);
+	s->in_idle = false;
+	return rc;
+}
+
+const tc_ssh_pty *tc_ssh_server_pty(const tc_ssh_server *s)
+{
+	if (s == NULL || !s->has_pty)
+		return NULL;
+	return &s->pty;
+}
+
+uint64_t tc_ssh_server_pty_generation(const tc_ssh_server *s)
+{
+	return s != NULL ? s->pty_generation : 0;
 }
 
 int tc_ssh_server_run(const tc_ssh_server_opts *opts)
@@ -878,6 +987,35 @@ int tc_ssh_server_run(const tc_ssh_server_opts *opts)
 		(void)send_packet(s, msg, msg_len);
 	if (tc_ssh_channel_close_build(msg, sizeof msg, &msg_len, &s->ch) == TC_OK)
 		(void)send_packet(s, msg, msg_len);
+	/* Then wait for the peer to close its half before the caller drops the
+	 * transport. This is not politeness, though it looks like it:
+	 *
+	 * Closing a socket that still has unread incoming bytes makes the kernel
+	 * send RST rather than FIN, and an RST discards whatever of our output
+	 * has not left the send buffer. A client sends CHANNEL_WINDOW_ADJUST
+	 * continuously while it reads, so at the end of any large transfer there
+	 * is almost always something unread -- which is how the last few thousand
+	 * lines of `seq 1 200000` went missing, intermittently, in about one run
+	 * in two. It is also why the client printed "Connection to ... closed by
+	 * remote host": from its side the connection was reset.
+	 *
+	 * SSH_MSG_DISCONNECT is the other thing that looks right here and is not.
+	 * OpenSSH reads a disconnect as the server hanging up and exits 255,
+	 * discarding the exit status just sent, so a successful command reports
+	 * a failure. Tried; measured; not done.
+	 *
+	 * Bounded both ways: a peer that answers something else a few times, or
+	 * never answers at all, must not keep this session alive. The read
+	 * failing is the ordinary case -- it means the peer closed first. */
+	for (int i = 0; i < 64 && !s->peer_closed; i++) {
+		size_t n = 0;
+		if (recv_packet(s, &n) != TC_OK)
+			break;
+		if (s->payload[0] == TC_SSH_MSG_CHANNEL_CLOSE) {
+			s->peer_closed = true;
+			break;
+		}
+	}
 
 out:
 	tc_ssh_cipher_wipe(&s->in);

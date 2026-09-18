@@ -199,6 +199,8 @@ LIB_SRCS := \
 	src/ssh/packet.c \
 	src/ssh/kex.c \
 	src/ssh/auth.c \
+	src/ssh/authkeys.c \
+	src/ssh/shellsrv.c \
 	src/ssh/channel.c \
 	src/ssh/server.c \
 	src/ssh/sftp.c \
@@ -214,7 +216,7 @@ CLI := $(BUILD)/tailcat-c
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/test_%.c=$(BUILD)/test_%)
 
-.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-files live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
+.PHONY: all usage-text test clean check-fat fuzz interop parse-interop live live-wg live-tailcat live-cli live-serve live-rekey live-serve-ports live-multi live-forward live-browse live-socks-many live-exec live-ssh live-recv live-genkey live-stun live-netcheck live-direct live-exitnode live-allow live-socksudp live-sshd live-sshloop live-dropbox live-files live-shell live-recv-serve live-ls diag1 diag3 diag5 test-unsigned-char test-aarch64
 all: $(CLI)
 
 # doc/usage.md is the source for src/usage_text.c, which is committed so that
@@ -489,6 +491,9 @@ live-dropbox: $(BUILD)/livesshd
 
 live-files: $(BUILD)/livesshd
 	BUILD=$(BUILD) sh scripts/live-files.sh
+
+live-shell: $(BUILD)/livesshd
+	BUILD=$(BUILD) sh scripts/live-shell.sh
 
 # And `recv` over a real tunnel. The only check that reaches the code where
 # the SSH server's blocking reads drive the serve event loop.

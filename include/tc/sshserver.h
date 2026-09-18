@@ -6,14 +6,21 @@
  * The stream is a pair of callbacks rather than a socket, because the point
  * of this server is to be reached through the tunnel rather than over TCP.
  * The live test drives it over a socket so a real OpenSSH can connect to it;
- * `serve ssh` will drive the same code over a tc_tcp_conn.
+ * `serve ssh` drives the same code over a tc_tcp_conn.
  *
  * ---- what it will not do ------------------------------------------------
  *
  * One channel, publickey auth against a fixed list of keys, and only the
- * `subsystem` and `exec` requests. No PTY, no shell, no forwarding, no agent.
- * The refusals are answered rather than ignored, because a client waiting for
- * a reply it will never get cannot tell that from a hung server.
+ * `subsystem`, `exec`, `shell` and `pty-req` requests. No forwarding, no
+ * agent, no x11, no env. The refusals are answered rather than ignored,
+ * because a client waiting for a reply it will never get cannot tell that
+ * from a hung server.
+ *
+ * A shell and a pty are served only when the caller sets allow_shell and
+ * allow_pty. They default off, so `recv` and the drop box refuse them exactly
+ * as they always have -- the one thing a drop box must never become is a
+ * shell on the serving machine, and that must not depend on a policy
+ * callback remembering to say no.
  *
  * Rekeying is implemented, but only as a responder: a peer may start a key
  * exchange at any point and we will complete it, and we never start one
@@ -98,6 +105,17 @@ typedef struct {
 	 * fill the list is an accident. */
 	bool any_key_authenticates;
 
+	/* Whether a `shell` request may be served, and whether a `pty-req`
+	 * before it is answered with success.
+	 *
+	 * Two flags rather than one because they fail differently. Without
+	 * allow_shell there is no interactive session at all. Without allow_pty
+	 * there is one, but on pipes: OpenSSH prints "PTY allocation request
+	 * failed on channel 0" and carries on, which is exactly `ssh -T` and is
+	 * the right answer on a platform with no ptys to hand out. */
+	bool allow_shell;
+	bool allow_pty;
+
 	tc_ssh_read_fn read;
 	tc_ssh_write_fn write;
 	void *io_ctx;
@@ -110,8 +128,66 @@ typedef struct {
 /* tc_ssh_server_run serves one connection to completion. */
 int tc_ssh_server_run(const tc_ssh_server_opts *opts);
 
+/* ---- sessions that talk in both directions at once ----------------------
+ *
+ * Everything else here is request and response: a client asks, the handler
+ * answers, and nothing needs to be sent while nothing has been asked. An
+ * interactive shell is not like that. The shell produces output whether or
+ * not the user is typing, and a server that only wrote when a packet arrived
+ * would deliver a command's output on the user's *next* keystroke.
+ *
+ * So a session that needs it registers a pump, from inside on_start, and the
+ * application's read callback calls tc_ssh_server_idle while it waits for
+ * bytes. The read callbacks here already loop -- they have to, because the
+ * bytes come through a tunnel that needs driving -- so this costs one call
+ * per turn of a loop that was going round anyway.
+ *
+ * ---- what a pump may do -------------------------------------------------
+ *
+ * It runs *inside* the read callback, which is inside the packet reader. It
+ * may call tc_ssh_server_write, and that is deliberately safe: while a pump
+ * is running, a write that would have to wait for the peer's window returns
+ * TC_ERR_AGAIN instead of reading a packet to get one. Reading a packet
+ * there would re-enter the reader that is already part way through a packet,
+ * and the pump is expected to hold on to what it could not send and try
+ * again next turn -- which is exactly what a full pipe means anyway.
+ *
+ * A pump must not call tc_ssh_server_read. There is no useful way to make
+ * that safe, and nothing needs it. */
+typedef int (*tc_ssh_idle_fn)(void *ctx, tc_ssh_server *s);
+
+/* Register the pump. Called from on_start; NULL removes it. */
+void tc_ssh_server_set_idle(tc_ssh_server *s, tc_ssh_idle_fn fn, void *ctx);
+
+/* tc_ssh_server_idle runs the registered pump once, or does nothing if there
+ * is none. Anything but TC_OK should end the session. */
+int tc_ssh_server_idle(tc_ssh_server *s);
+
+/* tc_ssh_server_pty reports the terminal the client asked for, or NULL if it
+ * asked for none.
+ *
+ * The struct is updated in place by any window-change that arrives while the
+ * session runs, and tc_ssh_server_pty_generation counts those changes. A
+ * shell pump reads the generation, and when it moves, resizes its pty: that
+ * is a poll rather than a callback because the change is noticed inside
+ * tc_ssh_server_read, and calling back into the application from there would
+ * be re-entering it while it is blocked on a read. */
+const tc_ssh_pty *tc_ssh_server_pty(const tc_ssh_server *s);
+uint64_t tc_ssh_server_pty_generation(const tc_ssh_server *s);
+
 /* Channel data, for use inside the on_start callback. */
 int tc_ssh_server_write(tc_ssh_server *s, const void *data, size_t len);
+
+/* tc_ssh_server_write_some sends what the peer's window allows and reports
+ * how much that was, without ever waiting.
+ *
+ * This is the form a pump needs. tc_ssh_server_write can return TC_ERR_AGAIN
+ * having already sent part of the buffer, and a caller that requeued the
+ * whole thing would send those bytes a second time -- which on a shell
+ * session means duplicated output, at an offset that depends on the peer's
+ * window. *nwrote of 0 with TC_OK means the window is shut; try later. */
+int tc_ssh_server_write_some(tc_ssh_server *s, const void *data, size_t len,
+                             size_t *nwrote);
 
 /* Returns TC_ERR_DONE once the peer has sent EOF and nothing is buffered. */
 int tc_ssh_server_read(tc_ssh_server *s, void *buf, size_t cap,

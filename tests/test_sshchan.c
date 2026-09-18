@@ -288,12 +288,108 @@ static void test_requests(void)
 	TCT_EQ_INT((int)req.type, (int)TC_SSH_REQ_EXEC);
 	TCT_EQ_STR(req.arg, "uptime -p");
 
+	TCT_CASE("shell carries nothing");
+	tc_ssh_wbuf_init(&w, msg, sizeof msg);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_REQUEST);
+	tc_ssh_put_u32(&w, ch.local_id);
+	tc_ssh_put_cstring(&w, "shell");
+	tc_ssh_put_bool(&w, true);
+	TCT_EQ_INT(tc_ssh_channel_request_parse(&req, &ch, msg,
+	                                        tc_ssh_wbuf_len(&w)),
+	           TC_OK);
+	TCT_EQ_INT((int)req.type, (int)TC_SSH_REQ_SHELL);
+	TCT_TRUE(req.want_reply);
+
+	TCT_CASE("pty-req carries a terminal and its size");
+	tc_ssh_wbuf_init(&w, msg, sizeof msg);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_REQUEST);
+	tc_ssh_put_u32(&w, ch.local_id);
+	tc_ssh_put_cstring(&w, "pty-req");
+	tc_ssh_put_bool(&w, true);
+	tc_ssh_put_cstring(&w, "xterm-256color");
+	tc_ssh_put_u32(&w, 120);
+	tc_ssh_put_u32(&w, 40);
+	tc_ssh_put_u32(&w, 960);
+	tc_ssh_put_u32(&w, 640);
+	/* The encoded terminal modes, which must be skipped rather than
+	 * mis-parsed as something else. A real client always sends some. */
+	tc_ssh_put_string(&w, "\x01\x00\x00\x00\x03\x00", 6);
+	TCT_EQ_INT(tc_ssh_channel_request_parse(&req, &ch, msg,
+	                                        tc_ssh_wbuf_len(&w)),
+	           TC_OK);
+	TCT_EQ_INT((int)req.type, (int)TC_SSH_REQ_PTY);
+	TCT_EQ_STR(req.pty.term, "xterm-256color");
+	TCT_EQ_INT(req.pty.cols, 120);
+	TCT_EQ_INT(req.pty.rows, 40);
+	TCT_EQ_INT(req.pty.width_px, 960);
+	TCT_EQ_INT(req.pty.height_px, 640);
+
+	TCT_CASE("a truncated pty-req is refused, not half-read");
+	/* Four numbers are promised and three are sent. Accepting it would put
+	 * an uninitialised height into the struct, and a terminal of 120x0 is
+	 * a shell that behaves very strangely for reasons nobody can see. */
+	tc_ssh_wbuf_init(&w, msg, sizeof msg);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_REQUEST);
+	tc_ssh_put_u32(&w, ch.local_id);
+	tc_ssh_put_cstring(&w, "pty-req");
+	tc_ssh_put_bool(&w, true);
+	tc_ssh_put_cstring(&w, "vt100");
+	tc_ssh_put_u32(&w, 80);
+	tc_ssh_put_u32(&w, 24);
+	TCT_TRUE(tc_ssh_channel_request_parse(&req, &ch, msg,
+	                                      tc_ssh_wbuf_len(&w)) != TC_OK);
+
+	TCT_CASE("a pty-req with an oversized TERM still works");
+	/* Truncated to nothing rather than refused: a nameless terminal is a
+	 * working session with a dumb one, and a refused pty-req is no session
+	 * at all. The size must still come through. */
+	{
+		char huge[200];
+		memset(huge, 'x', sizeof huge - 1);
+		huge[sizeof huge - 1] = '\0';
+		tc_ssh_wbuf_init(&w, msg, sizeof msg);
+		tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_REQUEST);
+		tc_ssh_put_u32(&w, ch.local_id);
+		tc_ssh_put_cstring(&w, "pty-req");
+		tc_ssh_put_bool(&w, true);
+		tc_ssh_put_cstring(&w, huge);
+		tc_ssh_put_u32(&w, 80);
+		tc_ssh_put_u32(&w, 24);
+		tc_ssh_put_u32(&w, 0);
+		tc_ssh_put_u32(&w, 0);
+		tc_ssh_put_string(&w, "", 0);
+		TCT_EQ_INT(tc_ssh_channel_request_parse(&req, &ch, msg,
+		                                        tc_ssh_wbuf_len(&w)),
+		           TC_OK);
+		TCT_EQ_INT((int)req.type, (int)TC_SSH_REQ_PTY);
+		TCT_EQ_STR(req.pty.term, "");
+		TCT_EQ_INT(req.pty.cols, 80);
+		TCT_EQ_INT(req.pty.rows, 24);
+	}
+
+	TCT_CASE("window-change is four numbers and no terminal");
+	tc_ssh_wbuf_init(&w, msg, sizeof msg);
+	tc_ssh_put_byte(&w, TC_SSH_MSG_CHANNEL_REQUEST);
+	tc_ssh_put_u32(&w, ch.local_id);
+	tc_ssh_put_cstring(&w, "window-change");
+	tc_ssh_put_bool(&w, false);
+	tc_ssh_put_u32(&w, 100);
+	tc_ssh_put_u32(&w, 30);
+	tc_ssh_put_u32(&w, 0);
+	tc_ssh_put_u32(&w, 0);
+	TCT_EQ_INT(tc_ssh_channel_request_parse(&req, &ch, msg,
+	                                        tc_ssh_wbuf_len(&w)),
+	           TC_OK);
+	TCT_EQ_INT((int)req.type, (int)TC_SSH_REQ_WINDOW_CHANGE);
+	TCT_EQ_INT(req.pty.cols, 100);
+	TCT_EQ_INT(req.pty.rows, 30);
+	TCT_EQ_STR(req.pty.term, ""); /* never resent, so never claimed */
+
 	TCT_CASE("everything else is something to refuse, with want_reply kept");
 	/* The flag has to survive parsing even for a request we will not serve:
 	 * a client that set it and hears nothing waits, which looks like a hung
 	 * server rather than a refused feature. */
-	static const char *const others[] = { "pty-req", "shell", "env",
-		                                  "x11-req", "window-change",
+	static const char *const others[] = { "env", "x11-req", "signal",
 		                                  "auth-agent-req@openssh.com" };
 	for (size_t i = 0; i < sizeof others / sizeof *others; i++) {
 		tc_ssh_wbuf_init(&w, msg, sizeof msg);

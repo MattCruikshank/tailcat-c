@@ -103,12 +103,34 @@ int tc_ssh_channel_open_failure_build(uint8_t *out, size_t cap,
                                       size_t *out_len, uint32_t remote_id,
                                       uint32_t reason, const char *message);
 
-/* What a CHANNEL_REQUEST asked for. */
+/* What a CHANNEL_REQUEST asked for.
+ *
+ * The four named ones are the four this server can act on. Everything else --
+ * env, x11-req, signal, agent forwarding -- stays TC_SSH_REQ_OTHER and is
+ * refused, with its arguments left unread: parsing a request in order to
+ * decline it only adds surface. */
 typedef enum {
 	TC_SSH_REQ_SUBSYSTEM,
 	TC_SSH_REQ_EXEC,
-	TC_SSH_REQ_OTHER /* pty-req, env, shell, signal, anything else */
+	TC_SSH_REQ_SHELL,
+	TC_SSH_REQ_PTY,
+	TC_SSH_REQ_WINDOW_CHANGE,
+	TC_SSH_REQ_OTHER /* env, signal, x11-req, anything else */
 } tc_ssh_request_type;
+
+/* A terminal, as the client described it.
+ *
+ * `cols` and `rows` are what the shell needs; the pixel dimensions are
+ * carried because the protocol has them and a curses program may ask, not
+ * because anything here uses them. The encoded terminal modes are skipped
+ * entirely: they describe the *client's* terminal, and the client is the one
+ * that will put its own end into raw mode. Applying them to the pty here
+ * would fight it. */
+typedef struct {
+	char term[64]; /* TERM, e.g. "xterm-256color" */
+	uint32_t cols, rows;
+	uint32_t width_px, height_px;
+} tc_ssh_pty;
 
 typedef struct {
 	tc_ssh_request_type type;
@@ -117,6 +139,10 @@ typedef struct {
 	 * rather than silently accepted: a subsystem called "sftp" and one called
 	 * "sftp-and-more" must not become the same request. */
 	char arg[256];
+	/* Filled for TC_SSH_REQ_PTY and TC_SSH_REQ_WINDOW_CHANGE. A
+	 * window-change carries the four numbers and no terminal name, so
+	 * `term` stays empty there. */
+	tc_ssh_pty pty;
 } tc_ssh_channel_request;
 
 int tc_ssh_channel_request_parse(tc_ssh_channel_request *out,

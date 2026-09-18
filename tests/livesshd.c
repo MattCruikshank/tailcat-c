@@ -16,7 +16,7 @@
  * wrong, it does not.
  *
  * Usage: livesshd <port> <host-seed-hex> <authorized-key-hex>
- *                 [<dir> [ro|rw|wo]]
+ *                 [<dir> [ro|rw|wo] | shell]
  *
  * The mode picks the policy the directory is served under: `wo` is the drop
  * box, `ro` and `rw` the file server. It defaults to `wo` so the older
@@ -29,6 +29,10 @@
 
 #include "tc/dropbox.h"
 #include "tc/fileserv.h"
+#include "tc/shellsrv.h"
+
+#include <errno.h>
+#include <poll.h>
 #include "tc/sshserver.h"
 
 #include <arpa/inet.h>
@@ -73,16 +77,38 @@ static int unhex(const char *s, uint8_t *out, size_t want)
 	return 0;
 }
 
+/* The server pointer, so the read below can run the session's pump. It is
+ * set from on_start and this program serves one connection, so a static is
+ * the whole of the bookkeeping it needs. */
+static tc_ssh_server *g_server;
+
 static int sock_read(void *ctx, uint8_t *buf, size_t cap, size_t *nread)
 {
 	int fd = *(int *)ctx;
-	ssize_t n = read(fd, buf, cap);
-	if (n < 0)
-		return TC_ERR_CLOSED;
-	if (n == 0)
-		return TC_ERR_CLOSED;
-	*nread = (size_t)n;
-	return TC_OK;
+	for (;;) {
+		/* Poll rather than block, so an interactive session's output moves
+		 * while nobody is typing. Without this the shell's output would
+		 * reach the client on its next keystroke. See tc/sshserver.h. */
+		struct pollfd p;
+		p.fd = fd;
+		p.events = POLLIN;
+		p.revents = 0;
+		int pr = poll(&p, 1, 20);
+		if (pr > 0 && (p.revents & POLLIN) != 0) {
+			ssize_t n = read(fd, buf, cap);
+			if (n <= 0)
+				return TC_ERR_CLOSED;
+			*nread = (size_t)n;
+			return TC_OK;
+		}
+		if (pr > 0 && (p.revents & (POLLHUP | POLLERR)) != 0)
+			return TC_ERR_CLOSED;
+		if (pr < 0 && errno != EINTR)
+			return TC_ERR_CLOSED;
+		int rc = tc_ssh_server_idle(g_server);
+		if (rc != TC_OK)
+			return rc;
+	}
 }
 
 static int sock_write(void *ctx, const uint8_t *buf, size_t len)
@@ -110,6 +136,8 @@ static int sock_write(void *ctx, const uint8_t *buf, size_t len)
 static const char *g_dir;
 /* 0 = drop box, 1 = read-only, 2 = read-write. */
 static int g_mode;
+/* Serve a shell rather than a directory. */
+static bool g_shell;
 
 /* serve_sftp opens the drop box and hands it to the shared serving loop.
  * The framing lives in tc_dropbox_serve so the CLI and this test run the
@@ -144,6 +172,20 @@ static int on_start(void *ctx, tc_ssh_server *s, tc_ssh_request_type type,
                     const char *arg)
 {
 	(void)ctx;
+
+	if (g_shell) {
+		g_server = s;
+		tc_shell_opts so;
+		memset(&so, 0, sizeof so);
+		/* An exec request carries the command; a shell request carries
+		 * nothing and means the login shell. */
+		so.command = (type == TC_SSH_REQ_EXEC && arg[0] != '\0') ? arg : NULL;
+		int src = tc_shell_serve(s, &so);
+		if (src != TC_OK)
+			fprintf(stderr, "livesshd: shell failed: %s\n",
+			        tc_strerror(src));
+		return src;
+	}
 
 	/* Without a drop box the sftp subsystem falls through to the echo below,
 	 * which is what lets live-sshloop exercise the client's channel and data
@@ -199,9 +241,11 @@ int main(int argc, char **argv)
 		                "<authorized-hex> [<dir> [ro|rw|wo]]\n");
 		return 2;
 	}
-	if (argc >= 5)
+	if (argc >= 5 && strcmp(argv[4], "shell") == 0)
+		g_shell = true;
+	else if (argc >= 5)
 		g_dir = argv[4];
-	if (argc == 6) {
+	if (argc == 6 && !g_shell) {
 		if (strcmp(argv[5], "ro") == 0)
 			g_mode = 1;
 		else if (strcmp(argv[5], "rw") == 0)
@@ -263,6 +307,11 @@ int main(int argc, char **argv)
 	opts.write = sock_write;
 	opts.io_ctx = &fd;
 	opts.on_start = on_start;
+	/* A shell and a terminal, only in shell mode. Off otherwise, so the
+	 * drop box and the file server refuse them exactly as the real server
+	 * does. */
+	opts.allow_shell = g_shell;
+	opts.allow_pty = g_shell;
 
 	int rc = tc_ssh_server_run(&opts);
 	close(fd);
