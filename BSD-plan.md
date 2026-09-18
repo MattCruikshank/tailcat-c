@@ -4,7 +4,9 @@ A plan, not a record. Nothing here has been done yet.
 
 ## Why this, and why now
 
-`README.md` claims six operating systems. Two of them have ever run this code:
+`README.md` claims six operating systems, and says plainly that four of them
+are untested -- this is the plan for making that sentence shorter. Two have
+ever run this code:
 Linux and Windows. macOS, FreeBSD, OpenBSD and NetBSD are *built* — the fat
 APE contains code for them and `check-fat` proves the binary is well-formed —
 and that is the whole of the evidence.

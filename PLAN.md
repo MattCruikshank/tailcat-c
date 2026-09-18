@@ -641,8 +641,9 @@ does not match" and nothing more specific.
       requires us to keep accepting it. Not worth it for a drop box.
 
 The decision and its alternatives remain recorded below, because a decision
-whose reasoning is thrown away is one that gets relitigated. Full detail is in the README under
-[Vendoring an SSH server](README.md#vendoring-an-ssh-server); the summary:
+whose reasoning is thrown away is one that gets relitigated. Full detail is in
+[PORT.md](PORT.md#vendoring-an-ssh-server) under Vendoring an SSH server; the
+summary:
 
 | | Licence | Verdict |
 |---|---|---|
@@ -958,9 +959,10 @@ Skipped once as "not worth writing", which was half right and half a wrong
 reason. The command is four lines -- upstream is a `//go:embed README.md` and
 a write to stdout -- so effort was never the objection. What was missing was
 the *document*. Upstream's README.md is 30 KB of user documentation, so
-embedding it answers the question a user is asking. Ours is 83 KB of
-engineering log, and printing 1,400 lines about mutation testing to someone
-who typed `readme` would answer a question nobody asked, for four per cent of
+embedding it answers the question a user is asking. Ours was 83 KB of
+engineering log -- since moved to PORT.md -- and printing 1,400 lines about
+mutation testing to someone who typed `readme` would answer a question nobody
+asked, for four per cent of
 a binary whose size is a selling point.
 
 So `doc/usage.md` was written to be the thing worth embedding: examples,

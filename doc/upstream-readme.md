@@ -5,7 +5,7 @@ Every instruction in
 typed as a reader would copy it, run against `build/cosmo/tailcat-c` and
 nothing else.
 
-The feature table in [README.md](../README.md#features) already says what is
+The feature table in [PORT.md](../PORT.md#features) already says what is
 implemented. This asks a different and harsher question: **what does a person
 following upstream's documentation actually see?** A feature can be present
 and still fail that test, because the flag was spelled differently, or the
@@ -35,7 +35,7 @@ the real Go binary, in a direction nothing here tested.
 
 All thirteen are now fixed, and closing the last of them turned up four more
 bugs — 45 through 48 — three of which were the same mistake in one function.
-They are in [README's bug list](../README.md#bugs-this-verification-has-actually-caught).
+They are in [PORT.md's bug list](../PORT.md#bugs-this-verification-has-actually-caught).
 
 
 ## What the second walk found

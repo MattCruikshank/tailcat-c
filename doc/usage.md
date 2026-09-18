@@ -3,9 +3,9 @@
 Netcat over WireGuard, through Tailscale's DERP relays. One address is all
 either side needs: no account, no daemon, no configuration file.
 
-This is what `tailcat-c readme` prints. README.md in the source tree is a
-different document -- an engineering log about how this was built and verified
--- and is not what you want at a terminal.
+This is what `tailcat-c readme` prints. README.md in the source tree is the
+full manual, including what this port does not do; PORT.md is the engineering
+record of how it was built and verified.
 
 
 ## The idea

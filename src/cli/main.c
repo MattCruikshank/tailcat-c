@@ -6973,7 +6973,7 @@ int main(int argc, char **argv)
 				 * upstream feature, just not one we have. */
 				fprintf(stderr,
 				        "tailcat-c: the \"%s\" service is not implemented "
-				        "here; see the feature table in README.md\n",
+				        "here; see the feature table in PORT.md\n",
 				        tc_portset_service_name(svc_kind));
 				return 2;
 			}
@@ -7050,10 +7050,10 @@ int main(int argc, char **argv)
 		                 want_ssh ? child_argv : NULL, json_out);
 	}
 	if (strcmp(args[0], "readme") == 0) {
-		/* Upstream embeds its own README.md here. Ours is an engineering log
-		 * three times the size, so doc/usage.md is embedded instead: a user
-		 * who types `readme` wants examples, not an account of how the TCP
-		 * stack was fuzzed. */
+		/* Upstream embeds its own README.md here. Ours is a fuller manual
+		 * that opens with what this port does not do, so doc/usage.md is
+		 * embedded instead: a user who types `readme` at a terminal wants
+		 * the examples. */
 		fputs(tc_usage_text, stdout);
 		return 0;
 	}

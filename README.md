@@ -1,2087 +1,717 @@
+<!--
+The shape of this file -- its sections, their order, and the worked examples
+they are built around -- follows the README of the tailcat project:
+
+    https://github.com/tailscale/tailcat
+    Copyright (c) 2020 Tailscale Inc & contributors.
+    SPDX-License-Identifier: BSD-3-Clause
+
+This program is a port of that one and is under the same licence; the terms
+and that notice are in LICENSE. The prose and the terminal output here
+describe this implementation, which differs from upstream in the ways the
+second section sets out.
+-->
+
 # tailcat-c
 
-A rewrite of [tailcat](https://github.com/tailscale/tailcat) in C11, built
-with the [Cosmopolitan](https://github.com/jart/cosmopolitan) C compiler into
-a single **fat Actually Portable Executable** — one binary that runs on
-Linux, macOS, Windows, FreeBSD, OpenBSD and NetBSD, on both x86_64 and
-aarch64.
-
-**Status: upstream's command set is implemented, bar the WebAssembly
-build.**
-Relay and direct paths both work, on two operating systems.
-`tailcat-c` serves and connects, interoperates with the real Go tailcat in
-both roles, finds a direct peer-to-peer path when one exists and falls back
-to the relay when it stops working, and the *same fat binary* does it on
-Linux and on Windows:
-
-```console
-$ echo 'the quick brown fox' | tailcat-c -v tcpGFwWCDMihnYWAeovm...
-# relay tc301a.ipn.dev
-# meowed: the server has added us as a peer
-# tunnel up
-# connected
-```
-
-and the Go server prints `the quick brown fox` on its own stdout. On a run
-where a direct path is available, the same client reports finding one:
-
-```console
-# probing for a direct path (4 of our addresses offered)
-# path: direct to 172.25.125.50:60857, 24ms (2 of 2 candidates proven)
-```
-
-and that one is against a **real Go tailcat server**, not against ourselves:
-Tailscale's own disco protocol answering our probes.
-
-It works the other way round too: `tailcat-c serve` mints an address that the
-**real Go client** accepts, answers its WireGuard handshake as the responder,
-and writes what it receives to stdout.
-
-`scripts/live-cross.sh` runs one binary against itself across both operating
-systems, in both directions, through a real relay:
-
-```
-one binary, 2047257 bytes, run by both operating systems
-
-== A: Windows transmits -> Linux receives ==
-  the Linux server received: hello from Windows
-== B: Linux transmits -> Windows receives ==
-  the Windows server received: hello from Linux
-```
-
-Everything is a single fat Actually Portable Executable with no dependencies
-beyond a vendored Mbed TLS. See [Limitations](#limitations) for what this
-deliberately does not do, and [Known TODOs](#known-todos) for the loose
-ends.
-
-## Why this is a big job
-
-tailcat's own source is ~8,900 lines of Go, which undersells it badly: it is
-a thin shell over a very large data plane it does not own. A working rewrite
-has to reimplement, at minimum:
-
-| Component | Go LOC | Needed for |
-|---|---:|---|
-| tailcat itself | 8,884 | everything |
-| `wgengine/magicsock` | 11,243 | DERP muxing, NAT traversal |
-| `derp` (client half) | ~2,500 | relay transport |
-| `netcheck`, `stun`, `disco`, `types/key` | 4,683 | relay selection, path discovery |
-| `wireguard-go` | ~10,000 | the actual encryption |
-| `gvisor` netstack | 100,000+ | userspace TCP, since tailcat touches no routing tables |
-| `gliderssh` + `x/crypto/ssh` + `sftp` | ~20,000 | only the SSH/SFTP features |
-
-The last row turned out to be the one where the estimate was most wrong, and
-in our favour: the SSH and SFTP subset `recv` and `ls` need — transport, key
-exchange, publickey auth, one channel, and a version 3 file protocol in both
-directions — came to about 2,900 lines rather than 20,000, because a drop box
-and a listing need almost none of what makes a general `sshd` big.
-
-## Scope
-
-The original scope was the **DERP-relay-only interop core** — wire compatible
-with real tailcat, but relaying rather than establishing direct paths, which
-is what tailcat's own WebAssembly demo does. That deliberately dropped
-`magicsock`'s hardest parts, on the grounds that they were a strict addition
-and could come later without redesign.
-
-They came later. STUN, netcheck, the disco protocol, path discovery and the
-upgrade/fallback machinery are all here now, and the claim that they could be
-added without redesign turned out to be true: the only structural change was
-widening the connection key from a port pair to a four-tuple.
-
-**Still out of scope**, in descending order of how much it would take:
-
-- The **browser/WebAssembly build**. Cosmopolitan does not target WASM, so
-  this means a second toolchain and a second build of everything — arguably
-  against the premise of a project whose whole point is one fat APE.
-- **TLS 1.3**, which is blocked on something more interesting than effort;
-  see [the note below](#tls-13-is-blocked-on-ed25519).
-
-`forward`, `socks`, `ssh`/`cp` as clients, `ls`, `recv`, exit nodes, saved
-identities, `browse` and `readme` are all here.
-
-**Smaller things that are simply absent**, none of them hard, all of them
-found by typing upstream's README at this binary rather than by reading our
-own feature list:
-
-- **`genkey --region=<relay-hostname>`**, for a relay you run yourself.
-  `--relay` does this for one `serve`; what is missing is recording it in a
-  *saved key*. `--fixed-region` and a numbered or named region already are.
-- **Reaching a third address from the pipe form or `ssh -p ip:port`.**
-  `forward` does this and `serve exit-node` is implemented, so this is
-  plumbing an existing path into two more commands. Until then both refuse
-  it by name; see bug 34 for what they did before.
-
-Every instruction in upstream's README has been typed at our binary and the
-result written down: [doc/upstream-readme.md](doc/upstream-readme.md). It is
-a sharper question than the feature table asks, and it found three bugs that
-the table would have called implemented.
-
-## How it compares
-
-### Size
-
-Both columns are release builds of the same commit: upstream with its own
-`-s -w` and the 75 `ts_omit_*` tags from `.goreleaser.yaml`, ours as cosmocc
-emits it. (Running `strip` on an APE destroys it — `scripts/check-fat.sh`
-will tell you so — and building without `-g` changes nothing, because cosmocc
-keeps debug information in sibling files rather than in the executable.)
-
-| | tailcat-c | tailcat (Go) |
-|---|---:|---:|
-| binary | **2.22 MB** | 17.70 MB |
-| gzipped | **1.11 MB** | 6.85 MB |
-| files needed for 6 OSes × 2 arches | **1** | 12 |
-
-The ratio is about 8×, and **most of it is the feature gap below, not
-craftsmanship**. A Go binary also carries a runtime, a garbage collector and
-reflection metadata that a C program does not, which accounts for a good part
-of the rest.
-
-Where our 2.22 MB actually goes, as `size` reports text+data on the x86_64
-objects — so these are code and initialised data, not file offsets, and they
-do not sum to the binary:
-
-| | |
-|---|---:|
-| Mbed TLS | 249 KB |
-| **all of our own code** | **189 KB** |
-| the compiled-in CA bundle | 181 KB |
-| the embedded usage text (`readme`) | 5.3 KB |
-| Cosmopolitan libc, and two architectures of everything | the remainder |
-
-Everything we wrote — addresses, CBOR, JSON, crypto, DERP, WireGuard, TCP,
-UDP, STUN, disco, netcheck, path discovery, Ed25519, and an SSH and SFTP
-client and server — now comes to 189 KB. For most of this project's life
-that number was smaller than the list of certificate authorities the binary
-ships with; the SSH subset added 42 KB and overtook it, and it now leads by
-six.
-
-Phases 3 through 5 added about 288 KB to the binary and roughly 6,000 lines
-of source, which is the cost of everything from `serve <ports>` through
-direct peer-to-peer paths.
-
-### Features
-
-| | tailcat-c | tailcat |
-|---|:--:|:--:|
-| **Data plane** | | |
-| WireGuard tunnel (Noise IKpsk2) | ✅ | ✅ |
-| Pre-shared key layer | ✅ | ✅ |
-| DERP relay transport | ✅ | ✅ |
-| Bring your own relay | ✅ | ✅ |
-| Direct peer-to-peer path (NAT traversal, disco, STUN, netcheck) | ✅ | ✅ |
-| Rekeying / session renewal | ✅ | ✅ |
-| Cookie reply (DoS mitigation) | ✅ | ✅ |
-| DERP map fetch | ✅ | ✅ |
-| Region choice by latency | ✅ (netcheck) | ✅ (netcheck) |
-| Multiple concurrent connections | ✅ | ✅ |
-| Multiple concurrent clients | ✅ (8) | ✅ |
-| UDP forwarding | ✅ (SOCKS5 UDP ASSOCIATE) | ✅ |
-| Exit node (forward to any address) | ✅ | ✅ |
-| Client allow list (`--allow`) | ✅ | ✅ |
-| IPv4 into the tunnel via NAT64 | ✅ | ✅ |
-| TLS to the relay | 1.2 ([why](#tls-13-is-blocked-on-ed25519)) | 1.2 + 1.3 |
-| **Commands** | | |
-| pipe stdin/stdout to a server | ✅ | ✅ |
-| `serve` | ports, ranges, `all`; many clients | full |
-| `parse` | ✅ (byte-identical JSON) | ✅ |
-| `version` | ✅ | ✅ |
-| `ping` (reports relay or direct path) | ✅ | ✅ |
-| `ping --until-direct` | ✅ | ✅ |
-| `resolve` | ✅ | ✅ |
-| `forward` (local TCP port forwarding) | ✅ | ✅ |
-| `socks` (SOCKS5 proxy) | ✅ CONNECT + UDP ASSOCIATE, up to 4 servers | ✅ (many servers) |
-| `socks <cmd>` with `all_proxy`, `--` optional | ✅ | ✅ |
-| `ssh` / `cp` (both exec the system ssh and scp) | ✅ | ✅ |
-| `ls` (SFTP remote listing) | ✅ (in-process SFTP client) | ✅ |
-| SSH *server* (`serve ssh`) | ✅ shell, pty, exec, forced command | ✅ |
-| `serve no-auth-ssh` | ✅ with upstream's warnings | ✅ |
-| `serve files` (`--files <dir>[:ro\|:rw\|:wo\|:wo+]`) | ✅ read, list, stat, write, drop box, tree drop box | ✅ |
-| `recv --accept-dirs` (recursive drop box) | ✅ | ✅ |
-| `--ssh-authorized-keys` (file, literal key, `user@github`) | ✅ ed25519, ECDSA P-256/P-384, RSA (SHA-2) | ✅ |
-| `recv` (file drop box, receiving) | ✅ (flat, write-only) | ✅ |
-| `cp` *into* a `tailcat recv` drop box | ✅ | ✅ |
-| `genkey`, `printpub` (saved identities) | ✅ | ✅ |
-| `readme` | ✅ (embeds doc/usage.md, not this file) | ✅ (embeds README.md) |
-| `browse`, `forward --open-browser` | ✅ | ✅ |
-| `serve exec` (a command per connection) | ✅ | ✅ |
-| bare `tailcat` starts a server | ✅ | ✅ |
-| `--flag=value` as well as `--flag value` | ✅ | ✅ |
-| `--timeout` as a duration (`2m`, `1h30m`) | ✅ | ✅ |
-| addresses in DNS TXT records | ✅ | ✅ |
-| the DNS safety probe | ✅ | ✅ |
-| `socks` with the address omitted | ✅ | ✅ |
-| a tc-addr as a URL hostname | ✅ | ✅ |
-| `genkey --fixed-region` | ✅ | ✅ |
-| `genkey --region=<relay-hostname>` | ✅ (comma-separated, no relay-list fetch) | ✅ |
-| a third address from the pipe or `ssh -p` | ✅ (`ip:port`, IPv6 in brackets) | ✅ |
-| **Not here** | | |
-| `ssh-rsa` (SHA-1), `ssh-dss`, `sk-*`, P-521, certificates | ❌ skipped, and said so | ✅ |
-| **Platforms** | | |
-| Linux, Windows | ✅ tested | ✅ |
-| macOS, FreeBSD, OpenBSD, NetBSD | **built, never run** — see [BSD-plan.md](BSD-plan.md) | ✅ (macOS) |
-| aarch64 | ✅ all 40 test binaries pass on real aarch64 instructions (qemu-user) | ✅ |
-| Browser (WebAssembly) | ❌ | ✅ |
-| Persistent keys on disk | ✅ | ✅ |
-
-So: tailcat-c does the **whole data path** — address, relay, tunnel, TCP,
-UDP, and the direct peer-to-peer path with its NAT traversal — in both roles
-and interoperably, plus everything built on top of it: serving ports,
-forwarding, SOCKS, exit nodes, `ssh` and `cp`, saved identities, and all four
-`serve` services — `ssh`, `no-auth-ssh`, `exec` and `files` — on an SSH and
-SFTP server of our own.
-
-What is left of upstream's surface is the **browser build**, which
-Cosmopolitan cannot target, and one difference that is a choice rather than a
-gap: an authorized key must be one of ed25519, ECDSA on P-256 or P-384, or RSA
-verified with SHA-256 or SHA-512 — everything anyone actually has. What is not
-accepted is `ssh-rsa` and `ssh-dss`, which sign with SHA-1; the `sk-*`
-hardware forms; P-521, which this Mbed TLS build does not carry; and OpenSSH
-certificates. Upstream takes all of those. A line naming one is skipped and
-counted rather than silently kept, because a key accepted into the list and
-unverifiable at login would look configured and never work.
-
-Getting to that point took asking an awkward question. The walkthrough of
-upstream's README had been kept up to date *by hand* as features landed —
-real evidence, from unit and live tests, but not the evidence that document
-exists to collect. Asked whether we had actually walked it again,
-[the honest answer was no](doc/upstream-readme.md). Walking it properly found
-eleven differences and two bugs; closing those turned up four more. All are
-fixed, and bugs 43 through 48 below are the interesting half of this
-project's recent history.
-
-## Build
-
-Requires the [cosmocc](https://github.com/jart/cosmopolitan) toolchain:
-
-```sh
-mkdir -p ~/cosmocc && cd ~/cosmocc
-curl -fsSL -o cosmocc.zip https://cosmo.zip/pub/cosmocc/cosmocc.zip
-unzip -o cosmocc.zip
-```
-
-Then:
-
-```sh
-git clone --recurse-submodules https://github.com/MattCruikshank/tailcat-c
-make            # build
-make test       # unit tests; also asserts every binary is a fat APE
-make fuzz       # fuzz/property tests under ASan + UBSan (host gcc)
-make interop    # cross-check against the real Go tailcat library
-make live       # connect to a real DERP relay and relay a packet (needs network)
-make live-wg    # handshake against a real wireguard-go device
-make live-tailcat  # full tunnel with a real tailcat server (needs network)
-make live-cli      # drive the CLI end to end against a real server
-make live-netcheck # STUN probes and region choice against the real relay list
-make live-direct   # two of ours finding a direct path between them
-make live-exitnode # reach a third address through an exit node
-```
-
-And, from Git Bash on Windows rather than from inside WSL, since it drives
-both sides:
-
-```sh
-sh scripts/live-cross.sh   # one binary, two operating systems, both ways
-```
-
-### Checking it
-
-Local, tiered, numbered like Starfleet diagnostics -- **1 is the one where you
-take the panels off**, 5 is the quick sweep:
-
-```console
-$ make diag5     # ~6s     did I just break the build
-$ make diag3     # ~1m     both toolchains, sanitizers, fuzzing, crosscheck
-$ make diag1     # long    the above from a clean tree, plus every live test
-```
-
-The first two are measured on this machine, warm; level 3 varies from about
-forty seconds to a minute and a half depending on how much needs rebuilding.
-Level 1's duration is
-deliberately not given a number here: it grew by eight live tests when bug 19
-was fixed and by two aarch64 stages after that, and the figure that used to
-sit in this comment predates both. It prints its own total, and every stage
-inside it times itself, which is the number to trust.
-
-Level 3 runs before every push. Install the hook once:
-
-```console
-$ git config core.hooksPath scripts/githooks
-```
-
-`TC_DIAG=5 git push` drops to the quick sweep and `TC_DIAG=0 git push` skips
-it, for when you know better.
-
-Levels 4 and 2 are deliberately undefined rather than missing: three tiers is
-what the work divides into, and two more would be distinctions nobody would
-remember.
-
-The split is about more than duration. **Level 1 is the only level that
-touches the network**, because the live tests dial Tailscale's production
-relays and run a real `tailcat` -- which is a thing to do deliberately before
-a release, not on every push. It is also the only level that starts from
-`rm -rf build`, which is what rules out the stale-object class of bug that
-went unnoticed here for the whole project.
-
-Every stage times itself, so the cost of each level stays a measured fact
-rather than an estimate in a comment.
-
-Then:
-
-```console
-$ tailcat-c serve                          # listen; prints an address
-$ echo hello | tailcat-c <tc-address>      # pipe to a server
-$ tailcat-c serve 22,80,8000-8999          # proxy local ports
-$ tailcat-c forward <tc-addr> 18080:80     # reach its port 80 on ours
-$ tailcat-c socks <tc-addr> 1080           # or via a SOCKS5 proxy
-$ tailcat-c genkey --key default --region 301  # a stable address
-$ tailcat-c ssh <tc-addr> uptime           # via the system ssh
-$ tailcat-c ping <tc-address>              # time the round trip
-$ tailcat-c resolve <tc-address>           # embed the relay, for offline use
-$ tailcat-c parse <tc-address>             # describe an address
-$ tailcat-c netcheck                       # UDP, NAT type, relay latency
-$ tailcat-c serve exit-node,22             # forward anywhere this machine can reach
-$ tailcat-c forward <addr> 13306:192.168.1.10:3306
-$ tailcat-c ls <tc-addr>:photos           # list what a server offers
-$ tailcat-c recv ~/inbox                   # receive files; senders name nothing
-$ tailcat-c serve --allow nodekey:...      # only that client may connect
-$ tailcat-c socks <addr> 1080             # CONNECT and UDP ASSOCIATE
-```
-
-The address must be self-contained; run `tailcat resolve` on a short one,
-since fetching the DERP map is not implemented.
-
-Mbed TLS is a pinned submodule, so `--recurse-submodules` matters; an
-existing clone needs `git submodule update --init`.
-
-`make CC=gcc test` builds with the host compiler instead, which is useful
-under sanitizers.
-
-### Building on Windows
-
-The toolchain runs under WSL. `scripts/wslmake.sh` wraps it and handles a
-WSL-specific problem: WSL registers a `binfmt_misc` handler for anything
-starting with `MZ`, which swallows Actually Portable Executables and hands
-them to Windows — and cosmocc runs APE tools during its own build, so it
-fails outright. The wrapper disables that handler and registers
-Cosmopolitan's loader instead, in the same invocation as the build, because
-`binfmt_misc` is per-WSL-instance state and WSL tears the instance down as
-soon as its last process exits.
-
-```sh
-scripts/wslmake.sh 'make test'
-```
-
-## Verification
-
-40 test binaries, 11,490 assertions, under two toolchains and on both
-architectures. The method matters
-more than the count, and it is the same one everywhere: **check against
-something that is not ours.**
-
-| Layer | The external anchor |
-|---|---|
-| addresses | upstream's own `tailcat_test.go` vectors, plus 2,000 random addresses generated by the real Go package and required to re-encode byte-identically |
-| crypto | `golang.org/x/crypto` and wireguard-go's exported KDFs, with RFC 7693 and RFC 7748 values as fixed points |
-| meow, disco, STUN | upstream's own encoders, via `tools/genvectors` |
-| UDP over IPv6 | packets built and checksummed by **gopacket** |
-| NAT64 | RFC 6052 §2.4's worked example, and `inet_pton`, which embeds a dotted quad itself |
-| Ed25519 | RFC 8032's published vectors, reached by feeding its own seeds to Go's `crypto/ed25519` |
-| IPv6 formatting | our output fed back through `inet_pton` |
-| SSH | `golang.org/x/crypto/ssh` for the wire encodings and the cipher, and a **real OpenSSH 9.6 client** for the protocol itself |
-| the SFTP drop box | a real `scp` and `sftp` carrying out the attacks, with the check on the filesystem afterwards rather than on what the client printed |
-| the SSH and SFTP *clients* | a real Go tailcat file server, via `golang.org/x/crypto/ssh` and `github.com/pkg/sftp` |
-| opening a browser | the real `rundll32 url.dll,FileProtocolHandler`, checked by watching a loopback listener for the request a browser actually made |
-| everything timing-dependent | simulated networks where loss, delay, NAT behaviour and the clock are arguments |
-
-Where a test passed on the first run, the response has generally been to
-**mutate the code and check the test notices**. That has been worth doing:
-of ten mutations to the path-discovery logic, six survived the first pass —
-including, embarrassingly, every one aimed at the rule the whole design rests
-on, because no scenario had one-way reachability. Of eleven to the UDP mux,
-two had to be *rewritten* before they were the right mutations: one was a
-false catch that merely failed to compile, and one modelled the wrong bug.
-
-The SSH work added about sixty more, across the wire format, the packet
-layer, key exchange, userauth, channels and the drop box, and produced three
-results worth separating:
-
-- **Caught, and by something stronger than an assertion.** Removing the
-  length bound in `tc_ssh_get_string` does not fail a check, it aborts under
-  ASan -- that argument turned out to be the only thing between a hostile
-  length field and a stack buffer.
-- **Survived, and the mutation was right.** Deleting the `has_signature`
-  check from publickey auth changed no test result, because a parsed query
-  form has an all-zero signature that fails verification anyway. The test
-  asserted the outcome without exercising the guard meant to produce it,
-  which is bug 13's shape exactly. Now closed.
-- **Survived, and the mutation was wrong.** Deleting the empty-list early
-  return from the same function is *equivalent*: with no keys the search loop
-  finds nothing and denies regardless. Recorded as equivalent rather than
-  papered over with a test that would prove nothing.
-
-The DERP frame codec added eleven, ten killed, and the survivor is the
-clearest case yet for doing this at all: `tc_derp_parse_recv_packet` bounds a
-relayed packet at 64KB, and deleting that bound changed no test result and no
-*fuzz* result, on a module that had just been fuzzed for a million
-iterations. It is not dead code -- a frame may be a megabyte, so without the
-check one oversized frame becomes a megabyte handed to the WireGuard layer as
-a packet. Nothing reached it because the tests used small packets and the
-fuzzer's buffer is a kilobyte. **A harness has a shape as well as a size**,
-and no number of iterations fixes the wrong shape.
-
-`browse` added twenty-five more, and a fourth result: **survived because
-something else on the machine did the job.** Three mutations to the
-browser-opening code -- ignoring `$BROWSER` entirely, trying only its first
-entry, and forking once where it forks twice -- all passed a suite that was
-watching the right thing. The reason is that `xdg-open` implements the same
-`$BROWSER` convention we do, so a build that skipped our handling still ended
-up running the recorder, by a longer route. The test now empties `$PATH`
-first, which makes every opener that has to be *found* unavailable, so what
-reaches the recorder can only have come from the code under test. With that
-one change all twenty-five die.
-
-That is the general shape and worth naming: a test that passes because the
-environment supplied the behaviour is not testing the code, and the way to
-find out is to take the environment away.
-
-A surviving mutation is a gap in the tests, unless it is equivalent -- or
-unless the environment is quietly standing in for the code. A caught one only
-counts if it was the right mutation.
-
-The address layer specifically is checked three ways:
-
-1. **Golden vectors ported from upstream.** `tests/test_addr.c` uses the
-   exact addresses and malformed-input cases from tailcat's own
-   `tailcat_test.go` (`TestAddr`, `TestParseAddrMalformed*`,
-   `TestParseAddrNullInArrays`).
-2. **Differential testing against the real Go library.** `make interop` has
-   `tools/genaddrs` generate thousands of random addresses using the actual
-   `github.com/tailscale/tailcat` package, then requires the C code to parse
-   each one and re-encode it *byte for byte identically*. That single check
-   pins field order, the `omitempty` rules, shortest-form CBOR integers and
-   the elide/restore transforms all at once. 2,000 addresses currently pass.
-3. **Fuzzing.** `make fuzz` mutates a seed corpus under ASan and UBSan,
-   asserting no crashes and that any address that parses survives an
-   encode/parse round trip unchanged.
-
-The crypto layer is checked the same way. `tools/genvectors` derives
-`tests/crypto_vectors.h` from `golang.org/x/crypto/{blake2s,chacha20poly1305,
-curve25519}` and wireguard-go's own exported `KDF1`/`KDF2`/`KDF3` — the exact
-implementations tailcat interoperates with — rather than transcribing hex by
-hand, which is where crypto test suites quietly go wrong. Two vectors
-(`rfc7693-abc` and `rfc7748-1`) are the published RFC values, so the
-generator is anchored to something outside Go as well.
-
-`tests/fuzz_crypto.c` property-tests the parts that guard the tunnel: random
-ciphertext never authenticates, a single flipped bit anywhere in ciphertext,
-tag, associated data or counter always fails, BLAKE2s fed in arbitrary chunk
-sizes equals the one-shot digest, and X25519 is commutative and refuses
-small-order points.
-
-`tests/fuzz_tcp.c` is the newest and took three attempts to make honest,
-which is the interesting part. Generating random packets and feeding them in
-was nearly useless: over 200,000 iterations it opened 76 connections, because
-a packet must clear a checksum, a port lookup and a state check before it
-reaches anything worth fuzzing. It exercised the length checks thoroughly and
-the reassembly queue barely at all. So it now runs two real stacks against
-each other, exchanging real data, and corrupts a fraction of the packets in
-flight, with one uncorrupted connection carrying a byte counter as an
-integrity oracle -- because a reassembly bug that silently reorders or
-duplicates data crashes nothing and would pass every crash-based check.
-
-Then the counters were printed, and they said 64 accepted connections at
-20,000 iterations and 64 at 200,000. The churn opened connections and never
-closed any, so both tables filled to `TC_TCP_MAX_CONNS` and stayed there: a
-ten-fold longer run did exactly the same work. Fixing that turned up bugs 20
-and 21 within minutes, one after the other, each of which had been holding
-the table full in its own way.
-
-The lesson is the one the file was written for, one level up, so every fuzz
-harness now **asserts its own reach** and fails if it stops getting there --
-no connection accepted, no byte carried end to end, nothing corrupted, or a
-connection table that never turned over. A fuzzer that has quietly stopped
-reaching the code looks identical, from the outside, to one that is finding
-no bugs.
-
-A smaller instance of the same thing: every harness seeded itself with
-`strtoull(argv[2]) | 1`, which maps seeds 2 and 3 -- and 4 and 5, and so on
--- to the same state. Half of every seed sweep was a verbatim repeat of the
-run before it, and the sweep looked twice as wide as it was.
-
-## Design notes
-
-**No dynamic allocation in the parsers.** Addresses arrive from untrusted
-places — a pasted string, a `tailcat=` TXT record — so `tc_addr_parse` writes
-into a caller-provided fixed-size `tc_conn_info` and rejects anything that
-exceeds its limits with `TC_ERR_TOOMANY` rather than truncating. There is no
-`malloc` on the parse path at all.
-
-**The CBOR reader is deliberately narrow.** It refuses indefinite-length
-items, tags, floats, unassigned simple values and the reserved
-additional-info values, and validates UTF-8 on text strings (matching
-fxamacker's `UTF8RejectInvalid`). Container element counts are bounds-checked
-against the bytes remaining, which both rejects absurd counts up front and
-keeps them from overflowing later arithmetic. Nothing in it recurses, so
-nesting depth cannot exhaust the stack.
-
-**Bug-compatible where it matters.** `tc_base64url_decode` skips `\r` and
-`\n` and does not reject a final quantum with non-zero unused bits, because
-Go's decoder does both — being stricter would mean refusing addresses real
-tailcat emits. Both deviations are documented at the declaration.
-
-### What the toolchain taught us
-
-- **Stack protection is unavailable in a fat build.** aarch64 has no
-  `__stack_chk_guard` at all, so any `-fstack-protector-*` flag fails to link
-  the aarch64 half. Supplying the symbol by hand makes it link, but the
-  x86_64 binary then segfaults, because Cosmopolitan only defines the guard
-  in its `-mtiny` runtime. Measured against cosmocc 14.1.0. The flag is
-  therefore enabled only for host builds, which is where the sanitizer and
-  fuzz targets run. `make test` runs `scripts/check-fat.sh` on every binary
-  so this tradeoff cannot silently become "we quietly dropped aarch64".
-- **cosmocc does not expose mbedTLS** to user programs; it bundles only
-  GCC/Clang, Cosmopolitan Libc, libcxx, compiler-rt and OpenMP. DERP needs
-  HTTPS, so a TLS library has to be vendored. See below.
-- **Never use `-moptlinux` or `-mtinylinux`** — both produce Linux-only
-  binaries.
-- **`-std=gnu11`, not `-std=c11`.** Strict ISO mode makes glibc hide the POSIX
-  networking declarations the DERP transport needs. `-Wpedantic` stays on, so
-  our own code is still held to ISO C. Cosmopolitan is more permissive than
-  glibc here, which is exactly why the project also builds with host gcc: that
-  build caught `src/net/tls.c` using `calloc` with no `<stdlib.h>`, which
-  cosmo's headers had been supplying transitively.
-- **cosmocc keeps the aarch64 object in a sibling `.aarch64/` directory** next
-  to the x86_64 one, and resolves the pair automatically at link time. Worth
-  knowing before concluding a symbol is missing: `nm` on the obvious path only
-  shows you half the build.
-- **Mbed TLS's public headers do not survive our warning set** (redundant
-  redeclarations, `#if` on undefined macros), so they are included with
-  `-isystem`. That suppresses their warnings without weakening ours.
-- **ISO C only guarantees 4095-byte string literals**, which `-Wpedantic`
-  enforces, and the CA bundle is 181KB. The generated file suppresses
-  `-Woverlength-strings` locally rather than emitting a far larger and less
-  readable hex byte array.
-
-### Working with WSL
-
-Both are about WSL rather than Cosmopolitan, but both cost real time:
-
-- **A WSL instance is torn down as soon as its last process exits**, taking
-  `binfmt_misc` registrations and `/tmp` with it. Anything that must persist
-  across steps has to happen inside a single `wsl.exe` invocation, or live on
-  a mounted Windows path. `scripts/wslmake.sh` exists for exactly this.
-- **`WSLInterop` claims every file starting with `MZ`** and hands it to
-  Windows, which swallows Actually Portable Executables — including the APE
-  tools cosmocc runs during its own build, so it fails before producing
-  anything.
-
-### On trusting DERP
-
-A DERP relay is untrusted by design. It only ever sees WireGuard-encrypted
-packets, so tailcat's confidentiality does not rest on the relay behaving, and
-tailcat needs no account with whoever runs it.
-
-That is not a reason to verify its certificate loosely, though — a relay that
-can be impersonated can still deny service or fingerprint who is talking to
-whom — so TLS verification is required by default and `insecure_skip_verify`
-has to be asked for explicitly. Because an Actually Portable Executable cannot
-rely on the host having a trust store at a known path, Mozilla's roots are
-compiled in; regenerate them with `scripts/gen-ca-bundle.py`.
-
-Opening the server's `FRAME_SERVER_INFO` box is also a real check rather than
-a formality: it proves the relay holds the private key matching the public key
-it greeted us with.
-
-The tailcat layer is checked the same way again: `tools/genaddrs -vectors`
-emits `tests/meow_vectors.h` using upstream's own `EncodeMeowPing`,
-`EncodeMeowed` and `DiscoPublicForNode`, so the encoded packets and the
-derived disco keys are pinned against the real implementation rather than
-against our reading of it.
-
-`make live-tailcat` is the end-to-end check: it builds the upstream Go
-binary, starts a real server, resolves the address it prints, and requires
-the C side to parse it, reach the relay, be meowed, and complete a
-handshake. Every milestone at once, against the thing we have to
-interoperate with.
-
-## TLS 1.3 is blocked on Ed25519
-
-Not on effort, and not on code size, which is what the plan originally
-assumed. This is worth writing down because the answer is the opposite of the
-obvious one.
-
-Enabling TLS 1.3 in Mbed TLS 3.6 is easy: `MBEDTLS_SSL_PROTO_TLS1_3`, the PSA
-crypto layer it requires (`MBEDTLS_PSA_CRYPTO_C` and HKDF — and *not*
-`MBEDTLS_PSA_CRYPTO_CONFIG`, whose defaults drag in ARIA, Camellia, CCM and
-DES), about twenty more source files, and a `psa_crypto_init()` before the
-first context. It builds, it links, and it costs 232 KB.
-
-It also cannot connect to a single relay.
-
-DERP servers append a self-signed **meta certificate** to the chain, encoding
-the server's public key in its CommonName so a client can skip a round trip.
-They send it only on TLS 1.3, because 1.3 encrypts the certificate chain and
-1.2 does not — see `initMetacert` in `tailscale.com/derp/derpserver`. That
-certificate is **Ed25519**, which Mbed TLS 3.6 cannot parse at all, so the
-chain is rejected whole, before any verification, with `X509 - Signature
-algorithm (oid) is unsupported`.
-
-The irony is exact: the gain 1.3 would have unlocked is upstream's "fast
-start", which reads the DERP key out of that same meta certificate — and the
-meta certificate is the thing that makes 1.3 unusable. Making it work means
-teaching a vendored TLS library to skip certificates it cannot parse in the
-middle of chain validation, which is not a change to make for an optimisation
-we do not implement.
-
-Nothing is given up by staying on 1.2 here: 1.2 with ECDHE and AEAD suites is
-not a weak configuration, and `tc_tls_last_version()` reports what was
-actually negotiated, so this is checkable rather than assumed.
-
-**Ed25519 now exists** (`tc/ed25519.h`), so the missing piece is no longer
-the algorithm — it is that Mbed TLS's X.509 parser has no hook to hand an
-unknown signature algorithm to. Teaching a vendored TLS library to call out
-to ours in the middle of chain validation is a bigger and more delicate
-change than writing the curve was, and it is still in service of an
-optimisation we do not implement. Worth revisiting; not worth rushing.
-
-## Vendoring an SSH server
-
-**Decided and done:** the subset was written, not vendored. It is kept here
-because a decision whose reasoning is thrown away is one that gets
-relitigated, and because the licence analysis is the part that would have to
-be redone first.
-
-`recv` and `ls` both sit behind SSH, and it was the largest single thing
-left. PLAN.md's original note said "realistically: vendor an existing
-implementation rather than write one", which is sound advice that turns out
-to have a licence attached, so the decision belonged here rather than buried
-in a plan.
-
-This project is **BSD-3-Clause**, matching upstream tailcat, and it links
-everything statically into one executable. That makes the licence of anything
-vendored a licence question about the *whole binary*, not about a file.
-
-### The candidates
-
-| | Licence | Server? | Notes |
-|---|---|---|---|
-| **TinySSH** | public domain | yes | ~4k lines. Uses curve25519, ed25519, ChaCha20-Poly1305 — the primitives we already have. No PTY, no port forwarding, modern algorithms only. |
-| **Dropbear** | MIT (+ public-domain libtom*) | yes | ~30k lines, and a *program*, not a library. Brings libtomcrypt and libtommath, duplicating crypto we already vendor. |
-| **OpenSSH portable** | BSD-ish, mixed | yes | The reference implementation, and deeply Unix-specific. Porting `sshd` into a library inside an APE is a large job on its own. |
-| **libssh** | LGPL-2.1 | yes | Static linking obliges us to let recipients relink. Possible for an open project, awkward for a single-file APE whose whole selling point is that it is one file. |
-| **wolfSSH** | GPLv3 or commercial | yes | GPLv3 would relicense this project. |
-| **libssh2** | BSD-3 | **no** | Client only. Listed because it is the one people suggest first and it cannot do this. |
-
-### The decision
-
-**Write the subset, and take TinySSH as the reference rather than the
-dependency.** That is what happened; see Phases 5.4 and 5.5 in the roadmap.
-
-The reasoning was that we do not need an SSH server. We need `sftp` reachable
-over SSH with publickey authentication, which is a much smaller thing:
-
-- transport and key exchange (RFC 4253) — `curve25519-sha256`, which is
-  X25519 and SHA-256, **both already here**;
-- `chacha20-poly1305@openssh.com` for the cipher, **already here**;
-- publickey userauth (RFC 4252);
-- one channel, and only the `subsystem`/`exec` request (RFC 4254).
-
-No PTY allocation, no agent forwarding, no port forwarding, no interactive
-shell, no `scp` protocol. Those are most of what makes a general `sshd` big,
-and all of them are things a drop box should *not* have.
-
-The one genuine gap **was Ed25519**, and it is now closed: `tc/ed25519.h`
-implements RFC 8032 in 877 lines, checked against RFC 8032's published
-vectors and byte-for-byte against Go's `crypto/ed25519`. So `ssh-ed25519`
-host and user keys are available without an `ecdsa-sha2-nistp256` fallback,
-and the "no unvendored crypto beyond Mbed TLS" property survives.
-
-Estimate with the crypto in hand was **~2,500 lines for the SSH subset and
-~1,500 for SFTP**, against ~30k for vendoring Dropbear and then carrying a
-second crypto stack forever.
-
-It came to about 2,900 for both, plus another 1,100 for the client halves
-that `ls` needed and the estimate had not counted — so the estimate was close
-for what it covered and forgot that a client is a separate thing from a
-server. Vendoring would have needed a port of comparable size, as the note
-below predicted, and a second crypto stack for ever.
-
-### If you would rather vendor
-
-Take **TinySSH** — public domain is the only licence here that costs nothing
-— but budget for the port rather than the drop-in: it is Unix-only, expects
-`fork`/`exec` and a supervising inetd-style parent, and depends on its own
-NaCl. Under Cosmopolitan on Windows that is the part that will hurt, and it
-is the same work as writing the subset, arranged differently.
-
-**Do not take wolfSSH** unless you intend to relicense, and **do not take
-libssh** unless you are willing to ship relinkable objects alongside the
-binary, which defeats the one-file premise.
-
-### The hazard this unlocks
-
-Worth stating before any of it is written. `recv` is a **write-only drop
-box**, and upstream's design is the one to copy rather than improve on: the
-server chooses every stored filename, so a sender can neither overwrite
-anything nor learn what is already in the directory. The recursive mode
-(`:wo+`, `--accept-dirs`) trades exactly that away, and upstream documents
-the trade rather than hiding it. Any implementation here should do the same,
-and the tests should assert the flat mode's guarantees directly.
-
-## Bugs this verification has actually caught
-
-Kept as a record, because each one says something about where the risk in this
-project really is. All were found by tooling rather than by reading the code.
-
-**1. NaCl secretbox started the keystream in the wrong place.** *(M3, found by
-generated vectors.)* NaCl takes the one-time Poly1305 key from the first 32
-bytes of the keystream and then encrypts the message from byte **32** — the
-second half of block 0 — not from block 1. I had written it as a block
-counter, which silently skipped 32 bytes of keystream. The tell was that empty
-plaintexts passed (the tag only covers the key derivation) and every non-empty
-one failed. Nothing but a differential vector would have found this quickly.
-
-**2. X25519 did not clamp the scalar.** *(M2, found by RFC 7748 vectors.)*
-`decodeScalar25519` clamps as part of X25519, so the RFC's own test vectors
-supply *unclamped* scalars and expect the implementation to do it. Mbed TLS
-also rejects an unclamped scalar outright, so this failed loudly rather than
-quietly — but only because the vectors used the RFC's inputs verbatim.
-
-**3. `mbedtls_ecp_mul` rejects a NULL RNG.** *(M2.)* It returns
-`MBEDTLS_ERR_ECP_BAD_INPUT_DATA`; it wants the RNG to randomise projective
-coordinates as a side-channel countermeasure. I had written a comment
-confidently asserting NULL was fine. The comment was wrong, and the code
-matched the comment.
-
-**4. `tls.c` used `calloc`/`free` with no `<stdlib.h>`.** *(M3, found by the
-host gcc build.)* Cosmopolitan's headers supply it transitively, so cosmocc
-never complained. An implicitly declared `calloc` is genuine undefined
-behaviour.
-
-**5. `-std=c11` hides `struct addrinfo` under glibc.** *(M3, host gcc build.)*
-Strict ISO mode suppresses the POSIX networking declarations. Cosmopolitan is
-more permissive, so again only the second toolchain noticed.
-
-**6. The build silently used the wrong compiler.** *(M1.)* `CC` is a GNU make
-builtin with a default of `cc`, so `CC ?= $(COSMOCC)` is a no-op. The first
-"passing" build was host `cc`, not cosmocc — the entire point of the project,
-quietly not happening. Fixed with `ifeq ($(origin CC),default)`, and `make
-test` now asserts every binary is a fat APE so it cannot regress unnoticed.
-
-**7. The interop harness mis-parsed hex.** *(M4.)* `sscanf("%2x")` did not
-honour the field width reliably, turning `0f` into `f9` in one byte of a key.
-The protocol code was correct; the scaffolding feeding it was not. It
-surfaced as `Received packet with invalid mac1` from wireguard-go, which
-points at the protocol and not at the test. Localising it needed a probe with
-the known-good bytes hard-coded, to prove BLAKE2s was innocent before hunting
-for the real cause.
-
-**8. The interop harness watched the wrong channel.** *(M4.)* wireguard-go's
-test TUN names its channels from the device's point of view, so packets the
-device receives arrive on `Inbound`; the harness waited on `Outbound` and saw
-nothing. Again the implementation was right and the test was wrong.
-
-**9. TCP sent uninitialised memory when the send buffer was shorter than the
-sequence space.** *(M6, found by a 40,000-byte transfer arriving as 54,087.)*
-SYN and FIN each consume a sequence number without occupying the buffer, so
-`snd_len - in_flight()` underflowed a `size_t` and `try_send` transmitted a
-full segment of whatever was in the buffer. The size mismatch was the only
-symptom; nothing crashed.
-
-**10. The JSON reader negated `INT64_MIN`.** *(Phase 2.1, found by
-UndefinedBehaviorSanitizer -- eventually.)* `-(int64_t)mag` is undefined for
-the one magnitude only the negative side can hold. UBSan had been reporting it
-for as long as the code existed, but **its diagnostics are non-fatal by
-default**: it printed a line and the suite still said `ok json 264 checks`, so
-several runs were reported as clean that were not. `SANITIZE=1` now passes
-`-fno-sanitize-recover=all`, and a finding fails the run. The lesson is not
-about the bug, which was trivial; it is that a checker whose output does not
-fail anything is a checker nobody reads.
-
-**11. A connection reset before it was accepted left a freed pointer in the
-accept queue.** *(Phase 2.1, found by mutation testing.)* This is the only
-entry found by deliberately breaking working code to see whether the tests
-noticed. Removing the accept-queue cleanup from the mux's drop path made no
-test fail -- a real gap, since the sequence (SYN queued, peer resets, loop
-reaps, application accepts) is ordinary. Notably ASan did not catch it either,
-because the freed pointer was returned and compared rather than dereferenced.
-A test for that exact sequence now exists, and the mutation fails it.
-
-**12. Handshake retries resent the identical initiation.** *(Phase 2.2, found
-by a two-hour simulation with 5% loss.)* Resending the same bytes looks like
-the thrifty choice: a fresh initiation carries a new ephemeral key and makes
-the peer repeat the expensive half. It is also exactly what initiation replay
-protection rejects, so one lost handshake packet stranded the tunnel until the
-attempt was abandoned ninety seconds later. wireguard-go builds a new
-initiation on every send for this reason. Nothing shorter than hours of
-simulated time would have found it: it needs a lost handshake message, on a
-session old enough to expire before the retries give up.
-
-**13. The test for bug 12 did not test bug 12.** *(Phase 2.2, found by
-mutation.)* `live-rekey.sh` held a session open for 280 seconds and required
-every line to arrive. With our rekey timer disabled entirely it still passed
-15 of 15 -- because WireGuard is deliberately redundant: the Go server renews
-at its own threshold if we do not. A delivery-only check proves the responder
-path and nothing about our own timer. The script now reads a summary the CLI
-emits and requires that *this* side initiated the rotations. Worth separating
-from the rest: the code was already correct, and the test was the thing that
-was wrong.
-
-**14. The Makefile had no header dependency tracking.** *(Phase 2.5, found by
-AddressSanitizer.)* Adding one member to `tc_stream` grew it from 56 bytes to
-64. Nothing rebuilt the objects that include the header, so `http.c` kept a
-stack frame laid out for the old struct while `tls.c` wrote into the new one,
-and `serve` crashed in `tc_net_tcp_connect` — three call frames from anything
-that had changed. This is not a link error: it is a program whose files
-disagree about where the fields are, and it had been latent since the first
-commit, invisible until the first change to a widely-included struct. Fixed
-with `-MMD -MP` and `-include`. ASan named the overflowing variable, its
-frame and the byte offset, which turned a mystifying crash into an obvious
-struct mismatch in about a minute.
-
-**15. The proxy killed its own process with SIGPIPE.** *(Phase 3.1, found by
-the first run of test_proxy.)* Writing to a socket whose peer has gone raises
-SIGPIPE, whose default disposition terminates the process -- and for a proxy,
-a local service exiting mid-stream is ordinary rather than exceptional. The
-test did not report a failure; it died with exit 141 and printed nothing.
-Fixed with `MSG_NOSIGNAL` per call rather than by changing the signal
-disposition of whatever program links the library, which is not a library's
-decision to make.
-
-**16. Every compressible IPv6 address formatted wrong.** *(Phase 4.3, found
-by the first disco test that printed one.)* The zero-run compressor emitted
-one colon for the run, then suppressed the separator on the group after it,
-so `2001:db8::1` came out as `2001:db8:1`. The formatter had shipped with
-exactly one IPv6 assertion covering it -- RFC 5769's STUN vector, which
-happens to have no zero groups at all -- so the entire compression path was
-dead code as far as the suite was concerned. A test vector chosen by someone
-else is only an anchor for the cases it contains. The replacement test walks
-RFC 5952's rules and then feeds our own output back through `inet_pton`,
-because a formatter checked only against a parser I also wrote proves that
-the two agree, not that either is right.
-
-**17. The server dropped the direct traffic it had just been sent.**
-*(Phase 4.4, found by the first end-to-end run.)* The two sides of a session
-decide independently where to send their own packets, so one routinely proves
-a direct path seconds before the other does -- the design says so explicitly.
-The receive side then demultiplexed arriving datagrams by asking "is this the
-path *I* chose?", which is false for exactly that window, so the client
-upgraded, sent its traffic directly, and the server threw it away. Every unit
-test passed: the state machine was right, and the code that consumed its
-answers asked the wrong question. Fixed with `tc_path_knows`, which asks
-whether the address belongs to this peer at all rather than whether we agree
-about it. The lesson is not about NATs -- it is that a component can be
-correct and still be wired up against a rule it states in its own header.
-
-**18. Editing the Mbed TLS config rebuilt nothing.** *(Phase 5.3, found by a
-link that should have worked.)* Mbed TLS reaches our config through its own
-`build_info.h`, which arrives via `-isystem` — and `-MMD` deliberately stops
-at system headers, so the dependency chain never reached
-`third_party/mbedtls_config.h`. Turning on TLS 1.3 therefore linked a
-`cipher_wrap.o` compiled against a config that no longer existed, and the
-symptom was a wall of missing ARIA and Camellia symbols that had nothing to
-do with the change. Fixed by naming the config as an explicit prerequisite.
-Same class as 14, found the same way, in the one part of the build where the
-usual mechanism was silently inapplicable.
-
-**19. The vector freshness check had never once passed.** *(Found by running
-the level 1 diagnostic for the first time in months.)* Level 1 regenerates
-`tests/crypto_vectors.h` and diffs it, on the principle that a stale
-generated header is a test that has quietly stopped checking what it claims
-to. The check was added in Phase 2.1. The cookie-exchange vectors were added
-in Phase 2.3, and wireguard-go's `CookieChecker` draws its mac2 secret and
-every reply nonce from `crypto/rand` -- so from that moment the file could
-never match itself, and the stage failed every time it ran. It simply had not
-run: level 1 is the only level that includes it, level 3 runs on every push,
-and level 1 had not been invoked since. A check nobody runs and a check that
-always fails are the same check.
-
-Two fixes, and the second is the one that matters. The comparison now
-excludes the block that cannot be reproduced, with the reason stated in both
-the script and the generated file. And level 1 gained the **eight live tests
-that were never in it** -- `live-allow`, `live-exitnode`, `live-socksudp`,
-`live-forward`, `live-genkey`, `live-multi`, `live-recv`, `live-ssh` -- three
-of which were written in the same session that found this. The README said
-level 1 ran "every live test". It ran nine of seventeen.
-
-**20. A corrupt SYN cost a table slot, permanently.** *(Found by the TCP
-fuzzer, which ran out of connections.)* The demultiplexer checks a SYN's
-flags and ports, then opens a connection and hands it the segment -- and the
-connection validates the whole thing again, checksum included, rejecting a
-bad one by dropping it without touching its state. So a corrupt SYN left a
-connection sitting in `LISTEN`, holding nothing. `accept_syn` tested only for
-`CLOSED`, so it kept it; a connection in `LISTEN` never reaches `CLOSED`, so
-the reaper could never free it; and `TC_TCP_MAX_CONNS` is 64. Sixty-four
-corrupt SYNs from an authenticated peer and the listener stopped answering
-for good. It was pushed onto the accept backlog too, so the application was
-handed a connection that would never establish and never close.
-
-Fixed by requiring `SYN_RECEIVED` -- the one state a bare SYN can produce --
-rather than enumerating the ways it can fail.
-
-**21. A peer that vanished held its slot for ever.** *(Same fuzz run, one
-layer down.)* An established connection with nothing to send has no
-retransmission timer, so nothing at all was watching it. A peer that crashed,
-was unplugged, or whose reset was lost in the tunnel left this side
-`ESTABLISHED` until the process exited. On a general-purpose host that is
-untidy; against a 64-entry table it is the same permanent exhaustion as 20,
-reached by a route that requires no hostility whatsoever -- just a laptop
-closing its lid.
-
-Fixed with keepalive probes: silence is not evidence, so after a minute of it
-a probe goes out, and the connection is dropped only after six of those go
-unanswered. Probing rather than simply timing out is the whole of it, since
-an interactive session may legitimately sit idle for hours.
-
-That fix contained a third bug and revealed a fourth. The third: the idle
-timer is re-armed by every segment that arrives, in *any* state, but is only
-acted on in the synchronised ones -- so `tc_tcp_next_deadline` would report a
-time the tick declined to act on, the deadline would never advance, and a
-caller that sleeps until the next deadline would spin at full speed instead.
-A wrong answer is loud; a busy loop is silent, and it is somebody's battery.
-Both now share one `ka_active` predicate, because the failure mode of the tick
-and the deadline disagreeing is precisely that.
-
-The fourth: our own probe carries a garbage octet, so it is answered by the
-path that re-acknowledges old *data*, and a tailcat-to-tailcat test could
-never notice that a **zero-length** probe drew no reply at all. RFC 793 asks
-for an acknowledgement to exactly that segment, and a Linux kernel at the far
-end of the tunnel sends one by default -- so its keepalives went unanswered
-and it would eventually reset a perfectly good connection. Found by mutation
-testing, not by the fuzzer: disabling the new code changed no test result,
-which is the only reason it was looked at again.
-
-All four were locked down with direct tests before the fix was believed, and
-each of those tests was checked against a mutation that reintroduces the bug
-it covers.
-
-**22. Every SSH handshake packet was four bytes out of alignment.** *(Phase
-5.4, found by the first real `ssh` client to connect.)* Whether the packet
-length field counts toward the block alignment depends on the cipher.
-`chacha20-poly1305@openssh.com` encrypts it separately under its own key and
-leaves it outside the aligned region; the `none` cipher in force before
-NEWKEYS does not, so RFC 4253's plain rule applies and the length field
-counts like everything else. We used the AEAD rule for both.
-
-Every packet of the handshake was therefore misaligned and OpenSSH rejected
-all of them with `padding error: need 212 block 8 mod 4`. Nothing offline
-could have caught it: every vector in `tests/ssh_vectors.h` is encrypted,
-because vectors are generated from the cipher, and the one test that pinned
-the padding rule directly asserted the AEAD rule against a *plaintext*
-cipher -- so it was confirming the bug. Our encoder and our decoder agreed
-perfectly with each other throughout.
-
-This is the clearest case yet for the project's own rule about anchors. The
-packet layer's vectors were produced by Go written from the same OpenSSH
-document as the C, so both sides could be -- and in this respect both were --
-wrong in the same way. Only a peer written from neither could tell.
-
-**23. A rekey request was ignored, and the client hung.** *(Phase 5.4,
-found by being asked where the limitation was written down.)* The sequence
-number is the cipher nonce, so it must never wrap, and the server stopped at
-2^32 packets rather than letting it. That much was recorded -- in the
-README's TODO list, though not in PLAN.md -- and it was the harmless half.
-
-The half that actually happens is a peer *asking* to rekey. OpenSSH starts a
-key exchange on its own schedule, and RFC 4253 section 9 has the initiator
-wait for a KEXINIT in reply. `tc_ssh_server_read` had no case for KEXINIT, so
-the request fell through to `default: break;` and was dropped in silence. The
-client then waited for a reply that was never coming: measured with
-`-o RekeyLimit=16K` over 200KB, `ssh` was killed by `timeout` after 12 seconds
-having printed **nothing at all** to stderr.
-
-Rekeying is now implemented as a responder, and three details in it are each
-a silent corruption rather than a clean failure if wrong: the session id must
-*not* change, the sequence number must *not* reset, and the two NEWKEYS
-messages are not symmetric -- our send key goes in after ours goes out, their
-receive key only after theirs comes in. All three are caught by mutation.
-
-The lesson is about the documentation rather than the code. The limitation
-had been written down, which felt like diligence, and what was written down
-described the unreachable half of it accurately and missed the half that
-happens in every long session. Being asked "is that in the plan?" was what
-produced the second reading.
-
-The test is written accordingly: it fails if the transfer is corrupted, if
-`ssh` hangs, *and* if no rekey actually took place -- because a client that
-ignored `RekeyLimit` would otherwise pass it, which is the same shape of
-mistake as a fuzzer that stopped reaching the code it was aimed at.
-**24. Bug 7, reintroduced in a new file four years later.** *(Phase 5.5,
-found by the drop box working under host gcc and failing under cosmocc.)*
-`tests/livesshd.c` needed to turn a hex key into bytes, so it grew a small
-`unhex` using `sscanf("%2x")`. That is precisely bug 7: cosmo's `sscanf` does
-not honour that field width reliably, so the key decoded correctly under
-glibc and wrongly under cosmocc.
-
-The symptom was the same as bug 7's, and just as misleading. The entire SSH
-handshake succeeded -- key exchange, host key, cipher, service accept -- and
-authentication failed with `Permission denied (publickey)`, which points at
-the authentication code. It was not the authentication code. The host key
-survived a corrupt decode because a client told not to check host keys does
-not check it; only the authorized key has to match exactly, so only it failed.
-
-Worth recording because the first instinct was to suspect the new code. The
-fix for bug 7 lived inside the file that had it, so nothing stopped the same
-mistake being made again in a file written years later -- and the second
-toolchain caught it a second time, which is the argument for having one.
-
-**25. `recv` refused every connection it existed to accept.** *(Found by
-the first run over a real tunnel.)* Connections are admitted by an accept
-filter that consults the served port set, and `recv` serves no local ports at
-all -- so the SYN for port 22, where its own SSH server listens, was refused
-before the accept loop that would have recognised it. The feature could not
-work at all, and everything it is built from was passing.
-
-Nothing offline could have found it. The SFTP policy, the SSH server and the
-drop box are each driven by a real OpenSSH over a socket, and all of that was
-green; the filter only exists on the tunnel path, and a tunnel needs a relay.
-It took one deliberate live run, which is what live-recv-serve now is.
-
-The shape is worth noting: every component was tested and the wiring between
-two of them was not, because the wiring is the part that only exists in the
-whole. That is the same reason `make live-cli` exists at all.
-
-**26. Our SSH server replied to a channel request only after doing the
-work.** *(Phase 5.5, found by our own SSH client.)* `on_start` ran the entire
-application -- the whole SFTP session -- and the `CHANNEL_SUCCESS` for the
-request that started it went out afterwards. RFC 4254 section 4 has the
-requester wait for that reply before using the channel, so a client that
-waits deadlocks: ours sent the subsystem request and blocked, the server sat
-inside the application waiting for data that would never come.
-
-It had worked against every real client tried, because OpenSSH does not wait
--- it sends optimistically. The bug was invisible until something that
-follows the specification more strictly connected, and the first thing that
-did was our own client on the day it was written. Fixed by splitting the
-decision from the work: `tc_ssh_accept_fn` answers, and only then does
-`tc_ssh_start_fn` run.
-
-**27. The SFTP client insisted on our own server's handle length.** *(Phase
-5.5, found by `make live-ls` against a real Go server.)* A file handle is
-opaque and entirely the server's to choose -- ours are eight bytes, Go's
-`pkg/sftp` uses its own, OpenSSH uses four. The client-side parser required
-exactly eight, so it interoperated with itself and nothing else. It got as
-far as a successful `stat` before failing on the first `opendir`, which is
-the most misleading place for it to stop: everything up to the point where a
-server-chosen value comes back works perfectly.
-
-Both of these are the same lesson in two directions. A protocol has two ends,
-and writing both from one reading gives two implementations that agree with
-each other. Bug 26 needed a stricter *client* than the one we had been
-testing with; bug 27 needed a server that was not ours.
-
-**28. A bare `make` stopped building anything.** *(Phase 5.9, found while
-measuring the binary for 5.10 and wondering why it had not changed.)* The
-rule that regenerates `src/usage_text.c` was written just above `all:`, and
-make takes the **first non-special target in the file** as its default goal.
-So `make` regenerated a documentation file, printed one line, exited 0, and
-built nothing. Every diagnostic level kept passing, because each of them
-names its targets. It was found by a number that refused to move: the binary
-was the same size after a change that should have grown it. The rule now
-sits below `all`, with a comment saying why it has to.
-
-
-**29. Nothing after the first non-zero stage in a diagnostic ever ran.**
-*(Found by running a level 1 diagnostic to the end, which had not happened
-before.)* `scripts/diagnostic.sh` runs under `set -e`, and `stage()` did
-`sh -c "$*"` followed by `rc=$?`. Under `set -e` the shell exits on the
-untested non-zero, so `rc` was never read: the FAIL branch, the SKIP branch
-and the summary at the bottom were all unreachable, and the comment promising
-that a stage "keeps going on failure so one broken thing does not hide the
-state of everything after it" described the opposite. Level 1 reached the
-qemu stage, found no emulator, and stopped — with twenty-four live interop
-stages, the only ones that prove interop, never run.
-
-**30. No exit code could mean "skipped".** *(Found by fixing 29 and watching
-what the newly-reachable SKIP branch reported.)* The convention was that exit
-2 meant "the tooling is not installed". Every stage is a `make` target, and
-make exits 2 for *any* recipe failure, so a script's "I have no scp" and "the
-test failed" arrive as the same byte. The live drop-box stage was failing and
-was reported as skipped: a green run with a broken test inside it, which is
-worse than the abort in 29. Moving the code to 77 does not help — make
-flattens that to 2 as well, which is worth checking rather than assuming. So
-the exit-code convention is gone; prerequisites are declared at the call site
-with `--need`, and anything non-zero is a failure.
-
-**31. Four cleanup traps aborted before cleaning up.** *(Found by 30, once a
-real failure could be seen.)* `[ -n "$pid" ] && kill "$pid"` is an AND-list,
-and it ends non-zero whenever the server has already exited — tripping
-`set -e` inside the EXIT trap, so the `rm -rf` after it never ran.
-`live-dropbox.sh` exited 1 with all six of its adversarial checks passed, and
-had leaked a temp directory on every run it had ever done; there were 31 in
-`/tmp`. Three sibling scripts carry the identical line and had been lucky.
-
-Bugs 29 and 31 are the same shell footgun in two places, and 30 is what made
-31 invisible. The harness now has a self-test: `sh scripts/diagnostic.sh
-selftest` runs synthetic stages through the real `stage()` and asserts
-nineteen things, including that exit 2 reports FAIL "because that is all make
-ever says". It runs at the start of every level, and deliberately not through
-`stage()` — if `stage()` is what is broken, a check routed through it cannot
-report.
-
-**32. `ssh` and `cp` never passed their tail through, and one way of failing
-was silent.** *(Phase 6, found by typing upstream's README at our binary.)*
-A comment in `src/cli/main.c` said those subcommands "take the tail of argv
-rather than the parsed list". They did not. So:
-
-- `tailcat-c ssh <addr> ls -la` died on `unknown flag -la`.
-- `tailcat-c cp -r photos/ <addr>:` died on `unknown flag -r` — an example in
-  our own usage text.
-- `tailcat-c ssh <addr> ls -l` **worked**, having quietly eaten the `-l` as
-  though it were the one belonging to our own `ls -l`. The remote command ran
-  without it and nothing said so.
-
-The third is the one worth remembering. The first two are an error message;
-the third is a wrong answer, and the user has no way to notice. Flag parsing
-now stops when the subcommand turns out to be `ssh` or `cp`, with `-p` the
-one exception, because upstream's `-p` is its own too.
-
-**33. `--timeout=2m` meant two seconds.** *(Phase 6, same walk.)* Upstream
-takes a Go duration; we took an integer through `strtoul`, which stops at the
-first character it does not understand and reports nothing. `--timeout=30s`
-became 30, which is right by accident and is why it survived; `--timeout=2m`
-became 2. The command still ran, it just gave up fifty-eight seconds early.
-There is now a parser in `src/duration.c` taking `ns`, `us`, `ms`, `s`, `m`
-and `h`
-and compounds of them, keeps a bare number meaning seconds, rounds up so a
-sub-second timeout cannot become zero — zero means "no deadline" to every
-caller here — and refuses everything else rather than reading a prefix.
-
-Its own tests found an overflow in it before it shipped: rounding with
-`(total + NS_PER_S - 1) / NS_PER_S` wraps for a total near the top of the
-range, and two nanosecond counts that each fit and together do not were
-accepted and returned 0. Dividing before rounding fixes it. Written down
-because the lesson is about the test, not the arithmetic: the case was in the
-file because "a sum that overflows only when added" is a thing to check, not
-because anyone suspected that line.
-
-
-**34. A port argument was read as far as it parsed and no further.**
-*(Phase 6, found while writing down the gaps rather than while testing.)*
-`tailcat-c <addr> 10.0.0.1:22` connected to **port 10** of the server and
-said nothing. `strtoul` with no endptr check stops at the first dot and
-keeps the prefix, which is bug 33's defect in a second place nobody had
-thought to look.
-
-It matters because that string is not a typo: upstream documents
-`tailcat ssh -p 10.0.0.1:22 <tc-addr>` for reaching a third address through
-an exit node, and `-p` is handed straight to the pipe form. So following
-upstream's own documentation produced a connection to the wrong port of the
-right machine.
-
-Ports now have to be the whole argument. The host:port form gets its own
-message naming the command that does work, because "bad port" would have
-been true and useless -- the user typed something valid, at the wrong
-program.
-
-Three bugs of one kind now: 33, 34, and the `-l` half of 32 are all a parser
-accepting a prefix and discarding the rest. The lesson is not about
-`strtoul`. It is that **every one of them still ran**, and the only visible
-difference between right and wrong was a number nobody had a reason to
-check.
-
-**35. A saved key's region was thrown away on every start.** *(Phase 6.5,
-found while testing `--fixed-region`, which exists to prevent exactly this.)*
-`cmd_serve` set `ci.region_id = -1` unconditionally before choosing a relay,
-discarding whatever the key file recorded. So `genkey --key k --region tok`
-printed an address naming region 304, and `serve --key k` then re-measured,
-listened on 301, and printed a different address. A client holding the first
-one dialled a relay the server was not on.
-
-Upstream, given the identical key file, comes up on 304. The whole promise of
-a saved key is that the address does not change across restarts, and the
-region is part of the address -- so this was not a cosmetic difference but
-the feature not working.
-
-**The test that should have caught it was already there, and passed.**
-`live-genkey` generates a key with a pinned region, runs each implementation
-against the other's key file, and requires the addresses to match byte for
-byte. It used `--region 301`. From where it runs, 301 *is* the nearest relay,
-so the server re-probed, landed on 301 anyway, and the two addresses agreed
-for the wrong reason.
-
-It now asks netcheck which region is preferred and deliberately pins a
-different one, so a server that re-probes visibly lands somewhere else.
-Confirmed by reintroducing the bug: the addresses then differ in their final
-character, which is the region.
-
-That is the third time in this project a test has passed by accident -- after
-bug 13 and the `has_signature` mutation -- and the shape is the same every
-time: **the test supplied the answer the code would have guessed anyway.**
-A pinned value that matches the default pins nothing.
-
-**36. `serve` would not say which kind of key it was using.** *(Same
-investigation.)* It printed "listening with new address" whether the identity
-was ephemeral or loaded from disk. Upstream prints `listening with saved key
-"name"` and documents why: the line exists so you know whether you are
-starting a fresh single-use server or re-listening on an address you may have
-shared with people months ago. Ours told you nothing, which is worst in the
-case that matters.
-
-**37. `ls <addr>:path` stopped working the moment DNS names were added.**
-*(Phase 6.6, found by `make live-ls` while preparing something else.)* The
-new resolver was wired into the `ls` dispatch, where the argument is still
-`<address>:<path>` as one string -- so it asked whether `tc...:sub` was a DNS
-name, and refused. `ls <addr>` with no path was unaffected, which is the form
-everything else exercised.
-
-It was written, committed and pushed without being noticed, because the test
-that catches it is a *live* one and lives in level 1. Levels 3 and 5 were
-green throughout. The lesson is not "run level 1 more often" -- it costs
-twenty minutes and dials someone else's relays -- but that a change to
-argument handling reaches commands whose only tests are live ones, and the
-tier has to be chosen by what the change touches rather than by how big it
-looks.
-
-**38. A full-sized channel packet overflowed the buffer it was built into.**
-*(Phase 5.6, found by `make live-files` on the first 40KB download.)* An SSH
-CHANNEL_DATA chunk was capped at the peer's `remote_max_packet`, which is
-itself capped at 32768 -- and then a nine-byte header was written in front of
-it, into a 32768-byte buffer. 32768 + 9 does not fit.
-
-Nothing had reached it in four months of use because nothing wrote a large
-enough block in one call: the drop box only ever sends short STATUS replies,
-`ls` sends short requests, and every other user of the channel writes small.
-`serve files` sends 32KB DATA replies, and the very first download failed with
-"output buffer too small" -- on both sides, since the client had the same line.
-The bound is now `remote_max_packet - TC_SSH_CHANNEL_DATA_OVERHEAD`, and the
-constant exists so the next person to write that line has to think about it.
-
-**39. Closing the socket discarded the end of every large transfer.**
-*(Phase 5.6, found by `make live-shell` asking for 200000 lines.)* Closing a
-socket that still has unread incoming bytes makes the kernel send RST rather
-than FIN, and an RST discards whatever of our output has not yet left the send
-buffer. An SSH client sends CHANNEL_WINDOW_ADJUST continuously while it reads,
-so at the end of any large transfer there is almost always something unread.
-
-`seq 1 200000` came back as 198436 lines. Then 200000. Then 198436 again. The
-symptom was a transfer that looked entirely successful and was simply short, at
-a length that depended on timing -- and the same cause was behind the
-"Connection to ... closed by remote host" that every client had been printing
-since the SSH server was written, which had been filed away as cosmetic. It was
-not cosmetic; it was the client reporting a reset connection, which is exactly
-what it was.
-
-The wind-down now waits for the peer's CHANNEL_CLOSE before the caller drops
-the transport. Two things about this one are worth keeping:
-
-- **It affected every service, not the new one.** `recv` and `ls` had been
-  carrying it for months. They never showed it because a drop box upload is
-  the client writing and the server replying "ok" -- there is nothing at the
-  end to lose. It took a service that *sends* a lot to make it visible.
-- **The obvious fix was wrong.** Sending SSH_MSG_DISCONNECT looks like the
-  polite ending and makes OpenSSH exit 255: it reads a disconnect as the
-  server hanging up, and discards the exit status just delivered. Tried,
-  measured, reverted, and the comment in the code says so, because it is the
-  kind of thing a future reader would otherwise add back.
-
-Two more from the same afternoon, both in the shell's pump and both producing
-the same truncated-but-plausible output: a drain loop that stopped when the
-*child* exited rather than when its *output* ended -- a shell can leave tens of
-thousands of lines in a pty after it has been reaped -- and a `poll` that only
-read on POLLIN. Once a hung-up pty has nothing left to deliver it reports
-POLLHUP alone, and the end-of-file itself (on Linux, `read` failing with EIO)
-is only handed to something that actually calls `read`. A loop that waited for
-POLLIN therefore never learned the session was over, and hung with the child
-long since gone.
-
-**40. `ssh -i key <addr>` could not find its address.** *(Phase 5.6, found by
-`make live-ssh-serve` needing to offer an identity file.)* `tailcat-c ssh`
-read argument zero as the destination, so any flag in front of it — `-i`,
-`-o`, `-l`, `-p` — was taken for the address and refused with "-i is neither a
-tailcat address nor a DNS name". `cp` next door had always scanned its
-operands for the one that looked like an address; `ssh` never did, because the
-first argument usually *is* one.
-
-It survived the whole of the README walkthrough because every example there
-puts the address first, which is what a README does. The scanner now walks
-OpenSSH's own flag letters and lives in `shquote.c` with 26 tests, because
-"which argument is the destination" is exactly the kind of pure logic that
-should not have been buried in a 6,700-line `main.c` where nothing could
-reach it.
-
-**41. Bug 39's fix hung the tunnel.** *(Mine, same afternoon, found by the
-second session of `make live-ssh-serve`.)* Waiting for the peer's
-CHANNEL_CLOSE is right for a kernel socket and wrong for this tunnel: the read
-callback there has no deadline, and an `ssh` whose ProxyCommand is killed when
-it exits can leave without ever sending one. The wait then never ended, and
-since the server takes one SSH session at a time, *every* later session was
-refused — a server that worked once and then silently stopped.
-
-`recv` never showed it, which is the interesting part. A drop box session ends
-when the client closes the channel, so `peer_closed` was already set and the
-wait was skipped. A shell session ends when the client sends EOF, which is not
-the same thing. Two services, the same wind-down, and only one of them reached
-the new code.
-
-The wait is now the caller's decision, because only the caller knows what its
-transport does on close.
-
-**42. Our own TCP threw away the end of every large transfer.**
-*(Phase 5.6, found by `make live-ssh-serve` asking for 50000 lines and getting
-45541.)* Bug 39 one layer down, and the same sentence describes it:
-`tc_tcp_mux_close` **aborts** the connection — its own doc comment says
-"aborts one connection and drops it immediately" — so anything still in the
-send buffer when a session ended went nowhere.
-
-Two things make this one worth the space. The first is that **it was never the
-shell's bug**: `recv` and `ls` had carried it since the SSH server was
-written, and it took a service that finishes with tens of kilobytes still
-moving to make it visible, because the last thing a drop box sends is a
-nine-byte STATUS that is acknowledged long before the session ends. The second
-is that **the same mistake was waiting at two layers**, made independently,
-months apart, and both times it produced a transfer that looked entirely
-successful and was simply short. Neither was reachable by a test that did not
-send a lot of data and then count how much arrived.
-
-The fix is the ordinary one — FIN, wait for the send buffer to drain, bounded,
-then drop — and the bound matters as much as the wait: a peer that has stopped
-acknowledging must not hold the serve loop open.
-
-The pattern is hard to miss: **four of the first six came from running the
-same code through a second, stricter environment**, and the two crypto bugs
-came from comparing against a reference implementation rather than against my
-own expectations. Neither unit tests nor code review would have found most of
-them.
-
-Bugs 7 and 8 are worth separating out, because they are the opposite failure:
-**the implementation was correct and the test harness was broken**, in both
-cases with a symptom that pointed squarely at the implementation. When an
-interop test fails, the scaffolding deserves as much suspicion as the code
-under test.
-
-**43. The real `tailcat ls` could not talk to our file server or drop box.**
-*(Phase 6.7, found by walking upstream's README a second time.)* Our SSH server
-set `any_key_authenticates`, which demands the publickey method with a valid
-signature and refuses `none`. Upstream's server sets `NoClientAuthHandler`
-whenever it has no authorized keys, and its `ls` client sets no `Auth` field at
-all — `none` is the only method it ever offers. So the reference implementation
-could not list our server:
-
-```
-ssh: unable to authenticate, attempted methods [none], no supported methods remain
-```
-
-Demanding a key that is then not checked was also theatre: the server accepts
-*any* key, so requiring one proved only that the client held the private half
-of a key it had invented for the occasion. The tunnel did the authenticating,
-which is what that flag means.
-
-**The shape of the gap is the lesson.** The live suite could not see this,
-and not by accident:
-
-| test | direction | why it passed |
-|---|---|---|
-| `live-ls` | our `ls` → **their** server | theirs accepts `none` |
-| `live-recv-serve` | `scp` → our server | `scp` always offers a key |
-| — | **their `ls` → our server** | **nothing** |
-
-Two tests each covered one side of a square and the empty corner was the
-broken one. A suite can have high coverage of *code* and a hole like this in
-its coverage of *directions*, and no amount of testing against ourselves would
-have found it — only building the other implementation and pointing it at us.
-`make live-ls` now runs both ways, and checks that the drop box still refuses
-them.
-
-**44. `cp -r` was broken, in a command our own documentation recommends.**
-*(Phase 6.7, same walk.)* `cp` emitted `--` and then every argument, so a flag
-in front of the operands landed after the separator: `scp: stat local "-r": No
-such file or directory`.
-
-This is bug 32's shape in the command next door. That walk fixed `ssh` and the
-`serve ssh` work fixed `ssh`'s scanning again as bug 40; `cp` was never given
-either treatment, and `cp -r` is in upstream's README *and* in `doc/usage.md`.
-Twice now this project has shipped a broken command that its own documentation
-tells people to run, and both times a walk of the documentation is what found
-it.
-
-The fix needed a *second* flag table rather than reusing `ssh`'s, which is
-worth knowing: scp's `-p` preserves timestamps and ssh's `-p` is the port, so
-scanning an scp command line with ssh's table swallows the first operand — the
-file being copied. Seven tests pin the distinction.
-
-**45. A saved key that embedded its relay was served without it.**
-*(Phase 6.8, found by implementing `genkey --embed-derp-map`.)* Two halves,
-both older than the flag that exposed them.
-
-`region_id == 0` used to mean one thing -- "the file named no region, so
-measure one at startup" -- and a key with its relay's hostnames embedded is
-exactly that shape, because the nodes replace the ID. So serving one
-re-measured the nearest relay and published an address naming a region number,
-while the address the user had already handed out named a host.
-
-Then the address builder collapsed embedded regions back to an ID unless
-`--full-address`, using "the region carries an inner ID" as its test for
-"this was resolved at startup". Upstream writes that inner ID, so its keys
-were indistinguishable from resolved ones. Ours round-tripped correctly only
-because our *writer* happened to omit the inner ID -- an accident, not a
-design.
-
-**This was breaking upstream's key files before this program could write
-one.** `tailcat genkey --embed-derp-map` has existed all along; `serve --key`
-on one was already wrong, and no test noticed because nothing here could make
-such a key to compare against. The fix for both halves is checked by
-generating with either binary and serving with the other: the addresses are
-now byte-identical in both directions.
-
-**46. `#ifdef __APPLE__` in a binary that starts on six systems.**
-*(Phase 6.8.)* `config_dir()` chose between `~/Library/Application Support`
-and `~/.config` at compile time. cosmocc defines neither `__APPLE__` nor
-`__linux__`, so the macOS branch was dead in every shipped build: on macOS we
-wrote keys to `~/.config/tailcat/keys/` while the real tailcat used
-`~/Library/Application Support/tailcat/keys/`, and the two implementations
-could not read each other's saved keys there.
-
-What makes this one worth the space is that **the rule was already written
-down, in this repository, and the tool to follow it already existed**.
-`include/tc/browser.h` says:
-
-> The opener depends on the operating system, which a fat APE does not know
-> until it runs. `#ifdef __APPLE__` is a question about the compiler, and the
-> same binary starts on six systems; `tc_host_os` asks Cosmopolitan at
-> runtime instead.
-
-That paragraph was written to explain a decision two files away from the code
-that contradicted it. Knowing the principle, documenting the principle, and
-building the helper for it were not enough; only going looking found the
-place it had not been applied.
-
-**47. The `/proc/self/exe` lookup never ran.** *(Phase 6.8, same look.)*
-`self_path()` guarded it with `#ifdef __linux__`, which cosmocc does not
-define, so every shipped build fell through to `argv[0]` -- on Linux too. Its
-own comment says why that is not enough: "a program found through PATH gets a
-bare name, and ssh runs the ProxyCommand through a shell whose PATH may
-differ." So `tailcat-c ssh`, invoked by bare name, handed ssh a ProxyCommand
-that only worked if the shell's PATH happened to agree.
-
-Cosmopolitan resolves the executable path itself on all six targets, so the
-answer was `GetProgramExecutableName()` rather than any guess of ours.
-Invoked through PATH, the ProxyCommand is now an absolute path.
-
-**48. `%AppData%` was read with the wrong case.** *(Phase 6.8, found while
-fixing 46 -- on the machine this is being written on.)* Windows environment
-variables are case-insensitive and Go reads them through
-`GetEnvironmentVariable`, so upstream's `os.UserConfigDir` finds `AppData`
-however it is spelled. Cosmopolitan's `getenv` matches exactly, and what is
-exported is `APPDATA`. The lookup missed, and **every Windows key went to
-`~/.config` instead of `%AppData%\tailcat\keys`** -- the same interop failure
-as bug 46, on the platform we actually test.
-
-Fixing the spelling then exposed an ordering bug the typo had been hiding:
-WSL exports the Windows `APPDATA` into the Linux environment, so a Linux run
-would have begun writing keys under `/mnt/c`. The branch had never been
-guarded by platform; it had simply never matched. It is now inside the same
-runtime `tc_host_os()` test as bug 46.
-
-Three bugs in one function, all the same mistake in different clothes: asking
-a question about the machine in a way that only happens to work on the machine
-it was written on. That the fat APE's whole premise is *one binary, six
-systems* is what makes it the mistake this project is most exposed to.
-
-Bugs 39 and 42 are worth reading together, because they are the same mistake
-at two layers of the same stack, made months apart, and both were found by one
-test that sent a lot of data and counted what arrived. Closing a connection
-that still has bytes on it discards them — in the kernel's TCP and in ours —
-and the symptom in both cases was a transfer that reported success and was
-simply short. Nothing about either was visible to a test of what the code
-*does*; only to a test of how much of it came out the other end.
-
-Multi-client serving repeated that lesson three times in one sitting, and all
-three looked like the server hanging: a bare `wait` that also waited on the
-server and the local service, which never exit; a background job inheriting
-stdout and holding the pipe open after the test had finished; and a
-`pkill -f tailcat-c` that matched the shell whose own command line contained
-that string, so the cleanup killed the thing running it. The feature under
-test worked first time. The harness cost more than the feature.
-
-Bugs 10 and 13 are the uncomfortable ones, and they are the same failure in
-two shapes: a check that cannot fail is not a check. One was a sanitizer whose
-findings did not stop the run; the other was a live test that passed with the
-feature it existed to test switched off. Both were caught by asking what would
-have to break for this to go red -- which is now the habit: **11 and 13 came
-from deliberately breaking working code to see whether anything noticed, and
-12 from a simulation long enough for the bug to have room to appear.**
-
-## Limitations
-
-Current, and deliberate unless noted.
-
-### Protocol scope
-
-- **Direct paths, with limits.** A session starts on the relay and moves to a
-  direct path once one has been proven, falling back if it stops working. What
-  is missing is the rest of what `magicsock` does: no relay-to-relay
-  discovery, no UDP relay allocation (disco `0x04` and up), no path MTU
-  discovery, and no interface preference beyond the round trip it produces.
-  Two peers that both sit behind symmetric NATs will stay on the relay, which
-  is the correct answer rather than a limitation -- but upstream has a UDP
-  relay for that case and we do not.
-- **UDP is reachable only through SOCKS.** `socks` implements UDP ASSOCIATE,
-  which is upstream's surface for it too -- `forward` is TCP-only in both
-  implementations. Fragmented SOCKS datagrams (`FRAG` non-zero) are dropped,
-  which RFC 1928 permits and every implementation does.
-- **The SSH server serves sftp and nothing else.** No shell, no PTY, no
-  port or agent forwarding, no `exec` for `recv` — every one of those is a
-  way to reach something other than the directory being served, and a drop
-  box needs none of them. `ssh` and `cp` remain *clients* that exec the
-  system ssh and scp with us as a `ProxyCommand`, which is exactly what
-  upstream does for those two as well.
-- **No rekeying as the initiator.** A peer may start a key exchange at any
-  point and we complete it, keeping the session id; we never start one. The
-  sequence number is the cipher nonce and must not wrap, so a session stops
-  at 2^32 packets — unreachable against any peer that rekeys at all.
-- **No WASM build.** Cosmopolitan does not target it.
-- **`ls` is in-process, as upstream's is.** Upstream's `ls` is the one file
-  command it does *not* shell out for: it links `golang.org/x/crypto/ssh`
-  and `github.com/pkg/sftp` and drives them over its own tunnel. Ours does
-  the same with `tc/sshclient.h` and the client half of `tc/sftp.h`, so it
-  needs no `sftp` binary — which on Windows is not a given — and prints what
-  upstream prints. `make live-ls` checks it against a real Go file server.
-
-  What it does not do is read files: `ls` lists, and there is no `get`. A
-  read client is a different feature from a listing one, and `cp` already
-  covers fetching by execing scp.
-- **`ssh` turns off host key checking**, because the destination it gives ssh
-  is a hash of the address rather than a host anyone holds a key for, and the
-  address already authenticates the server: reaching it required the
-  pre-shared key and the server's public key. A `known_hosts` entry keyed on a
-  synthetic name would add a prompt and no security.
-- **`socks` reaches one server**, the one in its address. Upstream can route
-  across several at once by giving each a `tc...` hostname; we take only the
-  one from the command line.
-
-  Destinations *are* honoured now, following upstream's rule: the hostname
-  `server.tailcat` (or an empty host) means the server itself, and anything
-  else is a destination to reach **through** it, which needs `serve
-  exit-node`. **This changed in Phase 5**: `socks` used to ignore the
-  destination host entirely and use only the port, because there was no way
-  to reach anything else. A client that relied on that needs to say
-  `server.tailcat` now -- which is also what it would have to say to
+**[tailcat](https://github.com/tailscale/tailcat), rewritten in C and built by
+the [Cosmopolitan C Compiler](https://justine.lol/cosmopolitan/) into a single
+file that runs on six operating systems and two processor architectures.**
+
+Upstream tailcat is a Go program: a remix of Tailscale's open source pieces
+that gives you a WireGuard-encrypted tunnel between two machines with no
+Tailscale account, no control plane, and no root. One side runs a server and
+gets back a short **tailcat address**; the other side passes that address to a
+client. You exchange the address however you like -- chat, email, a DNS record
+-- and everything after that is encrypted end to end. The first connection
+bootstraps through a DERP relay, and then the two sides look for a direct
+peer-to-peer path and usually find one.
+
+This program does the same job, from scratch, in C.
+
+`tailcat-c` is one file. Not one per platform -- **one file**, an [Actually
+Portable Executable](https://justine.lol/ape.html) carrying both x86-64 and
+aarch64 code and running unmodified on Linux, macOS, Windows, FreeBSD, OpenBSD
+and NetBSD. No runtime, no installer, no shared libraries, nothing to
+configure. Copy it and run it.
+
+It is not a wrapper. No Go is involved in the build and none of Tailscale's
+code is linked in: the WireGuard implementation, the Noise handshake, the DERP
+relay client, the NAT-traversal protocol, the TCP/IP stack, the SSH server and
+client and the SFTP layer are all written here. The only third-party library is
+[Mbed TLS](https://github.com/Mbed-TLS/mbedtls), for TLS to the relay.
+
+**It interoperates with upstream in both directions**, which is the point and
+the only claim worth making. A real Go `tailcat` client reaches a `tailcat-c`
+server, and a `tailcat-c` client reaches a real Go `tailcat` server. Both
+directions are checked against the real binary over real relays before every
+release.
+
+For how that was verified, and the 48 bugs the verification caught, see
+[PORT.md](PORT.md). This file is the manual.
+
+## What this port does not do
+
+Most of upstream's surface is here. These are the parts that are not. None of
+them is an oversight: each is either a deliberate trade or something the
+toolchain cannot reach.
+
+- **There is no Go library.** Upstream's CLI is a thin shell over an importable
+  package, and a large part of its documentation is that API. Here the
+  command-line tool *is* the program. Everything it can do it does through
+  flags, and nothing is importable. To embed tailcat in a Go program, use
   upstream.
 
-  Hostnames are resolved **on the client's machine**, as upstream resolves
-  them. SOCKS5 exists partly so a proxy can resolve names, and one that
-  refused them would break every ordinary client -- but the consequence is
-  real: the query is visible to whoever sees this machine's DNS, and a name
-  that means something different on the far side of the tunnel resolves to
-  the wrong thing.
-- **netcheck does not probe hairpinning or port mapping.** A relay is chosen
-  by STUN round trip as upstream's netcheck does, and the NAT mapping is
-  classified as stable or destination-dependent. What is missing is whether
-  we can reach our own mapped address, and UPnP/PMP/PCP -- each a separate
-  mechanism rather than a reading of these probes. `tailcat-c netcheck`
-  prints what is measured.
-- **`serve` with no ports handles one client and one connection**, then
-  exits -- it writes to one stdout, so a second client would have nowhere to
-  go. That is upstream's behaviour too. `serve <ports>` has no such limit and
-  takes up to 8 clients and 64 connections at once.
-- **The address is a bearer credential.** Anyone holding it can connect, so
-  it is exactly as secret as the least careful place it has been pasted, and
-  it cannot be narrowed after the fact. It is the only
-  credential -- *unless* `--allow` is given, which restricts by client node
-  key exactly as upstream's does. Without it, and especially with `serve
-  exit-node`, anyone holding the address can reach anything the serving
-  machine can, including its own loopback services and its cloud metadata
-  endpoint. `--allow` is the answer and it is off by default, which is
-  upstream's default too.
+- **There is no browser build.** Upstream compiles to WebAssembly and has a web
+  demo that interoperates with the CLI. Cosmopolitan does not target
+  WebAssembly, so this cannot. That is a toolchain limit, not a backlog item.
 
-### TLS
+- **TLS 1.2 to the relay, not 1.3.** The relay connection is TLS and this one
+  negotiates 1.2. The blocker is Mbed TLS's X.509 parser rather than the
+  handshake: it will not parse the Ed25519 certificates the 1.3 path needs.
+  The tunnel inside is WireGuard either way, so this affects how the relay
+  connection is secured and nothing about your data.
 
-- **TLS 1.2 only**, and not for the reason this entry used to give. Enabling
-  1.3 in Mbed TLS 3.6 turned out to be easy; what blocks it is that DERP's
-  1.3-only meta certificate is **Ed25519**, which Mbed TLS cannot parse, so
-  the chain is rejected whole. See
-  [TLS 1.3 is blocked on Ed25519](#tls-13-is-blocked-on-ed25519). Tailscale's
-  relays accept 1.2 and ECDHE with AEAD suites is not a weak configuration —
-  but it does mean upstream's "fast start" optimisation is unavailable, since
-  reading the relay's key from that certificate requires 1.3.
-- **The CA bundle is a point-in-time snapshot** of Mozilla's roots, compiled
-  in and refreshed only by re-running `scripts/gen-ca-bundle.py`. A root
-  distrusted upstream stays trusted here until someone regenerates it.
-- **No revocation checking.** No OCSP, no CRLs. Mbed TLS supports neither well
-  in this configuration.
-- **The cipher suite list is trimmed** to what the config enables. A relay
-  demanding something we did not compile in will fail the handshake rather
-  than negotiate down.
+- **Fewer SSH key algorithms.** An authorized key may be ed25519, ECDSA on
+  P-256 or P-384, or RSA verified with SHA-256 or SHA-512 -- which covers every
+  key anyone actually has. Upstream additionally takes `ssh-rsa` and `ssh-dss`,
+  which sign with SHA-1; the `sk-*` hardware-token forms; P-521, which this
+  Mbed TLS build does not carry; and OpenSSH certificates. A line naming one of
+  those is skipped and counted, and a file with no usable key left is an error
+  rather than a server nobody can log in to.
 
-### WireGuard
+- **No pseudo-terminal on Windows.** Cosmopolitan's `forkpty` is `ENOSYS`
+  there, so `serve ssh` sessions on Windows run on pipes -- the same fallback
+  OpenSSH uses, which means no job control and no terminal resizing on that
+  platform. Every other platform gets a real pty.
 
-- **No persistent keepalive.** The passive keepalive is implemented -- a data
-  packet is answered with an empty one if nothing else goes back within ten
-  seconds -- but there is no configurable interval for holding a NAT binding
-  open, which is moot while every path goes through a relay.
-- **Demanding cookies is off by default.** The exchange is implemented in
-  both directions, but `tc_wg_peer_set_under_load` has to be turned on before
-  we ask a peer for one. It costs an extra round trip on every handshake, and
-  the traffic reaching a tool like this is already bounded by the relay.
-  Answering a peer that demands one is unconditional.
-- **No handshake rate limit.** Initiation replay is rejected, but a peer that
-  floods us with *fresh* initiations will make us do the expensive half of a
-  handshake each time. wireguard-go caps this at one per 20 ms. Nothing here
-  does, which matters more once 2.3 brings cookies.
-- **No index table.** Handshake indices are random 32-bit values with no
-  check for collision, which is fine for one peer and would not be for many.
+- **Smaller concurrency limits.** Eight tunnel clients at once, and `socks`
+  holds up to four servers. Upstream's limits are whatever the machine will
+  bear. These are fixed allocations, chosen so the program never calls `malloc`
+  on a path an attacker can reach.
 
-### TCP
+- **Four of the six platforms have never been run.** Linux and Windows are
+  tested on every release run, on both architectures. macOS, FreeBSD, OpenBSD
+  and NetBSD are compiled and linked into the same binary and have never
+  executed an instruction. Treat them as untested. The plan for fixing that is
+  [BSD-plan.md](BSD-plan.md).
 
-- **No SACK, timestamps or window scaling.** Throughput over a long fat pipe
-  will be poor; over a relay with a 64KB window it is adequate.
-- **No fast recovery**, only fast retransmit: after three duplicate ACKs the
-  window is halved and one segment resent, then slow start resumes.
-- **The MSS is fixed at 1140** and derived from tailcat's 1232-byte maximum
-  UDP payload. There is no path MTU discovery, and nothing fragments, so a
-  smaller path would black-hole rather than degrade.
-- **`tc_wg_timestamp_force_offset_ms` and `tc_tcp_force_next_iss` exist for
-  tests only.** The first moves the TAI64N clock, which is precisely what an
-  attacker replaying an initiation would want; the second makes the initial
-  sequence number predictable, which is what makes blind stream injection
-  practical. Both are documented as such at their definitions.
+- **`readme` prints something else.** Upstream embeds its own README;
+  `tailcat-c readme` embeds [doc/usage.md](doc/usage.md), a concise manual
+  rather than a document about a port.
 
-### Implementation
+Smaller differences are noted where they come up below. The full
+feature-by-feature comparison, including everything that *is* here, is the
+table in [PORT.md](PORT.md#features).
 
-- **A read timeout is recoverable and a write timeout is not.** Both exist
-  (`tc_derp_set_read_timeout`, `tc_derp_set_write_timeout`), but they are not
-  symmetric: a timed-out read leaves the TLS record layer holding what it
-  had, so a later read resumes mid-record, whereas a timed-out write may have
-  emitted part of a frame and the stream cannot be trusted afterwards. The
-  headers say so at both declarations.
-- **A `tc_derp_client` is not safe for concurrent use.** Send and receive both
-  touch the same stream with no lock, and both use thread-local scratch
-  buffers of about 64KB each.
-- **Address parser limits are compile-time**: at most
-  `TC_ADDR_MAX_REGIONS` (2) regions and `TC_ADDR_MAX_NODES` (8) nodes. Real
-  addresses carry one region with one or two nodes, so this is ample, but a
-  hand-built address with more is rejected rather than truncated.
-- **The CBOR reader is stricter than Go's** in two ways that could in
-  principle reject something upstream accepts: it refuses indefinite-length
-  items and tags. tailcat's encoder emits neither, so this has never fired,
-  but it is a deviation rather than a pure subset.
-- **`tc_conn_info` is several kilobytes.** Callers should heap-allocate it
-  rather than put it on a small thread stack.
+## Install
 
-### Security posture
+There are no packages and no per-platform downloads, because there is nothing
+to choose between: the binary is the same file everywhere.
 
-- **No stack protection in the shipped binary.** See the Cosmopolitan notes
-  above; this is forced by the fat build, not chosen. The sanitizer and fuzz
-  builds do have it.
-- **Fuzzing is a homegrown mutation fuzzer**, not coverage-guided. It runs
-  under ASan and UBSan and checks real invariants, but it is not libFuzzer and
-  cosmocc ships no libFuzzer or ASan runtime to make it one.
-- **No constant-time audit has been done** beyond writing the primitives in a
-  data-independent style and using Mbed TLS for the hard parts. No timing
-  measurements have been taken.
-- **Key zeroization is best-effort.** Key material is wiped with an explicit
-  memset-through-a-volatile-pointer, but nothing prevents the compiler or the
-  OS from having copied it elsewhere first.
-- **No CI.** Everything here was run by hand on one machine, on Linux under
-  WSL. The binaries are fat and should run on macOS, Windows and the BSDs —
-  but that has not been tested on any of them.
+Build it with [cosmocc](https://github.com/jart/cosmopolitan):
 
-## Known TODOs
+```sh
+$ make
+$ ./build/cosmo/tailcat-c version
+```
 
-Roughly in the order they should be picked up.
+That produces `build/cosmo/tailcat-c`. Copy it to any of the six supported
+systems and run it; on Windows, rename it to `tailcat-c.exe` first.
 
-- [x] **TCP keepalive and idle timeout.** Done, and overdue: see bug 21. An
-      established connection with nothing to send had no timer at all, so a
-      peer that vanished held its table slot until the process exited. After
-      `TC_TCP_KEEPALIVE_IDLE_MS` of silence a probe goes out, and after
-      `TC_TCP_KEEPALIVE_PROBES` unanswered ones the connection is dropped.
+`make test` builds and runs the test suite. `make CC=gcc SANITIZE=1 test` does
+the same under the host compiler with AddressSanitizer and
+UndefinedBehaviorSanitizer, which is worth doing: the two toolchains disagree
+often enough to be useful.
 
-      What remains, and is much smaller: a connection in `FIN_WAIT_2` whose
-      peer is alive but never closes. The probes are answered, so it is not
-      the vanished-peer case, and no timer bounds it. Linux caps it at 60
-      seconds (`tcp_fin_timeout`) for the same reason we would need to.
-- [ ] **Reaping is caller-driven.** `tc_tcp_mux_reap` has to be called or
-      closed connections hold their table slots; nothing does it on a timer.
-- [x] **Tiered local diagnostics** (`make diag5/3/1`) with a pre-push hook.
-      Deliberately not hosted CI: the live tests dial Tailscale's production
-      relays, and pointing a robot at someone else's infrastructure on every
-      push is not a reasonable default.
-- [ ] **Run the aarch64 half.** `check-fat` proves it compiles, links and is
-      present in every binary; for most of this project's life nothing had
-      ever *executed* it, which made it the largest untested claim here.
-      **Three of the four rungs are now done and the suite passes on aarch64
-      instructions**; the last one needs hardware, or a full-system emulator
-      to exercise Cosmopolitan's own aarch64 runtime rather than only ours.
-      - [x] **Build x86_64 with `-funsigned-char`** and run the whole suite —
-            `make test-unsigned-char`, and a level 1 stage.
+## Usage
 
-            The concern was real and now measured: `__CHAR_UNSIGNED__` is
-            **undefined for cosmo's x86_64 and defined for its aarch64**, so
-            plain `char` is signed in one half of every fat binary we ship
-            and unsigned in the other. `if (c < 0)` on a `char` means
-            different things in the two halves, and `json.c`, `cbor.c`,
-            `base64url.c` and `http.c` are full of character handling that
-            *mostly* uses `uint8_t`. "Mostly" was the word hiding it.
+### Pipe stdin/stdout between two machines
 
-            All 35 test binaries pass under the other signedness, so the
-            arithmetic is clean. That removes the largest *class* of aarch64
-            risk without an emulator.
-      - [x] **qemu-user** — `make test-aarch64`, which needs
-            `qemu-user-static` installed and skips with instructions when it
-            is not.
+The server starts and prints its ephemeral address:
 
-            The plan assumed this would need `assimilate` to flatten an APE
-            into a plain ELF. **It does not.** cosmocc already leaves a plain
-            statically-linked aarch64 ELF beside each binary as
-            `<name>.aarch64.elf`, and qemu-user runs those directly — no APE
-            loader, no binfmt registration.
+```sh
+$ tailcat-c
+# listening with new address: tcXXXXXXXXX
+(waiting)
+```
 
-            **Run, and it passes.** All 36 test binaries and 9,979 assertions,
-            on real aarch64 instructions under qemu-user 8.2.2, first attempt,
-            including the parts most likely to be architecture-sensitive:
-            Ed25519's 1,511 checks of bignum arithmetic, 842 of Noise, 1,241
-            of the UDP mux, and the whole SSH and SFTP stack.
+The client sends to it:
 
-            Two of everything, both halves executed. Until this ran, half of
-            every binary in this repository had been compiled and never once
-            invoked, and the case for it resting on `-funsigned-char` above
-            was an argument rather than a measurement.
+```sh
+$ echo hello | tailcat-c tcXXXXXXXXX
+```
 
-            Ubuntu ships the emulator as `qemu-aarch64-static` and not
-            `qemu-aarch64`, which is why the level 1 stage accepts either
-            name.
-      - [ ] **qemu-system** with a real aarch64 Linux: slow, but the only
-            option that exercises Cosmopolitan's own aarch64 runtime rather
-            than just our instructions. qemu-user translates syscalls to the
-            host kernel, so it tests our code and not Cosmopolitan's.
-      - [ ] **Real hardware** beats all of the above if any is to hand.
-- [ ] **Test on macOS and the BSDs.** Both architectures now execute their
-      own instructions, so what is left is the *operating systems*: Linux and
-      Windows are covered and the other four are not. That is now the largest
-      untested claim in the project, and unlike the aarch64 half it cannot be
-      closed with an emulator and a package — it needs the machines.
-- [ ] **Thread-safety review** of `tc_derp_client`, or an explicit statement
-      that callers must serialise it. Nothing here is threaded today — the
-      SSH server and client are blocking state machines driven by an event
-      loop, which is why their reads pump rather than wait — so this is about
-      what a future caller may assume, not about a bug.
-- [ ] Revisit **TLS 1.3**. Ed25519 now exists here, so the remaining blocker
-      is narrower than it was: Mbed TLS's X.509 parser has no hook to hand an
-      unknown signature algorithm to ours, and the certificate in question is
-      one we would then skip rather than verify. Still in service of an
-      optimisation we do not implement.
-- [ ] Refresh the **CA bundle** and decide on a cadence for it.
-- [ ] Consider making the address-parser limits runtime-configurable.
-- [ ] **Refresh the DERP map cache in the background** rather than only on a
-      miss, so a long-lived process does not pay a fetch mid-session.
-- [x] **Rekeying for the SSH server.** Done as a responder: a peer may
-      start a key exchange at any point and we complete it, keeping the
-      session id fixed so the new keys stay bound to the identity proven at
-      the start. `make live-sshd` moves 2MB with `RekeyLimit=16K`, which is
-      about 120 exchanges, and requires the byte count to survive all of
-      them. We never initiate, so the sequence number wrapping at 2^32
-      packets is still a hard stop -- unreachable against any peer that
-      rekeys at all. See bug 23.
-- [ ] **Fuzz the DERP frame codec.** It parses attacker-influenced lengths
-      straight off a socket, which is the same shape as the TCP reassembly
-      queue, and that is where bugs 20 and 21 came from. It has vectors and
-      no fuzzer.
-- [ ] **Extend mutation testing beyond the modules that have had it.** Path
-      discovery, the UDP mux, TCP, the SSH wire format, the packet layer, key
-      exchange, userauth, channels and the drop box have all been mutated;
-      the address codec, CBOR, JSON, Noise and DERP have not. Every module
-      that has been mutated so far gave up at least one untested assertion,
-      and two of them gave up a real bug.
+and the server prints what arrived, then exits:
 
-## Roadmap
+```sh
+$ tailcat-c
+# listening with new address: tcXXXXXXXXX
+hello
+$
+```
 
-- [x] **M1 — Addresses.** base64url, strict CBOR, the `Addr` codec, golden
-      vectors, differential testing against Go, fuzzing.
-- [x] **M2 — Crypto.** X25519, ChaCha20-Poly1305 and the CSPRNG from a pinned
-      Mbed TLS 3.6.7; BLAKE2s, HMAC-BLAKE2s and WireGuard's KDF1/2/3
-      implemented here, because Mbed TLS has no BLAKE2s and Noise needs it.
-      Vectors are generated from the same Go libraries WireGuard uses, with
-      RFC 7693 and RFC 7748 values as external anchors.
-- [x] **M3 — DERP client.** TCP, TLS 1.2 with certificate verification
-      against 121 compiled-in roots, the HTTP upgrade, the frame codec, the
-      NaCl-box key exchange and the send/receive loop. Verified end to end
-      against a production Tailscale relay by `make live`.
-- [x] **M4 — WireGuard.** The Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s
-      handshake, transport encryption and the 2048-bit sliding replay window.
-      Verified against real wireguard-go by `make live-wg`, which completes a
-      handshake and gets an encrypted IPv4 packet delivered to its TUN.
-      Rekeying and the cookie/DoS exchange landed later, in phases 2.2 and
-      2.3.
-- [x] **M5 — meow bootstrap.** The introduction exchange, the disco key
-      derivation a peer must advertise, and tunnel addressing. Verified
-      end to end by `make live-tailcat`: a real tailcat server accepts our
-      meow, adds us as a peer, and completes a WireGuard handshake through
-      the relay.
-- [x] **M6 — Minimal TCP.** A two-peer userspace TCP over IPv6: the state
-      machine, cumulative ACKs with a bounded reassembly queue, RTO with
-      Jacobson/Karels and Karn's algorithm, fast retransmit, slow start and
-      congestion avoidance, window updates and half close. Roughly 900 lines
-      in place of gvisor's netstack. Tested against a simulated link with
-      loss, duplication and reordering, and end to end against a real
-      tailcat server.
-- [x] **M7 — CLI.** `tailcat-c <addr> [port]` pipes stdin and stdout through
-      the tunnel, plus `parse` and `version`. A single-threaded event loop
-      over the relay socket and stdin drives the TCP stack and the WireGuard
-      session, so there are no locks. Verified by `make live-cli` against the
-      upstream Go server.
-- [x] **Phase 1 — self-sufficiency.** A strict JSON reader, an HTTPS GET, the
-      DERP map fetched and cached for an hour, a relay chosen by measured
-      handshake time, and the `resolve` and `ping` subcommands. Short
-      addresses now work directly and `serve` needs no `--relay`, so nothing
-      else has to be installed alongside the binary. `tailcat-c resolve`
-      produces a byte-identical result to `tailcat resolve`.
+### Expose local ports through the tunnel
 
-- [x] **Phase 2.1 — the demultiplexer.** Many TCP connections over one tunnel:
-      a table keyed by the port pair, a listener set, ephemeral port
-      allocation, and a reset for anything addressed to a port nobody owns.
-      The CLI routes through it, so dispatch is exercised by every live run.
-      `make live-serve` covers the passive open against a real Go client.
+`serve` takes ports, ranges, and `all`:
 
-- [x] **Phase 2.2 — session lifetime.** The previous/current/next keypair
-      triple, WireGuard's rekey and expiry timers, passive keepalives, and
-      initiation replay protection. A session now renews itself instead of
-      dying after two minutes. `make live-rekey` holds one open for 280
-      seconds against a real tailcat server, across rotations this side
-      initiated; it takes six minutes, which is the shortest honest way to
-      test it.
+```sh
+$ tailcat-c serve 8080,8443          # or: tailcat-c serve all
+# listening with new address: tcXXXXXXXXX
+# serving 8080,8443 to localhost, up to 8 clients
+```
 
-- [x] **Phase 2.3 — cookies.** XChaCha20-Poly1305, the cookie reply, and mac2
-      on both sides, so a peer under load can be answered rather than lost.
-      Verified against wireguard-go's own `CookieChecker` end to end.
-- [x] **Phase 2.5 — reconnection and liveness.** `FRAME_RESTARTING` acted on,
-      keep-alives tracked, redial under the same identity with backoff, and
-      write timeouts. A tunnel now survives its relay restarting, because
-      WireGuard is keyed to the peers rather than to the path.
+The client names the port after the address:
 
-- [x] **Phase 3.1 — `serve <ports>`.** Port specs with ranges and `all`, a
-      reusable splice that carries half closes in both directions, and many
-      clients at once, each with its own WireGuard session and demultiplexer.
-      `make live-serve-ports` proves a real Go client reaching a real local
-      service; `make live-multi` proves four of them at once seeing only
-      their own traffic.
+```sh
+$ tailcat-c tcXXXXXXXXX 8080
+```
 
-- [x] **Phase 3.2 and 3.3 — `forward` and `socks`.** Both listen locally and
-      dial through the tunnel, sharing one loop and the splice from 3.1.
-      `make live-forward` runs each against a real Go `tailcat serve`, which
-      is the mirror of `live-serve-ports`: between them, both ends of the
-      proxy have now been driven by something that is not ours.
+### Forward local ports to a tailcat server
 
-- [x] **Phase 3.4 — `ssh` and `cp`.** The system ssh and scp, with tailcat-c
-      as their `ProxyCommand`. `make live-ssh` is the longest chain anything
-      here has been tested through, and only the middle of it is ours:
-      `ssh -> tailcat-c -> DERP -> WireGuard -> the Go tailcat's sshd`.
+To make a served port an ordinary local TCP port -- for a browser, a database
+client, or anything else that speaks neither SOCKS nor stdio -- use `forward`:
 
-- [x] **Phase 3.6 — saved identities.** `genkey`, `printpub` and `--key`, in
-      upstream's own `*.private.json` format. Without one, a server's address
-      changed on every restart, which made it useless in a script.
-      `make live-genkey` runs a key through both implementations in both
-      directions and requires the addresses they derive to be identical
-      strings — which is how it caught `serve` advertising the embedded
-      address form where upstream names a region by number.
+```sh
+$ tailcat-c forward tcXXXXXXXXX 18080:8080 3306
+# 127.0.0.1:18080 -> the server's port 8080
+# 127.0.0.1:3306 -> the server's port 3306
+```
 
-**Phases 1, 2 and 3 are done.** `recv` turned out not to belong to Phase 3 at
-all: it is `serve --files <dir>:wo files`, and the `files` service is SFTP
-over SSH, so the *server* half needed an SSH server — Phases 5.4 and 5.5,
-rather than the ~300 lines that entry estimated. Its *client* half worked
-from the start, because `cp` execs the system scp, which speaks exactly that
-protocol; `make live-recv` has been delivering a file into a real `tailcat
-recv` drop box since then.
+A local port of 0 asks the operating system for a free one; each listener
+prints the port it got.
 
-- [x] **Phase 4 — direct peer-to-peer paths.** A UDP transport, a STUN
-      client, netcheck, the disco protocol, and the path discovery and
-      upgrade machinery that uses them. A session starts on the relay, moves
-      to a direct path once one is *proven* — only an answered Ping counts —
-      and moves back if it goes quiet. Tested against a simulated network
-      where NAT behaviour, loss, delay and the clock are all arguments, then
-      against reality: `make live-direct` for two of ours, and `make
-      live-cli`, which now shows our client going direct to a **real Go
-      tailcat server** using Tailscale's own disco protocol.
+A mapping may also name an address *beyond* the server, which needs the server
+running as an exit node:
 
-- [x] **Phase 5.1, 5.2 — datagrams and exit nodes.** UDP through the tunnel,
-      checked against packets built by `gopacket` because an IPv6 UDP
-      checksum covers a pseudo-header and a wrong one is invisible to a
-      loopback test. NAT64 for IPv4 destinations, anchored to RFC 6052's
-      published example. Exit-node mode on both muxes and both ends of the
-      CLI, off unless asked for by name, with `make live-exitnode` checking
-      that a server which was *not* asked to forward refuses.
+```sh
+$ tailcat-c serve exit-node
+# acting as an exit node: clients may reach anything this machine can
 
-- [x] **Phase 5.3 — TLS 1.3, attempted and reverted.** See
-      [above](#tls-13-is-blocked-on-ed25519). Kept from it:
-      `tc_tls_last_version()`, and a Makefile fix — Mbed TLS objects now
-      depend on `mbedtls_config.h` explicitly, because `-MMD` stops at the
-      `-isystem` header that includes it, so editing the config rebuilt
-      nothing.
+$ tailcat-c forward tcXXXXXXXXX 3001:172.23.52.30:3001 13306:[2001:db8::1]:3306
+```
 
-- [x] **Phase 5.1 and 5.7 — SOCKS5 UDP ASSOCIATE and `--allow`.** The two things
-      that finished the CLI's exposure of what the data plane could already
-      do. `socks` now relays datagrams (RFC 1928 §7) with an association
-      owned by its TCP control connection, so a forwarder is never left
-      running for whoever finds the port; `--allow` restricts a server by
-      client node key, as upstream's does. `tc_allow_permits` refuses the
-      all-zero key *before* the no-list shortcut, because checking after it
-      would have admitted that key in exactly the permissive case where
-      nobody is looking. `make live-socksudp` and `make live-allow` check
-      both against real clients.
+IPv6 destinations go in brackets. The pipe and `ssh -p` take the same
+destination syntax; see [Misc commands](#misc-commands).
 
-- [x] **Ed25519 of our own.** RFC 8032 in 877 lines — radix-2^51 field
-      arithmetic, extended Edwards coordinates, cofactorless verification and
-      the `S < L` canonicity check — against RFC 8032's published vectors and
-      byte-for-byte against Go's `crypto/ed25519`. Written because the SSH
-      subset needs `ssh-ed25519` and because vendoring a second crypto stack
-      for one curve was the wrong trade. It also narrows the TLS 1.3 blocker
-      without removing it.
+Listeners bind to `127.0.0.1` by default. Use `--bind 0.0.0.0` only when
+clients on other machines should be able to reach them. `--verbose` before the
+subcommand turns on networking logs. Ctrl-C stops forwarding.
 
-- [x] **TCP hardening.** Two ways an authenticated peer could permanently
-      exhaust the 64-entry connection table, both found by making the TCP
-      fuzzer assert its own reach rather than trusting it: a corrupt SYN left
-      an unreapable connection in `LISTEN`, and a peer that simply vanished
-      left one in `ESTABLISHED` with no timer watching it. Keepalive probes
-      close the second. Bugs 20 and 21 above have the detail, including the
-      third bug the fix contained and the fourth it revealed.
+### Open a browser to a tailcat server
 
-- [x] **Phase 5.4 — an SSH subset.** The licence question was
-      [decided](#vendoring-an-ssh-server) rather than deferred: write the
-      subset, with TinySSH as a reference and not a dependency. RFC 4251's
-      wire types, the binary packet protocol with
-      `chacha20-poly1305@openssh.com`, `curve25519-sha256`, `ssh-ed25519`
-      host keys, publickey authentication under five algorithms, one channel,
-      RFC 8308 extension negotiation, and rekeying as a
-      responder — server and client both, in 2,900 lines against the ~20,000
-      of Go a general implementation takes. `make live-sshd` puts a real
-      OpenSSH 9.6 client against our server and `make live-sshloop` runs our
-      own two halves against each other.
+```sh
+$ tailcat-c serve 80
+$ tailcat-c browse tcXXXXXXXXX
+```
 
-- [x] **Phase 5.5 — SFTP, the drop box, and `recv`.** A version 3 codec, a
-      write-only drop box whose central rule is that *the server chooses
-      every stored filename*, and the `recv` subcommand that serves it on
-      port 22 of the tunnel. `make live-dropbox` carries out the attacks with
-      a real `scp` and `sftp` and checks the filesystem afterwards rather
-      than what the client printed; `make live-recv-serve` does it through a
-      real relay.
+`browse` is shorthand for `forward --open-browser <tc-addr> 0:80`: it forwards
+a free local port to the server's port 80 and opens a browser there once the
+listener is up. `--open-browser` works with any single `forward` mapping.
 
-- [x] **Phase 5.6 — the other three `serve` services.** `files`, `ssh` and
-      `no-auth-ssh`, on the SSH and SFTP server Phase 5.5 built.
+### Public-key-authenticated SSH server
 
-      `serve files` is a second policy beside the drop box, and the opposite
-      one: the client names paths. Upstream confines them with Go's
-      `os.Root`, which refuses to traverse a symlink or a `..` at the system
-      call level. C has no such thing, so the walk pops `..` *before* any of
-      it reaches the filesystem and opens every component with
-      `openat(O_NOFOLLOW)` — a symlink is refused rather than resolved, which
-      is the part a `realpath()` check cannot do without losing a race.
+```sh
+$ tailcat-c serve --ssh-authorized-keys ~/.ssh/authorized_keys ssh
+# listening with new address: tcXXXXXXXXX
+# serving a shell to 3 authorized keys
+```
 
-      `serve ssh` is a real shell: a pty where the platform has one, `sh -c`
-      for an exec request, an exit status, and window resizing. Windows has
-      no pseudo-terminals — Cosmopolitan's `forkpty` is ENOSYS there, checked
-      with a probe before any of it was designed — so sessions there run on
-      pipes, which is the same thing OpenSSH falls back to.
+The flag takes a file, a literal public key line, or a GitHub account, and
+sources can be comma-separated or the flag repeated. A `user@github` source
+fetches `https://github.com/user.keys` once, before the server starts:
 
-      `--ssh-authorized-keys` takes upstream's three forms: a file, a literal
-      key, and `user@github`. Key options are refused rather than ignored,
-      because `command="..."` is a restriction and reading the key without it
-      grants more than the file says -- which is upstream's reasoning too,
-      found in its source while implementing something else.
+```sh
+$ tailcat-c serve --ssh-authorized-keys alice@github,./contractor.pub ssh
+```
 
-      `make live-shell` drives all of it with a real OpenSSH client, and it
-      is what found the two truncation bugs described in [the bug
-      list](#bugs-this-verification-has-actually-caught) — including bug 39, which had been
-      quietly shortening large transfers for every service, not just this
-      one.
+Every source must exist and produce at least one usable key, or startup fails
+-- a server that came up with an empty list would be one nobody can log in to,
+and its operator would have no way to tell.
 
-- [x] **RSA and ECDSA authorized keys.** `--ssh-authorized-keys` took
-      ed25519 and skipped everything else, which is a fine answer until
-      someone's `~/.ssh/authorized_keys` is an RSA key from 2014 and the
-      server starts by announcing it has no usable keys. Upstream accepts
-      ed25519, RSA under four algorithm names, ECDSA on three curves,
-      `ssh-dss`, the `sk-*` hardware forms and certificates. This now accepts
-      ed25519, ECDSA on P-256 and P-384, and RSA verified with SHA-256 or
-      SHA-512 — which is every key anyone actually has — and still skips the
-      SHA-1 algorithms, P-521, the hardware forms and certificates.
+Key options such as `command=` and `from=` are **refused**, not ignored. Each
+one is a restriction, and reading the key while dropping it would grant more
+than the file says. Upstream refuses them for the same reason. For a forced
+command, see [Run a command per connection](#run-a-command-per-connection).
 
-      Three things about it were not obvious in advance.
+Which algorithms are accepted, and which are not, is in [What this port does
+not do](#what-this-port-does-not-do).
 
-      **The key type is not the signature algorithm.** RFC 8332 added
-      `rsa-sha2-256` and `rsa-sha2-512` as ways to *sign* with a key whose
-      blob still says `ssh-rsa`, and `authorized_keys` names the key type.
-      So the question a file asks — "can you verify this?" — has the answer
-      "yes" for `ssh-rsa` and the question a request asks has the answer
-      "no", for the same string. There are two functions because there are
-      two questions; one of them would have skipped every RSA key on earth.
+`serve ssh` without `--ssh-authorized-keys` fails; use `no-auth-ssh` explicitly
+when the tunnel identity is enough.
 
-      **A server that says nothing gets no RSA keys.** An OpenSSH client
-      that is not sent RFC 8308's `server-sig-algs` assumes SHA-1 `ssh-rsa`
-      is all a server has, and has refused to use that by default since 8.8
-      — so it never offers the key, and the user sees `Permission denied
-      (publickey)` with a perfectly good key loaded. Nothing in that failure
-      points at the server having been quiet. `make live-sshkeys` asserts the
-      algorithm OpenSSH actually signed with, and deleting the EXT_INFO send
-      makes it fail exactly that way.
+### Auth-free SSH server
 
-      **A round trip proves less than it looks.** Everything here is format:
-      two names that must differ, a signature two length prefixes deep, a
-      message rebuilt field by field. A test that signs with the library
-      that verifies agrees with itself about any of that it gets wrong. So
-      `tools/gen-sshauth-vectors.py` takes keys from `ssh-keygen` and
-      signatures from `openssl`, and the vectors are checked in — and
-      because new keys and randomised ECDSA make them irreproducible, the
-      level 1 check regenerates them and runs the test rather than diffing,
-      which is the mistake bug 19 was.
+```sh
+$ tailcat-c serve no-auth-ssh
+# listening with new address: tcXXXXXXXXX
+# WARNING: serving a shell with no client authentication
+# anyone who has this address can run commands as you on this machine
+# the address is the only secret: treat it exactly like a password
+# `serve ssh --ssh-authorized-keys ...` asks for a key as well
+```
 
-- [x] **The last two command-line gaps.** `genkey --region=<hostname>` and a
-      third address from the pipe and from `ssh -p`. Both were listed as
-      choices rather than gaps, and neither really was: the first is how you
-      point a key at a relay the published list does not have, and the second
-      is the only way to reach a machine behind an exit node without setting
-      up a local listener first.
+> [!WARNING]
+> With `no-auth-ssh` the address **is** the credential: anyone who learns it
+> gets a shell as the user running the server. Share it only over private
+> channels, and never publish it -- not in a DNS TXT record, not anywhere. An
+> SSH server reachable by DNS name must authenticate clients some other way:
+> `--allow` at the tunnel layer, `--ssh-authorized-keys` at the SSH layer, or
+> both.
 
-      `--region` already took a number, a code and a name substring. Upstream
-      tells a hostname from those by looking for a dot, and so does this; what
-      it does not do is look at the rest, so `--region=..` writes a key whose
-      address names a relay that cannot exist and fails days later for
-      somebody who no longer has the command they ran. A key file is the one
-      thing here meant to outlive the session that made it, so the hostnames
-      are checked while there is still someone to read the error. The form
-      needs no relay list at either end, which makes it the only `genkey` that
-      touches no network — and therefore the first thing that could be checked
-      offline.
+The client side, either way:
 
-      That turned into `make cli-offline`, which is new and overdue:
-      `src/cli/main.c` is a program, so no unit test links against it, and
-      until now every check of its arguments was a live one that ran at level
-      1. It runs at every level and covers both features, including what `-p`
-      hands to the ProxyCommand — a stub `ssh` on `PATH` prints it, so the
-      canonical form is asserted rather than assumed.
+```sh
+$ tailcat-c ssh tcXXXXXXXXX
+$ tailcat-c ssh tcXXXXXXXXX ls -la
+```
 
-      The third address is one type rather than two variables:
+`ssh` and `cp` exec the system `ssh` and `scp` with a ProxyCommand that runs
+this program, so you get your own client, your own config, and scp's progress
+display.
 
-          typedef struct {
-              uint16_t port;    /* the server's port, when dst is unset */
-              tc_endpoint dst;  /* somewhere beyond it, needing an exit node */
-              char shown[96];
-          } dial_target;
+### Run a command per connection
 
-      Keeping those apart is exactly how `-p` came to mean only the first.
-      Making them one turned up a bug next door: the DNS safety probe, which
-      logs in as a stranger before connecting to a DNS-named server, dialled
-      port 22 no matter what `-p` said. With `-p 2222` it reported on a server
-      that might not be listening there at all, and with `-p 10.0.0.1:22` it
-      would have probed the server's own SSH rather than the machine behind
-      it — answering a question nobody asked, in the one place whose whole job
-      is to answer this one.
+Like inetd, `exec` runs a command for each incoming connection with the
+connection as its stdin and stdout. The command comes after `--`:
 
-- [x] **`ls`, in-process.** Upstream's `ls` is the one file command it does
-      not shell out for, so ours does not either: an SSH client and an SFTP
-      client over our own tunnel, printing what upstream prints. `make
-      live-ls` lists a directory served by a real Go tailcat.
+```sh
+$ tailcat-c serve exec -- /usr/bin/fortune
+```
 
-**Phases 1 through 5 are done**, apart from the browser build, which
-Cosmopolitan cannot target, and TLS 1.3, which is blocked on Mbed TLS's X.509
-parser rather than on effort. Of upstream's surface, what is left is one
-difference that is a choice rather than a gap: an authorized key must be
-ed25519, ECDSA on P-256 or P-384, or RSA signed with SHA-2 — not the SHA-1
-algorithms, the hardware-token forms, P-521 or certificates, all of which
-upstream takes. Those lines are skipped and counted rather than silently
-kept. See [PLAN.md](PLAN.md) for the detail.
+The command's stderr goes to the server's. It gets the peer's node key in
+`$TAILCAT_PEER_KEY` (in `--allow`'s format) and the peer's tunnel address in
+`$TAILCAT_REMOTE_ADDR`.
 
-## Licence
+Given with `ssh` or `no-auth-ssh`, the command replaces the shell instead, like
+OpenSSH's `ForceCommand`: every session runs only that command, on a pty if the
+client asked for one, and the server offers no shell, no client-chosen command
+and no SFTP. Whatever the client asked to run arrives in
+`$SSH_ORIGINAL_COMMAND`.
 
-BSD-3-Clause, matching upstream tailcat. Portions are ports of
-Tailscale-authored code; see `upstream-tailcat/LICENSE`.
+```sh
+$ tailcat-c serve --ssh-authorized-keys alice@github ssh -- ./deploy.sh
+$ tailcat-c serve no-auth-ssh -- git-upload-pack /srv/repo.git
+```
+
+### Send and receive files
+
+To receive, run a drop box and share the address it prints:
+
+```sh
+$ tailcat-c recv ~/inbox
+# listening with new address: tcXXXXXXXXX
+# receiving files into /home/you/inbox
+```
+
+The sender:
+
+```sh
+$ tailcat-c cp report.pdf tcXXXXXXXXX:
+```
+
+The drop box is write-only, and the rule underneath it is that **the server
+chooses every stored filename**: a sender cannot list the directory, read
+anything back, overwrite an existing file, or say where its file goes.
+`recv --accept-dirs` takes directory trees instead, and then senders do keep
+their own names.
+
+To offer files, serve a directory:
+
+```sh
+$ tailcat-c serve files                    # the current directory, read-only
+$ tailcat-c serve --files /pub:rw files    # a given one, read-write
+# serving /pub read-write over SFTP
+```
+
+```sh
+$ tailcat-c ls -l tcXXXXXXXXX
+$ tailcat-c cp tcXXXXXXXXX:report.pdf .
+```
+
+`ls` speaks SFTP in-process, so it works with no OpenSSH installed.
+
+Every path is confined to the served directory. Upstream does that with Go's
+`os.Root`, which refuses to traverse `..` or a symlink at the system-call
+level. C has no such thing, so the walk here resolves `..` before any of it
+reaches the filesystem and opens each component with `openat(O_NOFOLLOW)`: a
+symlink is refused rather than followed, which is the part a `realpath()` check
+cannot do without losing a race.
+
+The file service speaks SFTP, so stock `sftp` and `scp` work against it given a
+ProxyCommand through this program -- the same trick `cp` and `ssh` use. The
+`ssh` and `no-auth-ssh` servers serve SFTP too, with the same access as the
+shell.
+
+Transfers are not compressed. SFTP has no compression of its own and neither
+does the SSH transport here; compress before sending if it matters.
+
+### Misc commands
+
+`ping` reports whether the reply came back over a relay or a direct path.
+`--until-direct` keeps trying until a direct path works, and exits non-zero if
+none does:
+
+```sh
+$ tailcat-c ping --until-direct tcXXXXXXXXX
+pong in 61ms via DERP(nyc)
+pong in 3ms via 203.0.113.7:41641
+```
+
+Upstream prints fractional milliseconds here and this prints whole ones: both
+of its clocks measure in whole milliseconds, so the decimals would be invented.
+
+Run a command behind a SOCKS5 proxy over the tunnel:
+
+```sh
+$ tailcat-c socks tcXXXXXXXXX curl http://server.tailcat:8081/
+```
+
+In a SOCKS request the hostname `server.tailcat` means the server itself. A
+tailcat address also works directly as a URL hostname, so the address argument
+is optional:
+
+```sh
+$ tailcat-c socks curl http://tcXXXXXXXXX:8081/
+```
+
+(Addresses are case-sensitive. That works with curl and most command-line
+tools, but not with browsers, which lowercase hostnames.)
+
+Reach a third address through a server acting as an exit node, from the pipe or
+from `ssh`:
+
+```sh
+$ tailcat-c tcXXXXXXXXX 10.0.0.1:22
+$ tailcat-c ssh -p 10.0.0.1 tcXXXXXXXXX        # a bare address means its 22
+$ tailcat-c ssh -p 10.0.0.1:2222 tcXXXXXXXXX
+```
+
+`parse` prints what an address contains, without connecting to anything:
+
+```sh
+$ tailcat-c parse tcXXXXXXXXX
+{
+    "ServerPublic": "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34",
+    "RegionID": 302
+}
+```
+
+That output is byte-identical to upstream's for the same address, which is
+checked on every release run against 500 addresses the Go binary generates.
+
+`resolve` turns a short address -- one naming a relay region by number, so
+clients must fetch the relay list -- into a longer self-contained one with the
+relay's details embedded, which clients can connect to faster and offline. A
+server can print that form directly with `serve --full-address`.
+
+`netcheck` reports UDP reachability, NAT behaviour and relay latency.
+`version` prints the version. `readme` prints the manual.
+
+## Key management
+
+A server's address contains its WireGuard public key and an independent
+WireGuard pre-shared key, so the saved key material decides who can reach you.
+
+* **Ephemeral keys, the default.** Each run generates a fresh key in memory and
+  prints an address nobody has ever seen. When the process exits the key is
+  gone and the address is dead for good, so sharing it only ever refers to that
+  one run.
+
+* **Saved keys.** `genkey` writes a key to disk so the address stays the same
+  across restarts. The flip side: anyone you have *ever* given that address to
+  can connect to any future server using it, unless you restrict clients with
+  `serve --allow`.
+
+The startup line says which kind is in use, so you can tell a fresh single-use
+server from one re-listening on an address you may have shared before.
+
+Pre-shared keys are on by default and strongly recommended. `--psk=false` on
+`serve` or `genkey` produces shorter addresses for compatibility with tailcat
+clients v0.5.0 and earlier, but gives up post-quantum protection and protection
+from a relay operator that can see both peers' public keys.
+
+```sh
+$ tailcat-c genkey --key default --region nyc
+# wrote /home/you/.config/tailcat/keys/default.private.json
+tcXXXXXXXXX
+
+# later; the key named "default" is used automatically once it exists:
+$ tailcat-c serve 8080
+# listening with saved key "default": tcXXXXXXXXX
+
+# ... unless you ask for a one-off ephemeral key:
+$ tailcat-c serve --key new 8080
+# listening with new address: tcXXXXXXXXX
+```
+
+`default` is a magic name: once it exists, plain `tailcat-c` uses it instead of
+generating an ephemeral key, and the startup line is what tells you which
+happened. `--key new` forces an ephemeral one, `--key <name>` picks a different
+saved key, `genkey --delete --key default` removes it, and `genkey --list`
+lists what you have.
+
+Addresses can also be published as DNS TXT records and looked up by name. A DNS
+name works anywhere an address does:
+
+```sh
+# if example.com has a TXT record "tailcat=tc..."
+$ tailcat-c example.com 8080
+$ tailcat-c ssh example.com
+$ tailcat-c ping example.com
+```
+
+> [!WARNING]
+> An address is normally a secret: knowing it is what lets a client connect. A
+> DNS TXT record is **not** secret. It is public, world-readable and actively
+> scanned. Publishing an address in DNS hands that capability to the whole
+> internet, which is only safe if the server authenticates clients by something
+> other than knowledge of the address: `serve --allow` at the tunnel layer, or
+> `serve --ssh-authorized-keys ... ssh` for SSH. Never publish the address of a
+> `no-auth-ssh` server, or any other server that trusts whoever connects --
+> that is a shell on your machine, published in a TXT record.
+
+## Examples
+
+### Protected SSH server over DNS
+
+An SSH server reachable from anywhere by name, with no inbound ports open,
+where WireGuard authenticates the client before the SSH server sees a packet.
+
+> [!WARNING]
+> `--allow` below is not decoration. The TXT record makes the address public,
+> so having the address no longer proves anything and the server must
+> authenticate clients itself -- here by allowing exactly one client node key.
+> Without it, anyone who reads the record can connect.
+
+On the client, generate an identity. It prints the public key, which is all the
+server needs:
+
+```sh
+client$ tailcat-c genkey --client --key client-default
+# wrote /home/you/.config/tailcat/keys/client-default.private.json
+nodekey:cfb6bfa77a0654d7450947fd6acef17d2cd848da1d30b2540b13dac272ddfd16
+```
+
+On the server, generate a key pinned to its nearest relay region, then serve
+SSH to that client alone:
+
+```sh
+server$ tailcat-c genkey --key default --fixed-region
+# wrote /home/you/.config/tailcat/keys/default.private.json
+tcXXXXXXXXX
+
+server$ tailcat-c serve --allow nodekey:cfb6bf...ddfd16 22
+# listening with saved key "default": tcXXXXXXXXX
+```
+
+Publish the address:
+
+```
+my-server.example.com. 300 IN TXT "tailcat=tcXXXXXXXXX"
+```
+
+And the client side is just:
+
+```sh
+client$ tailcat-c ssh my-server.example.com
+```
+
+Client modes use the saved `client-default` key automatically when it exists,
+so no extra flags are needed to present the allowed identity. Anyone else's
+handshake is ignored: they cannot reach the SSH server, or even learn that one
+is running.
+
+As a safety net, `ssh` probes a DNS-named destination before connecting. It
+tries to log in the way a stranger would -- a freshly generated client key, no
+SSH credentials -- and if that succeeds it refuses to connect and says why,
+because anyone who reads the record could do the same. The probe dials whatever
+`-p` names, so it checks the destination you are actually about to use.
+`--skip-dns-safety-check` skips it.
+
+Why `--fixed-region`: it measures the nearest relay region once, now, and bakes
+it into the key file and the printed address, so restarts rendezvous in the
+same place and the published address stays valid. The default, `--region auto`,
+bakes in "choose at startup" instead -- fine for one-off use, wrong for an
+address published in DNS. `--region <name>` pins an explicit one and
+`--region list` shows the choices.
+
+### Bring your own relay
+
+Nothing requires Tailscale's relays. [Run your own DERP
+server](https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp) and
+generate a key that uses it by naming its hostname -- or several,
+comma-separated -- as the region:
+
+```sh
+server$ tailcat-c genkey --key default --region derp.example.com
+tcXXXXXXXXX
+
+server$ tailcat-c serve 22
+```
+
+The address then embeds your relay's hostname:
+
+```sh
+$ tailcat-c parse tcXXXXXXXXX
+{
+    "ServerPublic": "nodekey:8022c28ea8f52ec7a0a51b644ce00fef3aae150731a01c61a3abd3ac26e14a49",
+    "Region": [
+        {
+            "Nodes": [
+                {
+                    "HostName": "derp.example.com"
+                }
+            ]
+        }
+    ]
+}
+```
+
+so clients need no extra flags and neither side ever contacts Tailscale's relay
+list or relays. It is also the one `genkey` form that makes no network request
+at all. If you run a fleet, serve your own relay list as JSON and point both
+sides at it with `--derpmap-url`.
+
+## How it works
+
+### Tailcat addresses
+
+A server is identified by a **tailcat address**: `tc` followed by
+base64-encoded [CBOR](https://cbor.io/) containing
+
+- the server's WireGuard public key (Curve25519, 32 bytes),
+- a separate path-discovery public key (Curve25519, 32 bytes),
+- by default an independent WireGuard pre-shared key (256 random bits), which
+  stops a relay operator that can see both public keys from joining the tunnel
+  and protects recorded traffic against a future quantum attacker,
+- and relay information: either a small integer naming one of the default
+  relays, or full relay details, so a custom relay can be used or a client can
+  skip fetching the relay list.
+
+A typical address with a region number is about 140 bytes; with relay details
+embedded it is longer but self-contained.
+
+The default address is a **secret bearer capability**, because it contains the
+pre-shared key. Share it only with clients that should be able to connect.
+
+### Network stack
+
+This is where the port diverges most from upstream, so it is worth being
+precise. Upstream reuses Tailscale's own components: `magicsock` for the
+transport, gVisor's netstack for userspace TCP/IP, and Tailscale's WireGuard
+implementation. **None of that is here.** The equivalents are:
+
+- **WireGuard** -- the Noise IKpsk2 handshake, the transport keys, rekeying and
+  cookie replies, written here against the protocol specification and checked
+  against golden vectors and against `wireguard-go` over a real socket.
+- **The relay transport** -- a DERP client: the framing, the key exchange and
+  reconnection. It multiplexes the tunnel over a relay and over direct UDP.
+- **NAT traversal** -- STUN endpoint discovery, the disco protocol, the
+  call-me-maybe exchange and hole-punching, and the netcheck that picks a
+  region by latency.
+- **TCP/IP** -- a small userspace TCP stack. Connections are terminated inside
+  the process, so there is no TUN device, no routing change and no root,
+  exactly as upstream promises; the code doing it is not gVisor.
+- **TLS** -- Mbed TLS, the one third-party library, for the relay connection
+  only.
+
+### Connection flow
+
+1. **The server starts.** It generates or loads a WireGuard keypair and, by
+   default, a pre-shared key, connects to a relay, and prints its address. Then
+   it waits.
+
+2. **The client parses the address** for the server's public key,
+   path-discovery key, optional pre-shared key and relay. It generates its own
+   ephemeral keypair and connects to the same relay. The path-discovery key is
+   separate so it can appear in cleartext direct-path frames without revealing
+   the WireGuard public key, and the pre-shared key stays the secret capability
+   even when a relay operator sees both peers' public keys.
+
+3. **Discovery handshake.** The client sends a **Meow** message through the
+   relay carrying its node public key. The server adds the client as a peer,
+   reconfigures, and replies **Meowed**.
+
+4. **WireGuard tunnel.** With both sides configured as peers, the handshake
+   proceeds over the relay. Once it completes, the tunnel is up.
+
+5. **NAT traversal.** In parallel each side advertises its UDP endpoints -- the
+   public address learned by STUN, plus local interface addresses -- and both
+   attempt hole-punching. On success the traffic moves to a direct path; on
+   failure the relay keeps carrying it, just more slowly.
+
+6. **Data transfer.** The client dials a TCP port through the tunnel, and the
+   server dispatches the connection by port: forwarding to localhost, piping to
+   stdout, running an SSH session, and so on.
+
+### Addressing
+
+Each peer derives a deterministic IPv6 address from its WireGuard public key.
+That is an implementation detail rather than something users see, and upstream
+notes it may change; this port follows whatever upstream does, because the two
+have to agree.
+
+## Interoperability
+
+Interoperating with upstream is the whole purpose, so it is tested rather than
+asserted. Every release run puts this program against the real Go `tailcat`
+binary over real relays, in both directions -- a Go client against this server
+and this client against a Go server -- for the pipe, served ports, forwarding,
+SOCKS, exit nodes, `ls`, `recv`, SSH and file serving. Saved key files are
+exchanged both ways too, since an address is a function of its key, and a key
+file only one implementation could read would not be a saved identity at all.
+
+The SSH server is additionally checked against real OpenSSH rather than against
+upstream, which is the stronger test for that layer: both implementations here
+were written from the same RFCs, and OpenSSH was not.
+
+## Security
+
+The address is a bearer credential. Everything else follows from that, and the
+warnings above are the load-bearing parts of this document.
+
+This port has not been audited. It is a from-scratch implementation of
+cryptographic protocols in C, which is exactly the combination that warrants
+scepticism. What verification exists is described in [PORT.md](PORT.md),
+including what it does not cover -- and four of the six platforms it claims
+have never been run.
+
+To report a security issue in *upstream* tailcat, see [upstream's
+SECURITY.md](https://github.com/tailscale/tailcat/blob/main/SECURITY.md). For
+this port, open an issue on this repository.
+
+## Stability
+
+No promises about the CLI, its output, or anything else. Upstream makes none
+either, and this follows upstream.
+
+The public relays belong to Tailscale, not to this project. They are rate
+limited, have no uptime guarantee, and access may be withdrawn at any time. If
+you depend on this, [run your own relay](#bring-your-own-relay).
+
+## Licence and attribution
+
+BSD-3-Clause, matching upstream tailcat. [LICENSE](LICENSE) is upstream's,
+copied unchanged, because that is what the licence asks of a derivative: a
+redistribution in source form has to carry the copyright notice, the
+conditions and the disclaimer along with it.
+
+This program is a port of [tailcat](https://github.com/tailscale/tailcat),
+copyright (c) 2020 Tailscale Inc & contributors, and this file follows the
+structure of upstream's README. The protocols it implements -- WireGuard, DERP,
+disco, STUN -- are Tailscale's and their authors'. WireGuard is a registered
+trademark of Jason A. Donenfeld.
+
+Mbed TLS is vendored under `third_party/`, under the Apache-2.0 licence.
+
+## History
+
+Upstream tailcat began in September 2023 as "derpcat", written on a flight, and
+was open sourced in August 2026.
+
+This port started from the observation that the whole of it -- data plane and
+all -- could be made into a single file that runs anywhere, with no runtime and
+nothing to install, if it were written in C for the Cosmopolitan toolchain.
+Whether that was worth doing is a matter of taste. Whether it was done
+correctly is a matter of evidence, and [PORT.md](PORT.md) is the evidence.

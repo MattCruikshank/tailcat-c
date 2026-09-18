@@ -99,9 +99,9 @@ int tc_tunnel_addr_format(char *out, size_t cap,
  * generated from doc/usage.md by scripts/gen-usage.py.
  *
  * Deliberately not README.md, which upstream embeds for its equivalent
- * command. Ours is an engineering log three times the size, and a user who
- * types `readme` wants examples rather than an account of how the TCP stack
- * was fuzzed. */
+ * command. Ours is a fuller manual, and it opens with a section on what this
+ * port does not do -- useful reading, and not what someone who typed `readme`
+ * at a terminal is after. They want the examples. */
 extern const char tc_usage_text[];
 
 #endif /* TC_TAILCAT_H_ */
